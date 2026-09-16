@@ -1,7 +1,7 @@
 ---
 name: gitea
 description:
-  How to list, clone, open pull requests, respond to review feedback, and file
+  How to list, open pull requests, respond to review feedback, and file
   issues on our Gitea repositories via the tea CLI.
 ---
 
@@ -16,13 +16,6 @@ See the repositories your account can reach, listed as `<owner>/<repo>`:
 
 ```sh
 tea repos ls --fields name,updated,description
-```
-
-Clone over HTTPS; credentials and your commit identity are already configured,
-and the Gitea base URL is in the `GITEA_URL` environment variable:
-
-```sh
-git clone "$GITEA_URL/<owner>/<repo>"
 ```
 
 ## Opening a pull request

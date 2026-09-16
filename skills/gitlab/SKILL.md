@@ -1,8 +1,8 @@
 ---
 name: gitlab
 description:
-  How to list, clone, open merge requests, respond to review feedback, and
-  file issues on our GitLab projects via the glab CLI.
+  How to list, open merge requests, respond to review feedback, and file
+  issues on our GitLab projects via the glab CLI.
 ---
 
 These repositories live on GitLab, where pull requests are called merge
@@ -18,12 +18,6 @@ See the projects your account can reach, listed as `<namespace>/<project>`:
 
 ```sh
 glab repo list --member --per-page 100
-```
-
-Clone over HTTPS; credentials and your commit identity are already configured:
-
-```sh
-glab repo clone <namespace>/<project>
 ```
 
 ## Opening a merge request

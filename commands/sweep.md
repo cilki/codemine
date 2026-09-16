@@ -12,19 +12,24 @@ Your assigned task for this turn: $1
 Your assigned repository: $2, hosted on our $3 forge
 
 Load the `$3` skill before doing anything on the forge; it explains how to
-clone, open pull requests, respond to review feedback, and file issues.
+open pull requests, respond to review feedback, and file issues.
 
-Clone the assigned repository fresh into the current working directory and
-work from its default branch, unless your other instructions describe a
-different branch scheme. Don't reuse an existing clone because it may have
-stale changes.
+The assigned repository is already cloned, up to date, and checked out on its
+default branch in the current working directory — do not clone or fetch it
+again. Leftover build artifacts (`target/`, `node_modules/`, ...) from earlier
+runs may be present and are fine to reuse.
+
+Prefer the `codegraph_explore` tool over grep/find/broad file reads when
+exploring the codebase — it answers structural questions in a single call and
+is much cheaper. Fall back to normal exploration only if the tool is
+unavailable or fails.
 
 Execute only the assigned task, described below. If there is nothing to do for
 it on the assigned repository, skip the turn — do not switch to a different
 task or repository.
 
 End your final message with a line starting with exactly `TASK COMPLETED` if
-you changed anything on Gitea (pushed commits, opened or updated a PR or
+you changed anything on the forge (pushed commits, opened or updated a PR or
 issue), or `TASK SKIPPED` if there was nothing to do.
 
 If the task is too complicated for a single PR, open an issue instead and let

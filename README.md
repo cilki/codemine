@@ -3,13 +3,23 @@
 Continuously runs [opencode](https://opencode.ai) turns that sweep our
 repositories on Gitea, GitHub, and GitLab. Each turn the runner picks a task
 and a repository at random, logs the pair, and hands them to the agent, which
-delivers its work as a PR or issue. Each turn runs in a fresh workspace and a fresh session, back-to-back
-with the previous one.
+delivers its work as a PR or issue. Each turn runs in a fresh session,
+back-to-back with the previous one, against a persistent workspace: the runner
+keeps one clone per repository under `CODEMINE_WORKSPACE`, brings it back to a
+current default branch before the turn (hard reset; ignored files like build
+caches survive), and maintains a [codegraph](https://github.com/colbymchenry/codegraph)
+index in it. The agent explores through codegraph's `codegraph_explore` MCP
+tool instead of recloning and rereading the tree every turn, which cuts token
+usage substantially.
 
 The Docker image bundles the runner, the sweep commands, and everything the
-agent needs at runtime (`tea`, `gh`, `glab`, the Rust toolchain, ...). The
-dependency list lives in `nix/runtime.nix` and is shared between `shell.nix` and
-the image, both pinned by `nix/nixpkgs.nix`.
+agent needs at runtime (`tea`, `gh`, `glab`, `codegraph`, the Rust toolchain,
+...). The dependency list lives in `nix/runtime.nix` and is shared between
+`shell.nix` and the image, both pinned by `nix/nixpkgs.nix`; codegraph is
+included when the pin has it and pulled with the upstream installer by the
+image otherwise. When `codegraph` is not on the PATH at all, the runner skips
+indexing and drops the MCP entry from opencode's config, and the agent falls
+back to exploring the tree normally.
 
 ## Configuration
 
@@ -30,6 +40,7 @@ the image, both pinned by `nix/nixpkgs.nix`.
 | `CODEMINE_NICE`        | CPU niceness for the agent, 1-19 (default: none)        |
 | `CODEMINE_IONICE`      | I/O class: `best-effort` or `idle` (default: none)      |
 | `CODEMINE_WEBUI`       | Bind address for the status web UI (default: disabled)  |
+| `CODEMINE_WORKSPACE`   | Persistent workspace root (default `~/.codemine`)       |
 | `GIT_AUTHOR_NAME`      | The name commits are authored (and committed) as        |
 | `GIT_AUTHOR_EMAIL`     | The email commits are authored (and committed) as       |
 
@@ -39,10 +50,16 @@ authenticate from `GITHUB_TOKEN` and `GITLAB_TOKEN` directly; for self-hosted
 instances, set the CLIs' own host variables (`GH_HOST`, `GITLAB_HOST`)
 alongside the base URL.
 
-The binary embeds the `sweep` command and one skill per forge (how to clone,
-open PRs, respond to feedback, and file issues via the `tea`, `gh`, and
-`glab` CLIs) and installs them into opencode's config directory at startup,
-so it runs the same inside or outside the image.
+The binary embeds the `sweep` command and one skill per forge (how to open
+PRs, respond to feedback, and file issues via the `tea`, `gh`, and `glab`
+CLIs) and installs them into opencode's config directory at startup, along
+with the codegraph MCP server entry in `opencode.json`, so it runs the same
+inside or outside the image.
+
+Mount a volume at the workspace root (`/root/.codemine` unless you point
+`CODEMINE_WORKSPACE` elsewhere) to keep clones and codegraph indexes across
+container restarts. Without it everything still works, but each repository is
+recloned and reindexed after every restart.
 
 Each turn the runner draws one task from `CODEMINE_TASKS` and one repository
 from everything the bot's account can reach across the configured forges, and

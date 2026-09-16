@@ -1,14 +1,15 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use wait_timeout::ChildExt;
 
-use crate::config::{Config, Forge, ForgeKind, IoClass};
+use crate::config::{Config, Forge, ForgeKind};
 use crate::scan;
 use crate::status::{Activity, Outcome, Status, TurnRecord, epoch_now};
+use crate::workspace;
 
 pub enum Backoff {
     /// The usage window is exhausted until this epoch.
@@ -23,8 +24,9 @@ pub struct Report {
     pub completed: bool,
 }
 
-/// Run one opencode turn in a fresh workspace and report how it went. The
-/// workspace and log are cleaned up when they drop.
+/// Run one opencode turn against the repository's persistent workspace clone
+/// and report how it went. The workspace survives across turns; only the log
+/// is cleaned up when it drops.
 pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     let task = &cfg.tasks[fastrand::usize(..cfg.tasks.len())];
     let mut pool = Vec::new();
@@ -36,13 +38,11 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     }
     let (forge, repo) = &pool[fastrand::usize(..pool.len())];
 
-    let workspace = tempfile::Builder::new()
-        .prefix("codemine.")
-        .tempdir_in("/root")?;
+    let dir = workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo);
     let mut log = tempfile::NamedTempFile::new()?;
     println!(
         "new task: {} ({task} on {} {repo})",
-        workspace.path().display(),
+        dir.display(),
         forge.kind.name()
     );
 
@@ -53,41 +53,58 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             task: task.clone(),
             repo: repo.clone(),
             forge: forge.kind.name().into(),
-            workspace: workspace.path().display().to_string(),
+            workspace: dir.display().to_string(),
             log_path: log.path().to_path_buf(),
             started: started_epoch,
         };
     });
 
     let start = Instant::now();
-    // Throttling wraps the agent in nice/ionice; every descendant inherits
-    // both priorities across fork and exec.
-    let nice_arg = cfg.nice.map(|n| n.to_string());
-    let mut argv: Vec<&str> = Vec::new();
-    if let Some(nice) = &nice_arg {
-        argv.extend(["nice", "-n", nice]);
+    // A failed preparation (deleted repository, network blip, ...) fails the
+    // turn, not the runner.
+    if let Err(err) = workspace::prepare(cfg, forge, repo, log.as_file()) {
+        let elapsed = start.elapsed().as_secs();
+        eprintln!("failed to prepare {repo} in {elapsed}s: {err:#}");
+        let tail = read_tail(log.as_file_mut(), 64 * 1024)?;
+        eprint!("{}", last_lines(&tail, 20));
+        Status::update(status, |s| {
+            s.log_tail = last_lines(&tail, 100).to_owned();
+            s.record_turn(TurnRecord {
+                task: task.clone(),
+                repo: repo.clone(),
+                forge: forge.kind.name().into(),
+                started: started_epoch,
+                duration_secs: elapsed,
+                outcome: Outcome::Failed,
+                tokens: None,
+            });
+        });
+        return Ok(Report {
+            backoff: Backoff::Normal,
+            completed: false,
+        });
     }
-    match cfg.ionice {
-        Some(IoClass::BestEffort) => argv.extend(["ionice", "-c", "2", "-n", "7"]),
-        Some(IoClass::Idle) => argv.extend(["ionice", "-c", "3"]),
-        None => {}
-    }
-    argv.extend([
-        "opencode",
-        "run",
-        "--command",
-        &cfg.command,
-        "--model",
-        &cfg.model,
-        task,
-        repo,
-        forge.kind.name(),
-    ]);
-    let mut child = Command::new(argv[0])
+
+    let mut argv = workspace::throttle_argv(cfg);
+    argv.extend(
+        [
+            "opencode",
+            "run",
+            "--command",
+            &cfg.command,
+            "--model",
+            &cfg.model,
+            task,
+            repo,
+            forge.kind.name(),
+        ]
+        .map(String::from),
+    );
+    let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         // Own process group, so the timeout can take down the whole tree.
         .process_group(0)
-        .current_dir(workspace.path())
+        .current_dir(&dir)
         .env("NO_COLOR", "1")
         // The bash runner exported these for everything it ran; only opencode's
         // subprocesses ever used them.
@@ -101,14 +118,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
 
     let exit = child.wait_timeout(cfg.turn_timeout)?;
     if exit.is_none() {
-        // SIGTERM the whole process group with a grace period, then SIGKILL;
-        // signalling only the child would orphan cargo/rustc grandchildren.
-        let pgid = -(child.id() as i32);
-        unsafe { libc::kill(pgid, libc::SIGTERM) };
-        if child.wait_timeout(Duration::from_secs(10))?.is_none() {
-            unsafe { libc::kill(pgid, libc::SIGKILL) };
-            child.wait().ok();
-        }
+        workspace::kill_group(&mut child)?;
     }
     let elapsed = start.elapsed().as_secs();
 

@@ -25,3 +25,7 @@ with pkgs;
   rustfmt
   gnumake
 ]
+# codegraph is missing from some nixpkgs pins (it landed after the 26.05
+# branch-off); the runner skips indexing when the CLI is absent, and the
+# Dockerfile falls back to the upstream installer.
+++ lib.optional (pkgs ? codegraph) codegraph

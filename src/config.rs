@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -60,6 +61,9 @@ pub struct Config {
     pub once: bool,
     /// Bind address for the read-only status web UI; None disables it.
     pub webui: Option<SocketAddr>,
+    /// Root of the persistent workspace where repositories stay cloned across
+    /// turns (CODEMINE_WORKSPACE, default ~/.codemine).
+    pub workspace: PathBuf,
 }
 
 fn required(name: &str) -> Result<String> {
@@ -153,6 +157,12 @@ impl Config {
             Err(_) => None,
         };
 
+        let workspace = match std::env::var_os("CODEMINE_WORKSPACE") {
+            Some(dir) => PathBuf::from(dir),
+            None => PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()))
+                .join(".codemine"),
+        };
+
         Ok(Self {
             forges,
             model: required("CODEMINE_MODEL")?,
@@ -166,6 +176,7 @@ impl Config {
             ionice,
             once: args.skip(1).any(|arg| arg == "--once"),
             webui,
+            workspace,
         })
     }
 }

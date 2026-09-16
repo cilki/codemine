@@ -1,6 +1,7 @@
-//! Continuously invoke an opencode command to sweep repositories on Gitea.
-//! Each turn runs in a fresh workspace and a fresh session, back-to-back with
-//! the previous one.
+//! Continuously invoke an opencode command to sweep repositories on our code
+//! forges. Each turn runs in a fresh session against a persistent per-repo
+//! workspace that stays cloned and codegraph-indexed across turns,
+//! back-to-back with the previous one.
 
 mod config;
 mod prompts;
@@ -9,6 +10,7 @@ mod status;
 mod turn;
 mod usage;
 mod webui;
+mod workspace;
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -97,8 +99,17 @@ fn wait_for_tomorrow(day: &str) -> Result<()> {
 
 fn setup(cfg: &Config) -> Result<()> {
     // Install the embedded prompts where opencode resolves commands and
-    // skills by name, so the binary works without the image copying them.
+    // skills by name, so the binary works without the image copying them, and
+    // wire the codegraph MCP server into opencode's config when the CLI is
+    // actually installed.
     prompts::install(&prompts::opencode_config_dir())?;
+    prompts::install_mcp(
+        &prompts::opencode_config_dir(),
+        workspace::codegraph_available(),
+    )?;
+
+    std::fs::create_dir_all(&cfg.workspace)
+        .with_context(|| format!("failed to create {}", cfg.workspace.display()))?;
 
     // Let git authenticate to every configured forge over HTTPS. ~/.gitconfig
     // is mounted read-only from the host, so the credential helper goes in the

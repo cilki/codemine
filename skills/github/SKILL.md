@@ -1,7 +1,7 @@
 ---
 name: github
 description:
-  How to list, clone, open pull requests, respond to review feedback, and file
+  How to list, open pull requests, respond to review feedback, and file
   issues on our GitHub repositories via the gh CLI.
 ---
 
@@ -17,12 +17,6 @@ See the repositories your account can reach, listed as `<owner>/<repo>`:
 
 ```sh
 gh api user/repos --paginate --jq '.[].full_name'
-```
-
-Clone over HTTPS; credentials and your commit identity are already configured:
-
-```sh
-gh repo clone <owner>/<repo>
 ```
 
 ## Opening a pull request

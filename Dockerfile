@@ -34,6 +34,16 @@ RUN pkg=/root/.nix-profile/lib/node_modules/opencode-claude-auth \
 COPY --from=build /out/bin/codemine /usr/local/bin/codemine
 
 ENV PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH
+
+# codegraph indexes the workspace clones and serves the codegraph_explore MCP
+# tool to opencode. Use the upstream installer (it bundles its own Node
+# runtime and symlinks into CODEGRAPH_BIN_DIR) unless the nixpkgs pin already
+# provided the package via runtime.nix.
+RUN command -v codegraph \
+  || curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh \
+     | CODEGRAPH_BIN_DIR=/usr/local/bin sh \
+  && codegraph --version
+
 RUN mkdir -p /workspace
 WORKDIR /workspace
 
