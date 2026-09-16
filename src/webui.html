@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>codemine</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: Arial, sans-serif;
+    color: #e8eaed;
+    background-color: rgb(38, 42, 43);
+    background-image:
+      linear-gradient(rgba(56, 60, 63, 0.5) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(56, 60, 63, 0.5) 1px, transparent 1px);
+    background-size: 80px 80px;
+    min-height: 100vh;
+  }
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
+  .header { display: flex; align-items: baseline; gap: 12px; }
+  .header h1 { font-size: 1.5em; }
+  .header .sub { color: #9aa0a6; }
+  .disconnected { color: #e74c3c; font-size: 0.85em; }
+  .panel {
+    background: rgb(24, 26, 27);
+    border: 1px solid rgb(62, 68, 70);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .panel-title { text-transform: uppercase; letter-spacing: 1px; font-size: 0.75em; color: #9aa0a6; margin-bottom: 10px; }
+  .now-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .badge {
+    padding: 3px 10px; border-radius: 12px; font-size: 0.8em;
+    text-transform: uppercase; letter-spacing: 1px;
+    background: rgb(62, 68, 70); color: #e8eaed;
+  }
+  .badge.running { background: rgba(46, 204, 113, 0.15); color: #2ecc71; }
+  .badge.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
+  .badge.usage_limit, .badge.waiting_for_tomorrow { background: rgba(230, 126, 34, 0.15); color: #e67e22; }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+  .mono { font-family: "Courier New", monospace; }
+  .muted { color: #9aa0a6; }
+  #workspace { margin-top: 8px; font-size: 0.85em; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+  .stat { background: rgb(24, 26, 27); border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px 16px; }
+  .stat-label { text-transform: uppercase; letter-spacing: 1px; font-size: 0.7em; color: #9aa0a6; }
+  .stat-value { font-family: "Courier New", monospace; font-size: 1.4em; margin-top: 4px; }
+  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 800px) { .columns { grid-template-columns: 1fr; } }
+  #recent { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .turn { border: 1px solid rgb(62, 68, 70); border-radius: 6px; padding: 8px 10px; font-size: 0.9em; }
+  .turn-top { display: flex; justify-content: space-between; gap: 8px; }
+  .turn-meta { color: #9aa0a6; font-size: 0.85em; margin-top: 4px; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .outcome { font-weight: bold; }
+  .outcome.completed { color: #2ecc71; }
+  .outcome.skipped { color: #9aa0a6; }
+  .outcome.failed { color: #e74c3c; }
+  .outcome.timeout { color: #e67e22; }
+  #log {
+    font-family: "Courier New", monospace; font-size: 0.8em; color: #b8bcbf;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 420px; overflow-y: auto;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>codemine</h1>
+    <span class="sub" id="uptime"></span>
+    <span class="disconnected" id="disconnected" hidden>disconnected</span>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Now</div>
+    <div class="now-row">
+      <span class="badge" id="badge">starting</span>
+      <span id="detail"></span>
+      <span class="mono muted" id="timer"></span>
+    </div>
+    <div class="mono muted" id="workspace"></div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-label">Today</div><div class="stat-value" id="stat-today">–</div></div>
+    <div class="stat"><div class="stat-label">Turns</div><div class="stat-value" id="stat-turns">–</div></div>
+    <div class="stat"><div class="stat-label">Completed</div><div class="stat-value" id="stat-completed">–</div></div>
+    <div class="stat"><div class="stat-label">Skipped</div><div class="stat-value" id="stat-skipped">–</div></div>
+    <div class="stat"><div class="stat-label">Failed</div><div class="stat-value" id="stat-failed">–</div></div>
+    <div class="stat"><div class="stat-label">Tokens</div><div class="stat-value" id="stat-tokens">–</div></div>
+  </div>
+
+  <div class="columns">
+    <div class="panel">
+      <div class="panel-title">Recent turns</div>
+      <div id="recent"><span class="muted">No turns yet.</span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Log</div>
+      <pre id="log" class="muted"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  let state = null;
+
+  const tokenTotal = t => t.input + t.output + t.reasoning + t.cache_read + t.cache_write;
+
+  function fmtTokens(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return String(n);
+  }
+
+  function fmtDuration(secs) {
+    secs = Math.max(0, Math.round(secs));
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+    if (h) return h + "h " + m + "m";
+    if (m) return m + "m " + s + "s";
+    return s + "s";
+  }
+
+  // Server time, extrapolated from the last response.
+  const serverNow = () => state.now + (Date.now() - state.received) / 1000;
+
+  const BADGES = {
+    starting: "starting", running: "running", sleeping: "sleeping",
+    usage_limit: "usage limit", waiting_for_tomorrow: "daily limit",
+  };
+
+  function render() {
+    const a = state.activity;
+    $("badge").textContent = BADGES[a.state] || a.state;
+    $("badge").className = "badge " + a.state;
+
+    let detail = "", timer = "", workspace = "";
+    if (a.state === "running") {
+      detail = a.task + " on " + a.repo + " (" + a.forge + ")";
+      timer = fmtDuration(serverNow() - a.started) + " elapsed";
+      workspace = a.workspace;
+    } else if (a.state === "sleeping" || a.state === "usage_limit") {
+      timer = fmtDuration(a.until - serverNow()) + " remaining";
+    } else if (a.state === "waiting_for_tomorrow") {
+      detail = "daily limit reached; waiting for " + a.day + " to end";
+    }
+    $("detail").textContent = detail;
+    $("timer").textContent = timer;
+    $("workspace").textContent = workspace;
+    $("uptime").textContent = "up " + fmtDuration(serverNow() - state.started);
+
+    $("stat-today").textContent =
+      state.completed_today + " / " + (state.daily_limit ?? "∞");
+    $("stat-turns").textContent = state.totals.turns;
+    $("stat-completed").textContent = state.totals.completed;
+    $("stat-skipped").textContent = state.totals.skipped;
+    $("stat-failed").textContent = state.totals.failed + state.totals.timeout;
+    $("stat-tokens").textContent =
+      state.totals.tokens && tokenTotal(state.totals.tokens)
+        ? fmtTokens(tokenTotal(state.totals.tokens)) : "–";
+
+    const rows = state.recent.map(turn => {
+      const row = document.createElement("div");
+      row.className = "turn";
+
+      const top = document.createElement("div");
+      top.className = "turn-top";
+      const title = document.createElement("span");
+      title.textContent = turn.task + " on " + turn.repo;
+      const outcome = document.createElement("span");
+      outcome.className = "outcome " + turn.outcome;
+      outcome.textContent = turn.outcome;
+      top.append(title, outcome);
+
+      const meta = document.createElement("div");
+      meta.className = "turn-meta";
+      const when = document.createElement("span");
+      when.textContent = turn.forge + " · " + new Date(turn.started * 1000).toLocaleString();
+      const cost = document.createElement("span");
+      cost.textContent = fmtDuration(turn.duration_secs) +
+        (turn.tokens ? " · " + fmtTokens(tokenTotal(turn.tokens)) + " tokens" : "");
+      meta.append(when, cost);
+
+      row.append(top, meta);
+      return row;
+    });
+    if (rows.length) $("recent").replaceChildren(...rows);
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch("/api/status");
+      if (!res.ok) throw new Error(res.status);
+      state = await res.json();
+      state.received = Date.now();
+      $("disconnected").hidden = true;
+      render();
+    } catch {
+      $("disconnected").hidden = false;
+    }
+  }
+
+  async function refreshLog() {
+    if (!state) return;
+    if (state.activity.state !== "running") {
+      $("log").textContent = state.log_tail;
+      return;
+    }
+    try {
+      const res = await fetch("/api/log");
+      if (!res.ok) throw new Error(res.status);
+      const log = $("log");
+      const follow = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      log.textContent = await res.text();
+      if (follow) log.scrollTop = log.scrollHeight;
+    } catch {}
+  }
+
+  setInterval(refresh, 2000);
+  setInterval(refreshLog, 3000);
+  refresh().then(refreshLog);
+</script>
+</body>
+</html>

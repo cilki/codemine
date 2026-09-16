@@ -13,6 +13,7 @@ with pkgs;
   jq
   curl
   ripgrep
+  util-linux
   tea
   gh
   glab

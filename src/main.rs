@@ -3,8 +3,12 @@
 //! the previous one.
 
 mod config;
+mod prompts;
 mod scan;
+mod status;
 mod turn;
+mod usage;
+mod webui;
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -14,7 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Config;
+use crate::config::{Config, ForgeKind};
+use crate::status::{Activity, Status};
 use crate::turn::Backoff;
 
 const CLAUDE_CREDENTIALS: &str = "/root/.claude/.credentials.json";
@@ -22,6 +27,12 @@ const CLAUDE_CREDENTIALS: &str = "/root/.claude/.credentials.json";
 fn main() -> Result<()> {
     let cfg = Config::from_env(std::env::args())?;
     setup(&cfg)?;
+
+    let status = Status::new(cfg.daily_limit);
+    if let Some(addr) = cfg.webui {
+        let addr = webui::spawn(addr, status.clone())?;
+        println!("webui listening on http://{addr}");
+    }
 
     let mut day = local_day()?;
     let mut completed_today = 0u32;
@@ -31,19 +42,30 @@ fn main() -> Result<()> {
             day = today;
             completed_today = 0;
         }
-        if cfg.daily_limit.is_some_and(|limit| completed_today >= limit) {
+        Status::update(&status, |s| {
+            s.day = day.clone();
+            s.completed_today = completed_today;
+        });
+        if cfg
+            .daily_limit
+            .is_some_and(|limit| completed_today >= limit)
+        {
+            Status::update(&status, |s| {
+                s.activity = Activity::WaitingForTomorrow { day: day.clone() }
+            });
             wait_for_tomorrow(&day)?;
             continue;
         }
 
-        let report = turn::run(&cfg)?;
+        let report = turn::run(&cfg, &status)?;
         if report.completed {
             completed_today += 1;
+            Status::update(&status, |s| s.completed_today = completed_today);
             if let Some(limit) = cfg.daily_limit {
                 println!("completed {completed_today}/{limit} tasks today");
             }
         }
-        sleep(&cfg, report.backoff)?;
+        sleep(&cfg, report.backoff, &status)?;
         if cfg.once {
             return Ok(());
         }
@@ -74,36 +96,48 @@ fn wait_for_tomorrow(day: &str) -> Result<()> {
 }
 
 fn setup(cfg: &Config) -> Result<()> {
-    // Let git authenticate to Gitea over HTTPS. ~/.gitconfig is mounted
-    // read-only from the host, so the credential helper goes in the system
-    // config instead, where every process in the container picks it up.
+    // Install the embedded prompts where opencode resolves commands and
+    // skills by name, so the binary works without the image copying them.
+    prompts::install(&prompts::opencode_config_dir())?;
+
+    // Let git authenticate to every configured forge over HTTPS. ~/.gitconfig
+    // is mounted read-only from the host, so the credential helper goes in the
+    // system config instead, where every process in the container picks it up.
     run(Command::new("git").args(["config", "--system", "credential.helper", "store"]))?;
-    let credential = cfg.gitea_url.replacen(
-        "://",
-        &format!("://{}:{}@", cfg.gitea_user, cfg.gitea_token),
-        1,
-    );
+    let credentials: String = cfg
+        .forges
+        .iter()
+        .map(|forge| {
+            let line = forge
+                .url
+                .replacen("://", &format!("://{}:{}@", forge.user, forge.token), 1);
+            format!("{line}\n")
+        })
+        .collect();
     OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open("/root/.git-credentials")?
-        .write_all(format!("{credential}\n").as_bytes())?;
+        .write_all(credentials.as_bytes())?;
 
-    // Log tea in so its commands work without further setup. The container's
-    // filesystem is fresh on every start, so there is no existing login to
-    // collide with.
-    run(Command::new("tea").args([
-        "login",
-        "add",
-        "--name",
-        "gitea",
-        "--url",
-        &cfg.gitea_url,
-        "--token",
-        &cfg.gitea_token,
-    ]))?;
+    // Log tea in so its commands work without further setup; gh and glab need
+    // no login because they read GITHUB_TOKEN and GITLAB_TOKEN from the
+    // environment directly. The container's filesystem is fresh on every
+    // start, so there is no existing login to collide with.
+    if let Some(gitea) = cfg.forges.iter().find(|f| f.kind == ForgeKind::Gitea) {
+        run(Command::new("tea").args([
+            "login",
+            "add",
+            "--name",
+            "gitea",
+            "--url",
+            &gitea.url,
+            "--token",
+            &gitea.token,
+        ]))?;
+    }
 
     // Sanity check credentials. opencode authenticates through the
     // opencode-claude-auth plugin, which reads (and refreshes) the same Claude
@@ -138,21 +172,31 @@ fn run(command: &mut Command) -> Result<()> {
 /// When the usage window is exhausted, Anthropic reports the epoch at which it
 /// reopens; wait for that instead of burning turns until then. Otherwise pause
 /// just long enough to keep a failing run from spinning the loop.
-fn sleep(cfg: &Config, backoff: Backoff) -> Result<()> {
+fn sleep(cfg: &Config, backoff: Backoff, status: &status::Shared) -> Result<()> {
     if cfg.once {
         return Ok(());
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let seconds = match backoff {
+    let (seconds, limited) = match backoff {
         Backoff::UsageLimit(epoch) if epoch > now => {
             println!(
                 "usage: limit reached; sleeping until {}",
                 iso8601(epoch).unwrap_or_else(|| epoch.to_string())
             );
-            epoch - now + 60
+            (epoch - now + 60, true)
         }
-        _ => 60,
+        _ => (60, false),
     };
+    Status::update(status, |s| {
+        s.activity = match limited {
+            true => Activity::UsageLimit {
+                until: now + seconds,
+            },
+            false => Activity::Sleeping {
+                until: now + seconds,
+            },
+        };
+    });
     std::thread::sleep(Duration::from_secs(seconds));
     Ok(())
 }

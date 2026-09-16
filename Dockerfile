@@ -31,12 +31,13 @@ RUN pkg=/root/.nix-profile/lib/node_modules/opencode-claude-auth \
   && mkdir -p /root/.config/opencode/plugins \
   && ln -s "$pkg/$main" /root/.config/opencode/plugins/opencode-claude-auth.js
 
-COPY commands/ /root/.config/opencode/commands/
-COPY skills/ /root/.config/opencode/skills/
 COPY --from=build /out/bin/codemine /usr/local/bin/codemine
 
 ENV PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH
 RUN mkdir -p /workspace
 WORKDIR /workspace
+
+# Conventional port for the optional status web UI (CODEMINE_WEBUI).
+EXPOSE 8080
 
 ENTRYPOINT [ "/usr/local/bin/codemine" ]

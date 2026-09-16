@@ -64,7 +64,9 @@ mod tests {
     fn skip_marker() {
         assert!(reported_skipped("nothing to do here\nTASK SKIPPED\n"));
         assert!(reported_skipped("TASK SKIPPED — no open PRs\nmore output"));
-        assert!(!reported_skipped("the marker is TASK SKIPPED on its own line"));
+        assert!(!reported_skipped(
+            "the marker is TASK SKIPPED on its own line"
+        ));
         assert!(!reported_skipped("TASK COMPLETED\n"));
     }
 
