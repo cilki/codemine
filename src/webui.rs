@@ -236,7 +236,14 @@ async fn api_put_settings(
         .settings
         .update(|settings| settings.apply_update(incoming))
     {
-        Ok(()) => Json(state.settings.snapshot().0.redacted()).into_response(),
+        Ok(()) => {
+            let (settings, _) = state.settings.snapshot();
+            // The main loop only mirrors the limit into the status at the
+            // next turn boundary; reflect it now so the page's counter
+            // doesn't lag a running turn.
+            Status::update(&state.status, |s| s.daily_limit = settings.daily_limit);
+            Json(settings.redacted()).into_response()
+        }
         Err(err) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "error": format!("{err:#}") })),
@@ -390,9 +397,15 @@ mod tests {
             "model": "anthropic/claude",
             "author_name": "Bot",
             "author_email": "bot@example.com",
+            "daily_limit": 5,
         });
         let response = request(addr, "PUT", "/api/settings", &update.to_string());
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        // The daily limit lands in the status right away, not at the next
+        // turn boundary.
+        let status = body_json(&request(addr, "GET", "/api/status", ""));
+        assert_eq!(status["daily_limit"], 5);
         let value = body_json(&response);
         assert_eq!(value["github"]["token_set"], true);
         assert!(value["github"].get("token").is_none());
