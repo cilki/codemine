@@ -33,6 +33,51 @@ impl ForgeKind {
     }
 }
 
+/// A model the runner can be pointed at, as an opencode provider/model ID.
+#[derive(Serialize)]
+pub struct Model {
+    pub id: &'static str,
+    pub label: &'static str,
+}
+
+/// The models offered in the web UI. Only Anthropic's are listed, because the
+/// runner authenticates through the Claude OAuth credentials Claude Code
+/// maintains and no other provider can log in.
+pub const MODELS: [Model; 8] = [
+    Model {
+        id: "anthropic/claude-fable-5",
+        label: "Claude Fable 5",
+    },
+    Model {
+        id: "anthropic/claude-opus-5",
+        label: "Claude Opus 5",
+    },
+    Model {
+        id: "anthropic/claude-opus-4-8",
+        label: "Claude Opus 4.8",
+    },
+    Model {
+        id: "anthropic/claude-opus-4-7",
+        label: "Claude Opus 4.7",
+    },
+    Model {
+        id: "anthropic/claude-opus-4-6",
+        label: "Claude Opus 4.6",
+    },
+    Model {
+        id: "anthropic/claude-sonnet-5",
+        label: "Claude Sonnet 5",
+    },
+    Model {
+        id: "anthropic/claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+    },
+    Model {
+        id: "anthropic/claude-haiku-4-5",
+        label: "Claude Haiku 4.5",
+    },
+];
+
 /// I/O scheduling class for the agent process tree, passed to ionice.
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -93,7 +138,6 @@ impl Forge {
 pub struct Config {
     pub forges: Vec<Forge>,
     pub model: String,
-    pub command: String,
     /// The task pool the runner draws from each turn; the slugs name the task
     /// sections in the sweep command template.
     pub tasks: Vec<String>,
@@ -161,8 +205,14 @@ impl Cli {
     }
 }
 
+/// The current user's home directory, falling back to the container's when
+/// `$HOME` is unset (a bare `docker run` with no user).
+pub fn home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()))
+}
+
 fn default_workspace() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into())).join(".codemine")
+    home().join(".codemine")
 }
 
 #[cfg(test)]
@@ -170,9 +220,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Option<Cli>> {
-        Cli::parse(
-            std::iter::once("codemine".to_owned()).chain(args.iter().map(|s| s.to_string())),
-        )
+        Cli::parse(std::iter::once("codemine".to_owned()).chain(args.iter().map(|s| s.to_string())))
     }
 
     #[test]
@@ -185,9 +233,15 @@ mod tests {
 
     #[test]
     fn parse_flags() {
-        let cli = parse(&["--listen", "127.0.0.1:9000", "--workspace", "/tmp/ws", "--once"])
-            .unwrap()
-            .unwrap();
+        let cli = parse(&[
+            "--listen",
+            "127.0.0.1:9000",
+            "--workspace",
+            "/tmp/ws",
+            "--once",
+        ])
+        .unwrap()
+        .unwrap();
         assert_eq!(cli.listen, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(cli.workspace, PathBuf::from("/tmp/ws"));
         assert!(cli.once);
@@ -210,7 +264,11 @@ mod tests {
             url: url.into(),
             disabled_repos: BTreeSet::new(),
         };
-        assert!(forge(ForgeKind::Gitea, "https://git.example.com").env().is_empty());
+        assert!(
+            forge(ForgeKind::Gitea, "https://git.example.com")
+                .env()
+                .is_empty()
+        );
         assert_eq!(
             forge(ForgeKind::Github, "https://github.com").env(),
             [("GITHUB_TOKEN".to_owned(), "tok".to_owned())]
@@ -226,7 +284,10 @@ mod tests {
             forge(ForgeKind::Gitlab, "https://gitlab.example.com").env(),
             [
                 ("GITLAB_TOKEN".to_owned(), "tok".to_owned()),
-                ("GITLAB_HOST".to_owned(), "https://gitlab.example.com".to_owned()),
+                (
+                    "GITLAB_HOST".to_owned(),
+                    "https://gitlab.example.com".to_owned()
+                ),
             ]
         );
     }

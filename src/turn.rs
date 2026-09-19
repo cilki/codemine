@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use tracing::{info, warn};
 use wait_timeout::ChildExt;
 
 use crate::config::{Config, Forge, ForgeKind};
@@ -39,7 +40,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         );
     }
     if pool.is_empty() {
-        eprintln!("no repositories enabled on any forge");
+        warn!("no repositories enabled on any forge");
         return Ok(Report {
             backoff: Backoff::Normal,
             completed: false,
@@ -49,7 +50,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
 
     let dir = workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo);
     let mut log = tempfile::NamedTempFile::new()?;
-    println!(
+    info!(
         "new task: {} ({task} on {} {repo})",
         dir.display(),
         forge.kind.name()
@@ -73,9 +74,11 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     // turn, not the runner.
     if let Err(err) = workspace::prepare(cfg, forge, repo, log.as_file()) {
         let elapsed = start.elapsed().as_secs();
-        eprintln!("failed to prepare {repo} in {elapsed}s: {err:#}");
         let tail = read_tail(log.as_file_mut(), 64 * 1024)?;
-        eprint!("{}", last_lines(&tail, 20));
+        warn!(
+            "failed to prepare {repo} in {elapsed}s: {err:#}\n{}",
+            last_lines(&tail, 20)
+        );
         Status::update(status, |s| {
             s.log_tail = last_lines(&tail, 100).to_owned();
             s.record_turn(TurnRecord {
@@ -100,7 +103,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             "opencode",
             "run",
             "--command",
-            &cfg.command,
+            crate::prompts::SWEEP_COMMAND,
             "--model",
             &cfg.model,
             task,
@@ -139,23 +142,23 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     let errored = scan::has_error_report(last_lines(&tail, 50));
     let outcome = match exit {
         None => {
-            eprintln!("timed out after {elapsed}s");
+            warn!("timed out after {elapsed}s");
             Outcome::Timeout
         }
         Some(exit) if !exit.success() || errored => {
-            eprintln!(
-                "failed with status {} in {elapsed}s:",
-                exit.code().unwrap_or(-1)
+            warn!(
+                "failed with status {} in {elapsed}s:\n{}",
+                exit.code().unwrap_or(-1),
+                last_lines(&tail, 20)
             );
-            eprint!("{}", last_lines(&tail, 20));
             Outcome::Failed
         }
         Some(_) if completed => {
-            println!("ok in {elapsed}s");
+            info!("ok in {elapsed}s");
             Outcome::Completed
         }
         Some(_) => {
-            println!("skipped in {elapsed}s");
+            info!("skipped in {elapsed}s");
             Outcome::Skipped
         }
     };
@@ -192,9 +195,12 @@ pub fn list_repos(forge: &Forge) -> Result<Vec<String>> {
     match forge.kind {
         ForgeKind::Gitea => list_gitea_repos(),
         ForgeKind::Github => list_api_repos(forge, "gh", "user/repos", "full_name"),
-        ForgeKind::Gitlab => {
-            list_api_repos(forge, "glab", "projects?membership=true", "path_with_namespace")
-        }
+        ForgeKind::Gitlab => list_api_repos(
+            forge,
+            "glab",
+            "projects?membership=true",
+            "path_with_namespace",
+        ),
     }
 }
 

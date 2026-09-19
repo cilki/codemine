@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tracing::warn;
 use wait_timeout::ChildExt;
 
 use crate::config::{Config, Forge, IoClass};
@@ -30,7 +31,7 @@ pub fn prepare(cfg: &Config, forge: &Forge, repo: &str, log: &File) -> Result<Pa
     let dir = repo_dir(&cfg.workspace, forge.kind.name(), repo);
     if dir.join(".git").exists() {
         if let Err(err) = update(&dir, log) {
-            eprintln!("update of {} failed ({err:#}); recloning", dir.display());
+            warn!("update of {} failed ({err:#}); recloning", dir.display());
             reclone(forge, repo, &dir, log)?;
         }
     } else {
@@ -110,7 +111,7 @@ pub fn codegraph_available() -> bool {
             .status()
             .is_ok_and(|status| status.success());
         if !available {
-            eprintln!("codegraph is not installed; running without indexes");
+            warn!("codegraph is not installed; running without indexes");
         }
         available
     })
@@ -139,16 +140,16 @@ fn codegraph(cfg: &Config, dir: &Path, log: &File) {
             // A failing sync usually means a corrupt or outdated index;
             // rebuild it from scratch.
             Err(err) => {
-                eprintln!("codegraph sync failed ({err:#}); reindexing");
+                warn!("codegraph sync failed ({err:#}); reindexing");
                 if let Err(err) = std::fs::remove_dir_all(dir.join(".codegraph")) {
-                    eprintln!("failed to remove stale index: {err:#}");
+                    warn!("failed to remove stale index: {err:#}");
                     return;
                 }
             }
         }
     }
     if let Err(err) = run(&["init", "--yes"], CODEGRAPH_INIT_TIMEOUT) {
-        eprintln!("codegraph init failed ({err:#}); running the turn unindexed");
+        warn!("codegraph init failed ({err:#}); running the turn unindexed");
     }
 }
 

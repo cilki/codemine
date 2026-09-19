@@ -17,30 +17,32 @@ mod workspace;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 use crate::config::{Cli, Config, ForgeKind, USAGE};
-use crate::settings::SettingsStore;
-use crate::status::{Activity, Status};
+use crate::settings::{Problem, SettingsStore};
+use crate::status::{Activity, Shared, Status};
 use crate::turn::Backoff;
-
-const CLAUDE_CREDENTIALS: &str = "/root/.claude/.credentials.json";
 
 fn main() -> Result<()> {
     let Some(cli) = Cli::parse(std::env::args())? else {
         println!("{USAGE}");
         return Ok(());
     };
+    init_logging();
     setup(&cli)?;
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
-    let status = Status::new();
+    let status = Shared::new();
     let addr = webui::spawn(cli.listen, status.clone(), store.clone())?;
-    println!("webui listening on http://{addr}");
+    info!("webui listening on http://{addr}");
 
     let mut day = local_day()?;
     let mut completed_today = 0u32;
@@ -49,10 +51,18 @@ fn main() -> Result<()> {
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
         if !claude_oauth_usable() {
-            problems.push(format!("no usable Claude OAuth login at {CLAUDE_CREDENTIALS}"));
+            problems.push(Problem::new(
+                "",
+                format!(
+                    "no usable Claude OAuth login at {}",
+                    claude_credentials().display()
+                ),
+            ));
         }
         if !problems.is_empty() {
-            Status::update(&status, |s| s.activity = Activity::Unconfigured { problems });
+            Status::update(&status, |s| {
+                s.activity = Activity::Unconfigured { problems }
+            });
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
@@ -61,11 +71,14 @@ fn main() -> Result<()> {
             .expect("settings without problems are runnable");
 
         if applied_generation != Some(generation) {
-            if let Err(err) = apply_forge_auth(&cfg) {
-                eprintln!("failed to apply forge auth: {err:#}");
+            if let Err(err) = apply_forge_auth(&cli, &cfg) {
+                error!("failed to apply forge auth: {err:#}");
                 Status::update(&status, |s| {
                     s.activity = Activity::Unconfigured {
-                        problems: vec![format!("failed to apply forge auth: {err:#}")],
+                        problems: vec![Problem::new(
+                            "",
+                            format!("failed to apply forge auth: {err:#}"),
+                        )],
                     }
                 });
                 std::thread::sleep(Duration::from_secs(5));
@@ -103,7 +116,7 @@ fn main() -> Result<()> {
                     completed_today += 1;
                     Status::update(&status, |s| s.completed_today = completed_today);
                     if let Some(limit) = cfg.daily_limit {
-                        println!("completed {completed_today}/{limit} tasks today");
+                        info!("completed {completed_today}/{limit} tasks today");
                     }
                 }
                 sleep(&cli, report.backoff, &status)?;
@@ -111,7 +124,7 @@ fn main() -> Result<()> {
             // A failing turn (bad token, unreachable forge, ...) must not
             // kill the runner now that config is editable at runtime.
             Err(err) => {
-                eprintln!("turn failed: {err:#}");
+                error!("turn failed: {err:#}");
                 Status::update(&status, |s| s.log_tail = format!("turn failed: {err:#}"));
                 sleep(&cli, Backoff::Normal, &status)?;
             }
@@ -135,6 +148,21 @@ fn local_day() -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Send logs to stderr at info and above, overridable per-module with
+/// `RUST_LOG`. Timestamps are left off because the runner's output is
+/// expected to be stamped by whatever supervises it.
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .without_time()
+        .with_ansi(std::env::var_os("NO_COLOR").is_none())
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 /// One-time startup work that doesn't depend on the mutable settings.
 fn setup(cli: &Cli) -> Result<()> {
     // Install the embedded prompts where opencode resolves commands and
@@ -150,16 +178,44 @@ fn setup(cli: &Cli) -> Result<()> {
     std::fs::create_dir_all(&cli.workspace)
         .with_context(|| format!("failed to create {}", cli.workspace.display()))?;
 
-    // ~/.gitconfig is mounted read-only from the host, so the credential
-    // helper goes in the system config instead, where every process in the
-    // container picks it up.
-    run(Command::new("git").args(["config", "--system", "credential.helper", "store"]))?;
+    let gitconfig = install_git_config(cli)?;
+    // SAFETY: setup() runs before the web UI and agent threads exist, so no
+    // other thread can be touching the environment.
+    unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &gitconfig) };
     Ok(())
+}
+
+/// Write the git config the runner owns and return its path, for
+/// `GIT_CONFIG_GLOBAL`: neither `~/.gitconfig` (mounted read-only from the
+/// host) nor `/etc/gitconfig` (root-only) can be counted on to take the
+/// credential helper. Every git the runner spawns, opencode's included,
+/// inherits the variable. The real global config is chained in with
+/// `include.path`, so the user's identity and everything else they set still
+/// applies; git ignores the include when the file isn't there.
+fn install_git_config(cli: &Cli) -> Result<PathBuf> {
+    let path = cli.workspace.join("gitconfig");
+    let mut config = String::new();
+    if let Ok(home) = std::env::var("HOME") {
+        config.push_str(&format!("[include]\n\tpath = {home}/.gitconfig\n"));
+    }
+    config.push_str(&format!(
+        "[credential]\n\thelper = store --file={}\n",
+        git_credentials(cli).display()
+    ));
+    std::fs::write(&path, config).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Where the credential helper keeps forge logins. It lives in the workspace
+/// rather than at the helper's default `~/.git-credentials`, because the home
+/// directory isn't necessarily writable.
+fn git_credentials(cli: &Cli) -> PathBuf {
+    cli.workspace.join("git-credentials")
 }
 
 /// Let git and tea authenticate to every configured forge; re-run whenever
 /// the settings change so new tokens and URLs take effect on the next turn.
-fn apply_forge_auth(cfg: &Config) -> Result<()> {
+fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
     let credentials: String = cfg
         .forges
         .iter()
@@ -170,12 +226,14 @@ fn apply_forge_auth(cfg: &Config) -> Result<()> {
             format!("{line}\n")
         })
         .collect();
+    let path = git_credentials(cli);
     OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open("/root/.git-credentials")?
+        .open(&path)
+        .with_context(|| format!("failed to write {}", path.display()))?
         .write_all(credentials.as_bytes())?;
 
     // Log tea in so its commands work without further setup; gh and glab need
@@ -204,12 +262,18 @@ fn apply_forge_auth(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Where Claude Code keeps the OAuth credentials the opencode-claude-auth
+/// plugin reads and refreshes.
+fn claude_credentials() -> PathBuf {
+    config::home().join(".claude/.credentials.json")
+}
+
 /// Whether opencode can authenticate: the opencode-claude-auth plugin reads
 /// (and refreshes) the same Claude OAuth credentials file that Claude Code
 /// maintains. Checked every loop iteration so a fixed mount recovers without
 /// a restart.
 fn claude_oauth_usable() -> bool {
-    std::fs::File::open(CLAUDE_CREDENTIALS)
+    std::fs::File::open(claude_credentials())
         .ok()
         .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok())
         .is_some_and(|credentials| {
@@ -242,7 +306,7 @@ fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let (seconds, limited) = match backoff {
         Backoff::UsageLimit(epoch) if epoch > now => {
-            println!(
+            info!(
                 "usage: limit reached; sleeping until {}",
                 iso8601(epoch).unwrap_or_else(|| epoch.to_string())
             );

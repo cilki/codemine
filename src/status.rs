@@ -1,14 +1,39 @@
 //! Shared runtime state for the optional web UI. The main loop and turn
-//! runner write into it; the web server only reads.
+//! runner write into it; the web server only reads, and is woken on every
+//! write so it can push updates instead of polling.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use tokio::sync::watch;
 
-pub type Shared = Arc<Mutex<Status>>;
+/// A handle on the status plus its change signal. Cloning is cheap and every
+/// clone shares both.
+#[derive(Clone)]
+pub struct Shared {
+    status: Arc<Mutex<Status>>,
+    /// Bumped on every update, which wakes each subscribed SSE stream. The
+    /// revision number itself is never read — only the wakeup matters.
+    changes: watch::Sender<u64>,
+}
+
+impl Shared {
+    /// Lock for reading, shrugging off poisoning so a panic on either side of
+    /// the mutex can't wedge the other.
+    pub fn lock(&self) -> MutexGuard<'_, Status> {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A receiver whose `changed()` resolves on every later update.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+}
 
 /// How many finished turns the UI remembers.
 const RECENT_CAP: usize = 50;
@@ -60,9 +85,10 @@ pub struct TurnRecord {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Activity {
     Starting,
-    /// The settings aren't runnable yet; the web UI shows what's missing.
+    /// The settings aren't runnable yet; the web UI marks the fields that
+    /// need filling in.
     Unconfigured {
-        problems: Vec<String>,
+        problems: Vec<crate::settings::Problem>,
     },
     Running {
         task: String,
@@ -109,26 +135,31 @@ pub struct Status {
     pub log_tail: String,
 }
 
-impl Status {
+impl Shared {
+    /// A fresh status, with no subscribers yet.
     pub fn new() -> Shared {
-        Arc::new(Mutex::new(Status {
-            started: epoch_now(),
-            activity: Activity::Starting,
-            day: String::new(),
-            completed_today: 0,
-            daily_limit: None,
-            totals: Totals::default(),
-            recent: VecDeque::new(),
-            log_tail: String::new(),
-        }))
+        Shared {
+            status: Arc::new(Mutex::new(Status {
+                started: epoch_now(),
+                activity: Activity::Starting,
+                day: String::new(),
+                completed_today: 0,
+                daily_limit: None,
+                totals: Totals::default(),
+                recent: VecDeque::new(),
+                log_tail: String::new(),
+            })),
+            changes: watch::channel(0).0,
+        }
     }
+}
 
-    /// Lock and mutate, shrugging off poisoning so a panic on either side of
-    /// the mutex can't wedge the other.
+impl Status {
+    /// Lock and mutate, then wake the web UI. The lock is released before the
+    /// wakeup so a subscriber can read the new state immediately.
     pub fn update(shared: &Shared, f: impl FnOnce(&mut Status)) {
-        f(&mut shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        f(&mut shared.lock());
+        shared.changes.send_modify(|revision| *revision += 1);
     }
 
     pub fn record_turn(&mut self, record: TurnRecord) {
@@ -176,7 +207,7 @@ mod tests {
 
     #[test]
     fn record_turn_caps_and_totals() {
-        let shared = Status::new();
+        let shared = Shared::new();
         Status::update(&shared, |status| {
             for _ in 0..RECENT_CAP + 10 {
                 status.record_turn(record(Outcome::Completed));
@@ -184,7 +215,7 @@ mod tests {
             status.record_turn(record(Outcome::Skipped));
         });
 
-        let status = shared.lock().unwrap();
+        let status = shared.lock();
         assert_eq!(status.recent.len(), RECENT_CAP);
         assert_eq!(status.recent[0].outcome, Outcome::Skipped);
         assert_eq!(status.totals.turns, RECENT_CAP as u64 + 11);

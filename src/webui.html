@@ -87,10 +87,25 @@
   }
   button:hover { background: rgb(78, 84, 87); }
   button.small { padding: 4px 10px; font-size: 0.8em; }
-  .save-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
-  #save-result { font-size: 0.85em; }
-  #save-result.ok { color: #2ecc71; }
-  #save-result.err { color: #e74c3c; }
+  .tasks { margin-top: 12px; }
+  .tasks .checks-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 4px 12px;
+  }
+  .tasks .check { color: #e8eaed; font-size: 0.9em; }
+  .tasks .check[title] { cursor: help; }
+  .tasks .check.off { color: #9aa0a6; }
+  /* Unrunnable settings are marked on the field that fixes them, so the
+     collapsed panel has to advertise that there is something to fix. */
+  .field input.invalid, .field select.invalid { border-color: #e74c3c; }
+  .forges.invalid { outline: 1px solid #e74c3c; outline-offset: 8px; }
+  details.panel.has-problems > summary { color: #e74c3c; }
+  details.panel > summary { cursor: pointer; margin-bottom: 0; }
+  details.panel > summary::marker { color: #9aa0a6; }
+  details.panel[open] > summary { margin-bottom: 10px; }
+  #settings-status { font-size: 0.85em; margin-top: 16px; min-height: 1.2em; }
+  #settings-status.saving { color: #9aa0a6; }
+  #settings-status.ok { color: #2ecc71; }
+  #settings-status.err { color: #e74c3c; }
 </style>
 </head>
 <body>
@@ -131,17 +146,23 @@
     </div>
   </div>
 
-  <div class="panel">
-    <div class="panel-title">Settings</div>
+  <details class="panel" id="settings">
+    <summary class="panel-title">Settings</summary>
     <div class="general-grid">
-      <div class="field"><label for="s-model">Model (provider/model)</label><input id="s-model"></div>
-      <div class="field"><label for="s-command">Command</label><input id="s-command"></div>
-      <div class="field"><label for="s-tasks">Tasks (space-separated)</label><input id="s-tasks"></div>
+      <div class="field"><label for="s-model">Model</label>
+        <select id="s-model"></select>
+      </div>
       <div class="field"><label for="s-daily-limit">Daily task limit (blank = unlimited)</label><input id="s-daily-limit" type="number" min="1"></div>
       <div class="field"><label for="s-author-name">Git author name</label><input id="s-author-name"></div>
       <div class="field"><label for="s-author-email">Git author email</label><input id="s-author-email"></div>
-      <div class="field"><label for="s-timeout">Turn timeout (seconds)</label><input id="s-timeout" type="number" min="1"></div>
-      <div class="field"><label for="s-nice">Nice 1-19 (blank = full priority)</label><input id="s-nice" type="number" min="1" max="19"></div>
+      <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
+      <div class="field"><label for="s-nice">CPU priority</label>
+        <select id="s-nice">
+          <option value="high">high</option>
+          <option value="normal">normal</option>
+          <option value="low">low</option>
+        </select>
+      </div>
       <div class="field"><label for="s-ionice">I/O class</label>
         <select id="s-ionice">
           <option value="">full priority</option>
@@ -150,12 +171,12 @@
         </select>
       </div>
     </div>
-    <div class="forges" id="forges"></div>
-    <div class="save-row">
-      <button id="save">Save</button>
-      <span id="save-result"></span>
+    <div class="field tasks"><label>Tasks</label>
+      <div class="checks-grid" id="s-tasks"></div>
     </div>
-  </div>
+    <div class="forges" id="forges"></div>
+    <div id="settings-status"></div>
+  </details>
 </div>
 
 <script>
@@ -188,27 +209,61 @@
     unconfigured: "unconfigured",
   };
 
+  // Outline every field the runner is waiting on, and clear the ones that
+  // were fixed. Values are never touched, so this is safe to run on the
+  // status poll while the form is being edited.
+  function markProblems(problems) {
+    for (const marked of document.querySelectorAll(".invalid")) {
+      marked.classList.remove("invalid");
+      marked.title = "";
+    }
+    const fields = problems.map(p => p.field).filter(Boolean);
+    for (const field of fields) $(field)?.classList.add("invalid");
+    $("settings").classList.toggle("has-problems", fields.length > 0);
+    // The message still belongs to the field — as its tooltip.
+    for (const problem of problems) {
+      if (problem.field) {
+        const el = $(problem.field);
+        if (el) el.title = problem.message;
+      }
+    }
+  }
+
+  // Elapsed and remaining advance on their own between events, so they are
+  // redrawn on a local timer rather than waiting for the server to say
+  // something.
+  function renderClock() {
+    const a = state.activity;
+    let timer = "";
+    if (a.state === "running") {
+      timer = fmtDuration(serverNow() - a.started) + " elapsed";
+    } else if (a.state === "sleeping" || a.state === "usage_limit") {
+      timer = fmtDuration(a.until - serverNow()) + " remaining";
+    }
+    $("timer").textContent = timer;
+    $("uptime").textContent = "up " + fmtDuration(serverNow() - state.started);
+  }
+
   function render() {
     const a = state.activity;
     $("badge").textContent = BADGES[a.state] || a.state;
     $("badge").className = "badge " + a.state;
 
-    let detail = "", timer = "", workspace = "";
+    let detail = "", workspace = "";
     if (a.state === "running") {
       detail = a.task + " on " + a.repo + " (" + a.forge + ")";
-      timer = fmtDuration(serverNow() - a.started) + " elapsed";
       workspace = a.workspace;
-    } else if (a.state === "sleeping" || a.state === "usage_limit") {
-      timer = fmtDuration(a.until - serverNow()) + " remaining";
     } else if (a.state === "waiting_for_tomorrow") {
       detail = "daily limit reached; waiting for " + a.day + " to end";
     } else if (a.state === "unconfigured") {
-      detail = a.problems.join(" · ");
+      // Problems that map to a setting are marked on the field itself; only
+      // the ones nothing in the form can fix are spelled out here.
+      detail = a.problems.filter(p => !p.field).map(p => p.message).join(" · ");
     }
+    markProblems(a.state === "unconfigured" ? a.problems : []);
     $("detail").textContent = detail;
-    $("timer").textContent = timer;
     $("workspace").textContent = workspace;
-    $("uptime").textContent = "up " + fmtDuration(serverNow() - state.started);
+    renderClock();
 
     $("stat-today").textContent =
       state.completed_today + " / " + (state.daily_limit ?? "∞");
@@ -248,38 +303,34 @@
     if (rows.length) $("recent").replaceChildren(...rows);
   }
 
-  async function refresh() {
-    try {
-      const res = await fetch("/api/status");
-      if (!res.ok) throw new Error(res.status);
-      state = await res.json();
-      state.received = Date.now();
-      $("disconnected").hidden = true;
-      render();
-    } catch {
-      $("disconnected").hidden = false;
-    }
+  // Stay pinned to the bottom unless the reader has scrolled up to look at
+  // something.
+  function setLog(text) {
+    const log = $("log");
+    const follow = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    log.textContent = text;
+    if (follow) log.scrollTop = log.scrollHeight;
   }
 
-  async function refreshLog() {
-    if (!state) return;
-    if (state.activity.state !== "running") {
-      $("log").textContent = state.log_tail;
-      return;
-    }
-    try {
-      const res = await fetch("/api/log");
-      if (!res.ok) throw new Error(res.status);
-      const log = $("log");
-      const follow = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-      log.textContent = await res.text();
-      if (follow) log.scrollTop = log.scrollHeight;
-    } catch {}
+  // The server pushes status on every change and the log tail as it grows;
+  // EventSource reconnects on its own, so a dropped stream only shows up as
+  // the disconnected marker until it comes back.
+  function listen() {
+    const events = new EventSource("/api/events");
+    events.addEventListener("status", event => {
+      state = JSON.parse(event.data);
+      state.received = Date.now();
+      render();
+    });
+    events.addEventListener("log", event => setLog(JSON.parse(event.data)));
+    events.onopen = () => $("disconnected").hidden = true;
+    events.onerror = () => $("disconnected").hidden = false;
   }
 
   // ---- Settings ----
-  // The settings form loads once (and re-renders after a save), never on the
-  // status poll, so in-progress edits aren't clobbered.
+  // The settings form loads once, never on the status poll, and every edit
+  // saves itself; the form is not re-rendered afterwards, so a save can't
+  // clobber whatever is being edited next.
 
   const FORGES = ["gitea", "github", "gitlab"];
   const URL_PLACEHOLDER = {
@@ -289,6 +340,59 @@
   };
   // Per forge: Set of disabled repo names, edited by the checkboxes.
   const disabledRepos = {};
+
+  // The fixed choices from /api/options: the models the runner can be pointed
+  // at, and the task pool parsed out of the sweep command.
+  let options = { models: [], tasks: [] };
+  // The enabled tasks, edited by the checkboxes.
+  const enabledTasks = new Set();
+
+  // A stored value that is no longer on offer (a model we dropped, a task
+  // slug an older sweep.md defined) is kept as an extra choice rather than
+  // silently rewritten to something else.
+  function renderModels(selected) {
+    const ids = options.models.map(m => m.id);
+    const extra = selected && !ids.includes(selected)
+      ? [{ id: selected, label: `${selected} (not offered)` }] : [];
+    $("s-model").replaceChildren(...[...options.models, ...extra].map(model =>
+      Object.assign(document.createElement("option"),
+        { value: model.id, textContent: model.label })));
+    $("s-model").value = selected;
+  }
+
+  function taskRow(name, description) {
+    const label = document.createElement("label");
+    // The sweep command's own instructions for the task, as a hover tooltip.
+    label.title = description;
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = enabledTasks.has(name);
+    const paint = () => label.className = "check" + (box.checked ? "" : " off");
+    box.onchange = () => {
+      box.checked ? enabledTasks.add(name) : enabledTasks.delete(name);
+      paint();
+    };
+    paint();
+    label.append(box, document.createTextNode(name));
+    return label;
+  }
+
+  function renderTasks(selected) {
+    enabledTasks.clear();
+    for (const task of selected) enabledTasks.add(task);
+    const offered = new Map(options.tasks.map(t => [t.slug, t.description]));
+    const extra = selected.filter(slug => !offered.has(slug))
+      .map(slug => [slug, "not in the sweep command"]);
+    $("s-tasks").replaceChildren(...[...offered, ...extra]
+      .map(([slug, description]) => taskRow(slug, description)));
+  }
+
+  // Niceness is presented as a priority, since the numbers in between make no
+  // practical difference to a background agent. A hand-edited config.json
+  // lands on the nearest level and is rewritten to it on the next save.
+  const NICE = { high: null, normal: 10, low: 19 };
+  const nicePriority = nice =>
+    nice == null ? "high" : nice <= 14 ? "normal" : "low";
 
   function forgeCard(name) {
     const card = document.createElement("div");
@@ -349,14 +453,13 @@
   }
 
   function renderSettings(s) {
-    $("s-model").value = s.model;
-    $("s-command").value = s.command;
-    $("s-tasks").value = s.tasks.join(" ");
+    renderModels(s.model);
+    renderTasks(s.tasks);
     $("s-daily-limit").value = s.daily_limit ?? "";
     $("s-author-name").value = s.author_name;
     $("s-author-email").value = s.author_email;
-    $("s-timeout").value = s.turn_timeout_secs;
-    $("s-nice").value = s.nice ?? "";
+    $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
+    $("s-nice").value = nicePriority(s.nice);
     $("s-ionice").value = s.ionice ?? "";
     for (const forge of FORGES) {
       const f = s[forge];
@@ -374,21 +477,23 @@
   }
 
   async function loadSettings() {
-    const res = await fetch("/api/settings");
-    if (res.ok) renderSettings(await res.json());
+    const res = await fetch("/api/options");
+    if (res.ok) options = await res.json();
+    const settings = await fetch("/api/settings");
+    if (settings.ok) renderSettings(await settings.json());
   }
 
-  async function save() {
+  function settingsBody() {
     const num = value => value === "" ? null : Number(value);
+    const minutes = num($("s-timeout").value);
     const body = {
       model: $("s-model").value,
-      command: $("s-command").value,
-      tasks: $("s-tasks").value.split(/\s+/).filter(Boolean),
+      tasks: [...enabledTasks],
       daily_limit: num($("s-daily-limit").value),
       author_name: $("s-author-name").value,
       author_email: $("s-author-email").value,
-      turn_timeout_secs: num($("s-timeout").value) ?? 0,
-      nice: num($("s-nice").value),
+      turn_timeout_secs: minutes === null ? 0 : minutes * 60,
+      nice: NICE[$("s-nice").value] ?? null,
       ionice: $("s-ionice").value || null,
     };
     for (const forge of FORGES) {
@@ -401,31 +506,72 @@
         disabled_repos: [...disabledRepos[forge]].sort(),
       };
     }
-    const result = $("save-result");
+    return body;
+  }
+
+  // Edits save themselves. A save in flight sets `again` instead of racing a
+  // second PUT, so the last edit always wins and the form is never rewritten
+  // under the cursor.
+  let timer = null, saving = false, again = false;
+
+  function scheduleSave(delay) {
+    clearTimeout(timer);
+    timer = setTimeout(save, delay);
+  }
+
+  async function save() {
+    clearTimeout(timer);
+    if (saving) {
+      again = true;
+      return;
+    }
+    saving = true;
+    const status = $("settings-status");
+    status.className = "saving";
+    status.textContent = "saving…";
     try {
       const res = await fetch("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(settingsBody()),
       });
       const returned = await res.json();
       if (!res.ok) throw new Error(returned.error || res.status);
-      renderSettings(returned);
-      result.className = "ok";
-      result.textContent = "saved — applies from the next turn";
+      // Tokens are write-only: once stored, drop what was typed and say so.
+      for (const forge of FORGES) {
+        const token = $(`f-${forge}-token`);
+        if (token.value) {
+          token.value = "";
+          token.placeholder = returned[forge].token_set
+            ? "token set — leave blank to keep" : "no token";
+        }
+      }
+      status.className = "ok";
+      status.textContent = "saved — applies from the next turn";
     } catch (err) {
-      result.className = "err";
-      result.textContent = String(err.message || err);
+      status.className = "err";
+      status.textContent = String(err.message || err);
+    } finally {
+      saving = false;
+      if (again) {
+        again = false;
+        scheduleSave(0);
+      }
     }
   }
 
   $("forges").append(...FORGES.map(forgeCard));
-  $("save").onclick = save;
+  // Delegated, so the repo and task checkboxes built later are covered too.
+  // Typing debounces; committed choices save at once. Token fields are left
+  // to `change` alone, so a partial secret is never stored.
+  $("settings").addEventListener("input", event => {
+    if (event.target.type !== "password") scheduleSave(600);
+  });
+  $("settings").addEventListener("change", () => scheduleSave(0));
   loadSettings();
 
-  setInterval(refresh, 2000);
-  setInterval(refreshLog, 3000);
-  refresh().then(refreshLog);
+  setInterval(() => { if (state) renderClock(); }, 1000);
+  listen();
 </script>
 </body>
 </html>

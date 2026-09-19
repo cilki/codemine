@@ -21,8 +21,6 @@ pub struct Settings {
     pub gitlab: ForgeSettings,
     /// Model to run turns with, as provider/model; empty means unconfigured.
     pub model: String,
-    /// The opencode command to run each turn.
-    pub command: String,
     /// The task pool the runner draws from each turn.
     pub tasks: Vec<String>,
     /// Maximum completed (not skipped) tasks per local day; None is unlimited.
@@ -46,7 +44,6 @@ impl Default for Settings {
             github: ForgeSettings::default(),
             gitlab: ForgeSettings::default(),
             model: String::new(),
-            command: "sweep".into(),
             tasks: crate::prompts::default_tasks(),
             daily_limit: None,
             author_name: String::new(),
@@ -104,6 +101,24 @@ impl ForgeSettings {
 
 const FORGE_KINDS: [ForgeKind; 3] = [ForgeKind::Gitea, ForgeKind::Github, ForgeKind::Gitlab];
 
+/// Something that blocks turns from running, tied to the web UI element that
+/// fixes it so the page can mark that field instead of listing the message.
+/// An empty `field` means nothing in the settings can fix it.
+#[derive(Serialize, Clone)]
+pub struct Problem {
+    pub field: String,
+    pub message: String,
+}
+
+impl Problem {
+    pub fn new(field: &str, message: impl Into<String>) -> Self {
+        Problem {
+            field: field.to_owned(),
+            message: message.into(),
+        }
+    }
+}
+
 impl Settings {
     pub fn forge(&self, kind: ForgeKind) -> &ForgeSettings {
         match kind {
@@ -141,33 +156,48 @@ impl Settings {
         })
     }
 
-    /// What blocks turns from running, as human-readable messages for the UI.
+    /// What blocks turns from running, each tied to the field that fixes it.
     /// Empty means the settings are runnable.
-    pub fn problems(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
         for kind in FORGE_KINDS {
             let forge = self.forge(kind);
             if !forge.enabled {
                 continue;
             }
+            let name = kind.name();
             if forge.token.is_empty() {
-                problems.push(format!("{} is enabled but has no token", kind.name()));
+                problems.push(Problem::new(
+                    &format!("f-{name}-token"),
+                    format!("{name} is enabled but has no token"),
+                ));
             }
-            if kind == ForgeKind::Gitea && (forge.user.is_empty() || forge.url.is_empty()) {
-                problems.push("gitea needs a user and URL".into());
+            if kind == ForgeKind::Gitea {
+                if forge.user.is_empty() {
+                    problems.push(Problem::new("f-gitea-user", "gitea needs a bot user"));
+                }
+                if forge.url.is_empty() {
+                    problems.push(Problem::new("f-gitea-url", "gitea needs a URL"));
+                }
             }
         }
-        if !FORGE_KINDS.iter().any(|&kind| self.forge(kind).active(kind)) {
-            problems.push("no forge is enabled with a token".into());
+        if !FORGE_KINDS
+            .iter()
+            .any(|&kind| self.forge(kind).active(kind))
+        {
+            problems.push(Problem::new("forges", "no forge is enabled with a token"));
         }
         if self.model.is_empty() {
-            problems.push("model is not set".into());
+            problems.push(Problem::new("s-model", "model is not set"));
         }
         if self.author_name.is_empty() {
-            problems.push("git author name is not set".into());
+            problems.push(Problem::new("s-author-name", "git author name is not set"));
         }
         if self.author_email.is_empty() {
-            problems.push("git author email is not set".into());
+            problems.push(Problem::new(
+                "s-author-email",
+                "git author email is not set",
+            ));
         }
         problems
     }
@@ -183,7 +213,6 @@ impl Settings {
                 .filter_map(|&kind| self.runtime_forge(kind))
                 .collect(),
             model: self.model.clone(),
-            command: self.command.clone(),
             tasks: self.tasks.clone(),
             daily_limit: self.daily_limit,
             author_name: self.author_name.clone(),
@@ -203,7 +232,9 @@ impl Settings {
             let forge = value[kind.name()]
                 .as_object_mut()
                 .expect("forge sections are objects");
-            let set = forge["token"].as_str().is_some_and(|token| !token.is_empty());
+            let set = forge["token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty());
             forge.remove("token");
             forge.insert("token_set".into(), set.into());
         }
@@ -215,7 +246,6 @@ impl Settings {
     /// one overwrites it.
     pub fn apply_update(&mut self, mut incoming: Settings) -> Result<()> {
         incoming.model = incoming.model.trim().to_owned();
-        incoming.command = incoming.command.trim().to_owned();
         incoming.author_name = incoming.author_name.trim().to_owned();
         incoming.author_email = incoming.author_email.trim().to_owned();
         for kind in FORGE_KINDS {
@@ -238,9 +268,6 @@ impl Settings {
         }
         if self.turn_timeout_secs == 0 {
             bail!("turn timeout must be positive");
-        }
-        if self.command.is_empty() {
-            bail!("command must not be empty");
         }
         if self.tasks.iter().all(|task| task.trim().is_empty()) {
             bail!("task pool must not be empty");
@@ -344,15 +371,18 @@ mod tests {
     }
 
     fn cli() -> Cli {
-        Cli::parse(["codemine", "--workspace", "/tmp/ws"].map(String::from).into_iter())
-            .unwrap()
-            .unwrap()
+        Cli::parse(
+            ["codemine", "--workspace", "/tmp/ws"]
+                .map(String::from)
+                .into_iter(),
+        )
+        .unwrap()
+        .unwrap()
     }
 
     #[test]
     fn defaults_are_unconfigured() {
         let settings = Settings::default();
-        assert_eq!(settings.command, "sweep");
         assert_eq!(settings.turn_timeout_secs, 21600);
         assert!(!settings.tasks.is_empty());
         assert!(!settings.problems().is_empty());
@@ -375,8 +405,9 @@ mod tests {
         let mut settings = configured();
         settings.gitea.enabled = true;
         settings.gitea.token = "tok".into();
-        let problems = settings.problems();
-        assert!(problems.iter().any(|p| p.contains("gitea")), "{problems:?}");
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert!(fields.iter().any(|f| f == "f-gitea-user"), "{fields:?}");
+        assert!(fields.iter().any(|f| f == "f-gitea-url"), "{fields:?}");
         assert!(settings.to_config(&cli()).is_none());
     }
 

@@ -33,11 +33,12 @@ configured through the web UI:
 | `--workspace DIR` | Persistent workspace root (default `~/.codemine`) |
 | `--once`          | Run a single turn and exit                        |
 
-Settings are edited on the web UI's settings panel and persisted to
-`<workspace>/config.json` (mode 0600, since it holds the forge tokens). Until
-the settings are complete — at least one forge enabled with a token, plus a
-model and git author — the runner idles in an `unconfigured` state and the UI
-lists what's missing. Changes apply at the next turn boundary.
+Settings are edited on the web UI's settings panel (collapsed by default) and
+persisted to `<workspace>/config.json` (mode 0600, since it holds the forge
+tokens). Until the settings are complete — at least one forge enabled with a
+token, plus a model and git author — the runner idles in an `unconfigured`
+state and the UI outlines each field that needs filling in, with the reason as
+its tooltip. Changes apply at the next turn boundary.
 
 Per forge (Gitea, GitHub, GitLab) the UI configures: enabled, token, base URL
 (GitHub and GitLab default to their public instances; Gitea has no default),
@@ -47,10 +48,12 @@ are enabled by default, so new repositories join the pool automatically, and
 only the disabled set is stored. Tokens are write-only: once saved they are
 never shown again and can only be overwritten.
 
-The general settings cover the model (as provider/model), the opencode
-command (default `sweep`), the task pool, the daily completed-task limit
-(blank = unlimited), the git author name/email, the turn timeout, and the
-resource limits (CPU niceness 1-19 and I/O class `best-effort`/`idle`).
+The general settings cover the model (chosen from the Claude models the
+bundled OAuth login can reach), the task pool (a checkbox per task in the
+sweep command, showing that task's instructions on hover), the daily completed-task limit (blank = unlimited), the git
+author name/email, the turn timeout in minutes, and the resource limits (CPU
+priority high/normal/low and I/O class `best-effort`/`idle`). Edits save
+themselves and apply from the next turn; there is no save button.
 
 The runner injects `GITHUB_TOKEN`/`GITLAB_TOKEN` (and `GH_HOST`/`GITLAB_HOST`
 for self-hosted instances) into `gh`, `glab`, and the agent session itself,
@@ -90,7 +93,8 @@ the limit is reached the runner sleeps until the date changes. The count
 lives in memory, so restarting the container resets it.
 
 A writable mount of Claude Code's OAuth credentials is expected at
-`/root/.claude/.credentials.json`; the opencode-claude-auth plugin refreshes the
+`~/.claude/.credentials.json` — `/root/.claude/.credentials.json` in the image,
+since the container runs as root; the opencode-claude-auth plugin refreshes the
 tokens in place.
 
 On low-resource machines, the nice and I/O class settings throttle the agent
@@ -105,7 +109,9 @@ The web UI is always on (bind address via `--listen`) and serves both the
 status page and the settings panel. The status page shows what the runner is
 currently doing (with a live log tail while a turn runs), today's completed
 count, cumulative totals, and the recent turns with their durations and token
-usage, polling the server every couple of seconds.
+usage. It does not poll: the server pushes over SSE (`/api/events`) as soon as
+the state changes, and the log tail as it grows. `/api/status` and `/api/log`
+remain as one-shot endpoints for scripting.
 
 The UI has no authentication and configures tokens that can push to your
 repositories — bind it to a trusted network (or localhost behind a reverse
