@@ -60,6 +60,10 @@ pub struct TurnRecord {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Activity {
     Starting,
+    /// The settings aren't runnable yet; the web UI shows what's missing.
+    Unconfigured {
+        problems: Vec<String>,
+    },
     Running {
         task: String,
         repo: String,
@@ -106,13 +110,13 @@ pub struct Status {
 }
 
 impl Status {
-    pub fn new(daily_limit: Option<u32>) -> Shared {
+    pub fn new() -> Shared {
         Arc::new(Mutex::new(Status {
             started: epoch_now(),
             activity: Activity::Starting,
             day: String::new(),
             completed_today: 0,
-            daily_limit,
+            daily_limit: None,
             totals: Totals::default(),
             recent: VecDeque::new(),
             log_tail: String::new(),
@@ -172,7 +176,7 @@ mod tests {
 
     #[test]
     fn record_turn_caps_and_totals() {
-        let shared = Status::new(None);
+        let shared = Status::new();
         Status::update(&shared, |status| {
             for _ in 0..RECENT_CAP + 10 {
                 status.record_turn(record(Outcome::Completed));

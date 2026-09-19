@@ -3,9 +3,10 @@
 Continuously runs [opencode](https://opencode.ai) turns that sweep our
 repositories on Gitea, GitHub, and GitLab. Each turn the runner picks a task
 and a repository at random, logs the pair, and hands them to the agent, which
-delivers its work as a PR or issue. Each turn runs in a fresh session,
+delivers its work as a PR or issue. Configuration lives in the always-on web
+UI, persisted in the workspace. Each turn runs in a fresh session,
 back-to-back with the previous one, against a persistent workspace: the runner
-keeps one clone per repository under `CODEMINE_WORKSPACE`, brings it back to a
+keeps one clone per repository under the workspace root, brings it back to a
 current default branch before the turn (hard reset; ignored files like build
 caches survive), and maintains a [codegraph](https://github.com/colbymchenry/codegraph)
 index in it. The agent explores through codegraph's `codegraph_explore` MCP
@@ -23,32 +24,38 @@ back to exploring the tree normally.
 
 ## Configuration
 
-| Variable               | Description                                             |
-| ---------------------- | ------------------------------------------------------- |
-| `GITEA_TOKEN`          | Gitea personal access token, scoped to write:repository |
-| `GITEA_USER`           | The bot account's Gitea username                        |
-| `GITEA_URL`            | Gitea base URL                                          |
-| `GITHUB_TOKEN`         | GitHub personal access token                            |
-| `GITHUB_URL`           | GitHub base URL (default `https://github.com`)          |
-| `GITLAB_TOKEN`         | GitLab personal access token                            |
-| `GITLAB_URL`           | GitLab base URL (default `https://gitlab.com`)          |
-| `CODEMINE_MODEL`       | Model to run turns with, as provider/model              |
-| `CODEMINE_COMMAND`     | The opencode command to run each turn (default `sweep`) |
-| `CODEMINE_TASKS`       | Space-separated task pool (default: all tasks)          |
-| `CODEMINE_DAILY_LIMIT` | Max completed tasks per day (default: unlimited)        |
-| `CODEMINE_TIMEOUT`     | Seconds before a turn is cut off (default 21600)        |
-| `CODEMINE_NICE`        | CPU niceness for the agent, 1-19 (default: none)        |
-| `CODEMINE_IONICE`      | I/O class: `best-effort` or `idle` (default: none)      |
-| `CODEMINE_WEBUI`       | Bind address for the status web UI (default: disabled)  |
-| `CODEMINE_WORKSPACE`   | Persistent workspace root (default `~/.codemine`)       |
-| `GIT_AUTHOR_NAME`      | The name commits are authored (and committed) as        |
-| `GIT_AUTHOR_EMAIL`     | The email commits are authored (and committed) as       |
+The command line only chooses where things live; everything else is
+configured through the web UI:
 
-Each forge is enabled by setting its token variable, and at least one must be
-configured. Gitea also needs `GITEA_USER` and `GITEA_URL`. `gh` and `glab`
-authenticate from `GITHUB_TOKEN` and `GITLAB_TOKEN` directly; for self-hosted
-instances, set the CLIs' own host variables (`GH_HOST`, `GITLAB_HOST`)
-alongside the base URL.
+| Flag              | Description                                       |
+| ----------------- | ------------------------------------------------- |
+| `--listen ADDR`   | Bind address for the web UI (default `0.0.0.0:8080`) |
+| `--workspace DIR` | Persistent workspace root (default `~/.codemine`) |
+| `--once`          | Run a single turn and exit                        |
+
+Settings are edited on the web UI's settings panel and persisted to
+`<workspace>/config.json` (mode 0600, since it holds the forge tokens). Until
+the settings are complete — at least one forge enabled with a token, plus a
+model and git author — the runner idles in an `unconfigured` state and the UI
+lists what's missing. Changes apply at the next turn boundary.
+
+Per forge (Gitea, GitHub, GitLab) the UI configures: enabled, token, base URL
+(GitHub and GitLab default to their public instances; Gitea has no default),
+and — Gitea only — the bot account's username. Each forge card can also load
+the live repository list and enable/disable individual repositories: repos
+are enabled by default, so new repositories join the pool automatically, and
+only the disabled set is stored. Tokens are write-only: once saved they are
+never shown again and can only be overwritten.
+
+The general settings cover the model (as provider/model), the opencode
+command (default `sweep`), the task pool, the daily completed-task limit
+(blank = unlimited), the git author name/email, the turn timeout, and the
+resource limits (CPU niceness 1-19 and I/O class `best-effort`/`idle`).
+
+The runner injects `GITHUB_TOKEN`/`GITLAB_TOKEN` (and `GH_HOST`/`GITLAB_HOST`
+for self-hosted instances) into `gh`, `glab`, and the agent session itself,
+and maintains the `tea` login for Gitea, so the forge CLIs work without any
+environment setup.
 
 The binary embeds the `sweep` command and one skill per forge (how to open
 PRs, respond to feedback, and file issues via the `tea`, `gh`, and `glab`
@@ -57,14 +64,15 @@ with the codegraph MCP server entry in `opencode.json`, so it runs the same
 inside or outside the image.
 
 Mount a volume at the workspace root (`/root/.codemine` unless you point
-`CODEMINE_WORKSPACE` elsewhere) to keep clones and codegraph indexes across
-container restarts. Without it everything still works, but each repository is
-recloned and reindexed after every restart.
+`--workspace` elsewhere) to keep the settings (`config.json`), clones, and
+codegraph indexes across container restarts. Without it each repository is
+recloned and reindexed after every restart — and the configuration is lost,
+so a persistent workspace is strongly recommended.
 
-Each turn the runner draws one task from `CODEMINE_TASKS` and one repository
-from everything the bot's account can reach across the configured forges, and
-passes both — plus the repository's forge — into the sweep prompt. The
-available tasks:
+Each turn the runner draws one task from the configured task pool and one
+repository from everything the bot's account can reach across the configured
+forges (minus the repositories disabled in the UI), and passes both — plus
+the repository's forge — into the sweep prompt. The available tasks:
 
 - `feedback` — respond to PR review comments, fix failing CI, address assigned
   issues
@@ -76,31 +84,39 @@ available tasks:
 
 Each turn ends as either completed or skipped: the agent closes its final
 message with a `TASK COMPLETED` or `TASK SKIPPED` marker line, which the
-runner reads from the log. `CODEMINE_DAILY_LIMIT` caps how many completed
-turns run per local day — skipped turns don't count, and turns with no marker
-do. When the limit is reached the runner sleeps until the date changes. The
-count lives in memory, so restarting the container resets it.
+runner reads from the log. The daily limit caps how many completed turns run
+per local day — skipped turns don't count, and turns with no marker do. When
+the limit is reached the runner sleeps until the date changes. The count
+lives in memory, so restarting the container resets it.
 
 A writable mount of Claude Code's OAuth credentials is expected at
 `/root/.claude/.credentials.json`; the opencode-claude-auth plugin refreshes the
 tokens in place.
 
-On low-resource machines, `CODEMINE_NICE` and `CODEMINE_IONICE` throttle the
-agent by spawning it through `nice`/`ionice`; the whole process tree (cargo,
-rustc, test runs, ...) inherits the reduced priorities. Unset means full
-priority. I/O priorities only take effect on schedulers that honor them (e.g.
-bfq); CPU niceness works everywhere.
-
-Pass `--once` to run a single turn and exit.
+On low-resource machines, the nice and I/O class settings throttle the agent
+by spawning it through `nice`/`ionice`; the whole process tree (cargo, rustc,
+test runs, ...) inherits the reduced priorities. Unset means full priority.
+I/O priorities only take effect on schedulers that honor them (e.g. bfq); CPU
+niceness works everywhere.
 
 ## Web UI
 
-Set `CODEMINE_WEBUI` to a bind address (e.g. `0.0.0.0:8080`) to serve a
-read-only status page: what the runner is currently doing (with a live log
-tail while a turn runs), today's completed count, cumulative totals, and the
-recent turns with their durations and token usage. The page polls the server
-every couple of seconds. `GET /api/status` returns the same data as JSON and
-`GET /api/log` the current log tail as plain text.
+The web UI is always on (bind address via `--listen`) and serves both the
+status page and the settings panel. The status page shows what the runner is
+currently doing (with a live log tail while a turn runs), today's completed
+count, cumulative totals, and the recent turns with their durations and token
+usage, polling the server every couple of seconds.
+
+The UI has no authentication and configures tokens that can push to your
+repositories — bind it to a trusted network (or localhost behind a reverse
+proxy), not the open internet.
+
+The HTTP API: `GET /api/status` returns the status as JSON and `GET /api/log`
+the current log tail as plain text. `GET /api/settings` returns the settings
+with each token redacted to a `token_set` flag; `PUT /api/settings` replaces
+them, where an empty or absent token keeps the stored one. `GET
+/api/repos/{forge}` lists the forge's reachable repositories merged with the
+disabled set.
 
 Token counts are collected best-effort from opencode's session storage after
 each turn and shown as unknown when they can't be read.

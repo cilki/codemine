@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ForgeKind {
@@ -20,10 +22,20 @@ impl ForgeKind {
             ForgeKind::Gitlab => "gitlab",
         }
     }
+
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "gitea" => Some(ForgeKind::Gitea),
+            "github" => Some(ForgeKind::Github),
+            "gitlab" => Some(ForgeKind::Gitlab),
+            _ => None,
+        }
+    }
 }
 
 /// I/O scheduling class for the agent process tree, passed to ionice.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum IoClass {
     /// Best-effort class at the lowest level (ionice -c 2 -n 7).
     BestEffort,
@@ -31,7 +43,7 @@ pub enum IoClass {
     Idle,
 }
 
-/// One code forge the bot sweeps, enabled by its token variable.
+/// One code forge the bot sweeps.
 pub struct Forge {
     pub kind: ForgeKind,
     pub token: String,
@@ -39,8 +51,45 @@ pub struct Forge {
     /// token-bearing pseudo-user over HTTPS.
     pub user: String,
     pub url: String,
+    /// Repositories excluded from sweeping; everything else the account can
+    /// reach is fair game, so new repositories join the pool automatically.
+    pub disabled_repos: BTreeSet<String>,
 }
 
+impl Forge {
+    /// Environment for child processes that talk to this forge: `gh` and
+    /// `glab` (run both directly and inside the agent session) authenticate
+    /// from these variables. Gitea needs none; `tea` reads its login file.
+    pub fn env(&self) -> Vec<(String, String)> {
+        match self.kind {
+            ForgeKind::Gitea => Vec::new(),
+            ForgeKind::Github => {
+                let mut env = vec![("GITHUB_TOKEN".to_owned(), self.token.clone())];
+                if self.url != "https://github.com" {
+                    let host = self
+                        .url
+                        .split_once("://")
+                        .map_or(self.url.as_str(), |(_, rest)| rest);
+                    env.push(("GH_HOST".to_owned(), host.trim_end_matches('/').to_owned()));
+                }
+                env
+            }
+            ForgeKind::Gitlab => {
+                let mut env = vec![("GITLAB_TOKEN".to_owned(), self.token.clone())];
+                if self.url != "https://gitlab.com" {
+                    env.push((
+                        "GITLAB_HOST".to_owned(),
+                        self.url.trim_end_matches('/').to_owned(),
+                    ));
+                }
+                env
+            }
+        }
+    }
+}
+
+/// A runnable snapshot of the settings, rebuilt from the store before each
+/// turn so UI changes apply at the next turn boundary.
 pub struct Config {
     pub forges: Vec<Forge>,
     pub model: String,
@@ -53,130 +102,132 @@ pub struct Config {
     pub author_name: String,
     pub author_email: String,
     pub turn_timeout: Duration,
-    /// CPU niceness applied to the agent process tree (CODEMINE_NICE, 1-19).
+    /// CPU niceness applied to the agent process tree (1-19).
     pub nice: Option<u8>,
-    /// I/O scheduling class applied to the agent process tree (CODEMINE_IONICE).
+    /// I/O scheduling class applied to the agent process tree.
     pub ionice: Option<IoClass>,
-    /// Run a single turn and exit (--once).
-    pub once: bool,
-    /// Bind address for the read-only status web UI; None disables it.
-    pub webui: Option<SocketAddr>,
     /// Root of the persistent workspace where repositories stay cloned across
-    /// turns (CODEMINE_WORKSPACE, default ~/.codemine).
+    /// turns.
     pub workspace: PathBuf,
 }
 
-fn required(name: &str) -> Result<String> {
-    std::env::var(name).map_err(|_| anyhow!("{name} is not set"))
+pub const USAGE: &str = "usage: codemine [--listen ADDR] [--workspace DIR] [--once]
+
+  --listen ADDR     bind address for the web UI (default 0.0.0.0:8080)
+  --workspace DIR   persistent workspace root (default ~/.codemine)
+  --once            run a single turn and exit
+  --help            show this help";
+
+/// Command-line options; everything else is configured through the web UI
+/// and persisted in the workspace.
+pub struct Cli {
+    pub listen: SocketAddr,
+    pub workspace: PathBuf,
+    pub once: bool,
 }
 
-impl Config {
-    pub fn from_env(args: impl Iterator<Item = String>) -> Result<Self> {
-        let timeout = match std::env::var("CODEMINE_TIMEOUT") {
-            Ok(s) => s
-                .parse()
-                .with_context(|| format!("CODEMINE_TIMEOUT is not a number of seconds: {s}"))?,
-            Err(_) => 21600,
+impl Cli {
+    /// Parse argv; None means --help was requested and the caller should
+    /// print `USAGE` instead of running.
+    pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Self>> {
+        let mut cli = Cli {
+            listen: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            workspace: default_workspace(),
+            once: false,
         };
-
-        let tasks = match std::env::var("CODEMINE_TASKS") {
-            Ok(s) => {
-                let tasks: Vec<String> = s.split_whitespace().map(String::from).collect();
-                if tasks.is_empty() {
-                    bail!("CODEMINE_TASKS is set but empty");
+        let mut args = args.skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--listen" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--listen needs an address\n{USAGE}"))?;
+                    cli.listen = value
+                        .parse()
+                        .with_context(|| format!("--listen is not a socket address: {value}"))?;
                 }
-                tasks
-            }
-            Err(_) => crate::prompts::default_tasks(),
-        };
-
-        let daily_limit = match std::env::var("CODEMINE_DAILY_LIMIT") {
-            Ok(s) => Some(
-                s.parse()
-                    .with_context(|| format!("CODEMINE_DAILY_LIMIT is not a number: {s}"))?,
-            ),
-            Err(_) => None,
-        };
-
-        let mut forges = Vec::new();
-        if std::env::var("GITEA_TOKEN").is_ok() {
-            forges.push(Forge {
-                kind: ForgeKind::Gitea,
-                token: required("GITEA_TOKEN")?,
-                user: required("GITEA_USER")?,
-                url: required("GITEA_URL")?,
-            });
-        }
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            forges.push(Forge {
-                kind: ForgeKind::Github,
-                token,
-                user: "x-access-token".into(),
-                url: std::env::var("GITHUB_URL").unwrap_or_else(|_| "https://github.com".into()),
-            });
-        }
-        if let Ok(token) = std::env::var("GITLAB_TOKEN") {
-            forges.push(Forge {
-                kind: ForgeKind::Gitlab,
-                token,
-                user: "oauth2".into(),
-                url: std::env::var("GITLAB_URL").unwrap_or_else(|_| "https://gitlab.com".into()),
-            });
-        }
-        if forges.is_empty() {
-            bail!("no forge configured; set GITEA_TOKEN, GITHUB_TOKEN, or GITLAB_TOKEN");
-        }
-
-        let nice = match std::env::var("CODEMINE_NICE") {
-            Ok(s) => {
-                let nice = s
-                    .parse()
-                    .with_context(|| format!("CODEMINE_NICE is not a number: {s}"))?;
-                if !(1..=19).contains(&nice) {
-                    bail!("CODEMINE_NICE must be between 1 and 19: {s}");
+                "--workspace" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--workspace needs a directory\n{USAGE}"))?;
+                    cli.workspace = PathBuf::from(value);
                 }
-                Some(nice)
+                "--once" => cli.once = true,
+                "--help" | "-h" => return Ok(None),
+                other => bail!("unknown argument: {other}\n{USAGE}"),
             }
-            Err(_) => None,
-        };
+        }
+        Ok(Some(cli))
+    }
+}
 
-        let ionice = match std::env::var("CODEMINE_IONICE") {
-            Ok(s) => Some(match s.as_str() {
-                "best-effort" => IoClass::BestEffort,
-                "idle" => IoClass::Idle,
-                _ => bail!("CODEMINE_IONICE must be \"best-effort\" or \"idle\": {s}"),
-            }),
-            Err(_) => None,
-        };
+fn default_workspace() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into())).join(".codemine")
+}
 
-        let webui = match std::env::var("CODEMINE_WEBUI") {
-            Ok(s) => Some(
-                s.parse()
-                    .with_context(|| format!("CODEMINE_WEBUI is not a socket address: {s}"))?,
-            ),
-            Err(_) => None,
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let workspace = match std::env::var_os("CODEMINE_WORKSPACE") {
-            Some(dir) => PathBuf::from(dir),
-            None => PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()))
-                .join(".codemine"),
-        };
+    fn parse(args: &[&str]) -> Result<Option<Cli>> {
+        Cli::parse(
+            std::iter::once("codemine".to_owned()).chain(args.iter().map(|s| s.to_string())),
+        )
+    }
 
-        Ok(Self {
-            forges,
-            model: required("CODEMINE_MODEL")?,
-            command: std::env::var("CODEMINE_COMMAND").unwrap_or_else(|_| "sweep".into()),
-            tasks,
-            author_name: required("GIT_AUTHOR_NAME")?,
-            author_email: required("GIT_AUTHOR_EMAIL")?,
-            daily_limit,
-            turn_timeout: Duration::from_secs(timeout),
-            nice,
-            ionice,
-            once: args.skip(1).any(|arg| arg == "--once"),
-            webui,
-            workspace,
-        })
+    #[test]
+    fn parse_defaults() {
+        let cli = parse(&[]).unwrap().unwrap();
+        assert_eq!(cli.listen, "0.0.0.0:8080".parse().unwrap());
+        assert!(cli.workspace.ends_with(".codemine"));
+        assert!(!cli.once);
+    }
+
+    #[test]
+    fn parse_flags() {
+        let cli = parse(&["--listen", "127.0.0.1:9000", "--workspace", "/tmp/ws", "--once"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(cli.listen, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(cli.workspace, PathBuf::from("/tmp/ws"));
+        assert!(cli.once);
+    }
+
+    #[test]
+    fn parse_errors_and_help() {
+        assert!(parse(&["--help"]).unwrap().is_none());
+        assert!(parse(&["--listen"]).is_err());
+        assert!(parse(&["--listen", "nonsense"]).is_err());
+        assert!(parse(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn forge_env_hosts() {
+        let forge = |kind, url: &str| Forge {
+            kind,
+            token: "tok".into(),
+            user: String::new(),
+            url: url.into(),
+            disabled_repos: BTreeSet::new(),
+        };
+        assert!(forge(ForgeKind::Gitea, "https://git.example.com").env().is_empty());
+        assert_eq!(
+            forge(ForgeKind::Github, "https://github.com").env(),
+            [("GITHUB_TOKEN".to_owned(), "tok".to_owned())]
+        );
+        assert_eq!(
+            forge(ForgeKind::Github, "https://github.example.com/").env(),
+            [
+                ("GITHUB_TOKEN".to_owned(), "tok".to_owned()),
+                ("GH_HOST".to_owned(), "github.example.com".to_owned()),
+            ]
+        );
+        assert_eq!(
+            forge(ForgeKind::Gitlab, "https://gitlab.example.com").env(),
+            [
+                ("GITLAB_TOKEN".to_owned(), "tok".to_owned()),
+                ("GITLAB_HOST".to_owned(), "https://gitlab.example.com".to_owned()),
+            ]
+        );
     }
 }

@@ -36,7 +36,7 @@
   }
   .badge.running { background: rgba(46, 204, 113, 0.15); color: #2ecc71; }
   .badge.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
-  .badge.usage_limit, .badge.waiting_for_tomorrow { background: rgba(230, 126, 34, 0.15); color: #e67e22; }
+  .badge.usage_limit, .badge.waiting_for_tomorrow, .badge.unconfigured { background: rgba(230, 126, 34, 0.15); color: #e67e22; }
   @keyframes pulse { 50% { opacity: 0.3; } }
   .mono { font-family: "Courier New", monospace; }
   .muted { color: #9aa0a6; }
@@ -61,6 +61,36 @@
     white-space: pre-wrap; word-break: break-word;
     max-height: 420px; overflow-y: auto;
   }
+
+  /* Settings */
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 0.75em; color: #9aa0a6; text-transform: uppercase; letter-spacing: 1px; }
+  .field input, .field select {
+    background: rgb(38, 42, 43); color: #e8eaed;
+    border: 1px solid rgb(62, 68, 70); border-radius: 6px;
+    padding: 7px 10px; font-size: 0.9em; font-family: inherit;
+  }
+  .field input:focus, .field select:focus { outline: none; border-color: #9aa0a6; }
+  .general-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  .forges { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
+  .forge { border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .forge-head { display: flex; align-items: center; justify-content: space-between; }
+  .forge-head .name { font-weight: bold; }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 0.85em; color: #9aa0a6; }
+  .check input { accent-color: #2ecc71; }
+  .repos { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+  .repos .check { color: #e8eaed; font-size: 0.9em; }
+  .repos .check.off { color: #9aa0a6; text-decoration: line-through; }
+  button {
+    background: rgb(62, 68, 70); color: #e8eaed; border: none; border-radius: 6px;
+    padding: 8px 16px; font-size: 0.9em; font-family: inherit; cursor: pointer;
+  }
+  button:hover { background: rgb(78, 84, 87); }
+  button.small { padding: 4px 10px; font-size: 0.8em; }
+  .save-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+  #save-result { font-size: 0.85em; }
+  #save-result.ok { color: #2ecc71; }
+  #save-result.err { color: #e74c3c; }
 </style>
 </head>
 <body>
@@ -100,6 +130,32 @@
       <pre id="log" class="muted"></pre>
     </div>
   </div>
+
+  <div class="panel">
+    <div class="panel-title">Settings</div>
+    <div class="general-grid">
+      <div class="field"><label for="s-model">Model (provider/model)</label><input id="s-model"></div>
+      <div class="field"><label for="s-command">Command</label><input id="s-command"></div>
+      <div class="field"><label for="s-tasks">Tasks (space-separated)</label><input id="s-tasks"></div>
+      <div class="field"><label for="s-daily-limit">Daily task limit (blank = unlimited)</label><input id="s-daily-limit" type="number" min="1"></div>
+      <div class="field"><label for="s-author-name">Git author name</label><input id="s-author-name"></div>
+      <div class="field"><label for="s-author-email">Git author email</label><input id="s-author-email"></div>
+      <div class="field"><label for="s-timeout">Turn timeout (seconds)</label><input id="s-timeout" type="number" min="1"></div>
+      <div class="field"><label for="s-nice">Nice 1-19 (blank = full priority)</label><input id="s-nice" type="number" min="1" max="19"></div>
+      <div class="field"><label for="s-ionice">I/O class</label>
+        <select id="s-ionice">
+          <option value="">full priority</option>
+          <option value="best-effort">best-effort</option>
+          <option value="idle">idle</option>
+        </select>
+      </div>
+    </div>
+    <div class="forges" id="forges"></div>
+    <div class="save-row">
+      <button id="save">Save</button>
+      <span id="save-result"></span>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -129,6 +185,7 @@
   const BADGES = {
     starting: "starting", running: "running", sleeping: "sleeping",
     usage_limit: "usage limit", waiting_for_tomorrow: "daily limit",
+    unconfigured: "unconfigured",
   };
 
   function render() {
@@ -145,6 +202,8 @@
       timer = fmtDuration(a.until - serverNow()) + " remaining";
     } else if (a.state === "waiting_for_tomorrow") {
       detail = "daily limit reached; waiting for " + a.day + " to end";
+    } else if (a.state === "unconfigured") {
+      detail = a.problems.join(" · ");
     }
     $("detail").textContent = detail;
     $("timer").textContent = timer;
@@ -217,6 +276,152 @@
       if (follow) log.scrollTop = log.scrollHeight;
     } catch {}
   }
+
+  // ---- Settings ----
+  // The settings form loads once (and re-renders after a save), never on the
+  // status poll, so in-progress edits aren't clobbered.
+
+  const FORGES = ["gitea", "github", "gitlab"];
+  const URL_PLACEHOLDER = {
+    gitea: "https://gitea.example.com",
+    github: "https://github.com (default)",
+    gitlab: "https://gitlab.com (default)",
+  };
+  // Per forge: Set of disabled repo names, edited by the checkboxes.
+  const disabledRepos = {};
+
+  function forgeCard(name) {
+    const card = document.createElement("div");
+    card.className = "forge";
+    card.innerHTML = `
+      <div class="forge-head">
+        <span class="name">${name}</span>
+        <label class="check"><input type="checkbox" id="f-${name}-enabled"> enabled</label>
+      </div>
+      <div class="field"><label for="f-${name}-token">Token</label>
+        <input id="f-${name}-token" type="password" autocomplete="off"></div>
+      <div class="field"><label for="f-${name}-url">URL</label>
+        <input id="f-${name}-url" placeholder="${URL_PLACEHOLDER[name]}"></div>
+      ${name === "gitea" ? `
+      <div class="field"><label for="f-gitea-user">User</label><input id="f-gitea-user"></div>` : ""}
+      <div class="field"><label>Repositories</label>
+        <div class="repos" id="f-${name}-repos"><span class="muted">Not loaded.</span></div>
+        <button type="button" class="small" id="f-${name}-load">Load repos</button>
+        <span class="muted" id="f-${name}-repos-note"></span>
+      </div>`;
+    card.querySelector(`#f-${name}-load`).onclick = () => loadRepos(name);
+    return card;
+  }
+
+  function repoRow(name, forge) {
+    const label = document.createElement("label");
+    label.className = "check" + (disabledRepos[forge].has(name) ? " off" : "");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !disabledRepos[forge].has(name);
+    box.onchange = () => {
+      box.checked ? disabledRepos[forge].delete(name) : disabledRepos[forge].add(name);
+      label.className = "check" + (box.checked ? "" : " off");
+    };
+    label.append(box, document.createTextNode(name));
+    return label;
+  }
+
+  function renderRepos(forge, names) {
+    const rows = names.map(name => repoRow(name, forge));
+    $(`f-${forge}-repos`).replaceChildren(
+      ...(rows.length ? rows : [Object.assign(document.createElement("span"),
+        { className: "muted", textContent: "No repositories." })]));
+  }
+
+  async function loadRepos(forge) {
+    const note = $(`f-${forge}-repos-note`);
+    note.textContent = "loading…";
+    try {
+      const res = await fetch(`/api/repos/${forge}`);
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || res.status);
+      note.textContent = "";
+      renderRepos(forge, body.repos.map(r => r.name));
+    } catch (err) {
+      note.textContent = String(err.message || err);
+    }
+  }
+
+  function renderSettings(s) {
+    $("s-model").value = s.model;
+    $("s-command").value = s.command;
+    $("s-tasks").value = s.tasks.join(" ");
+    $("s-daily-limit").value = s.daily_limit ?? "";
+    $("s-author-name").value = s.author_name;
+    $("s-author-email").value = s.author_email;
+    $("s-timeout").value = s.turn_timeout_secs;
+    $("s-nice").value = s.nice ?? "";
+    $("s-ionice").value = s.ionice ?? "";
+    for (const forge of FORGES) {
+      const f = s[forge];
+      disabledRepos[forge] = new Set(f.disabled_repos);
+      $(`f-${forge}-enabled`).checked = f.enabled;
+      const token = $(`f-${forge}-token`);
+      token.value = "";
+      token.placeholder = f.token_set ? "token set — leave blank to keep" : "no token";
+      $(`f-${forge}-url`).value = f.url;
+      if (forge === "gitea") $("f-gitea-user").value = f.user;
+      // Show the stored disables even before a live listing is loaded, so an
+      // unreachable forge can't silently drop them.
+      renderRepos(forge, [...disabledRepos[forge]].sort());
+    }
+  }
+
+  async function loadSettings() {
+    const res = await fetch("/api/settings");
+    if (res.ok) renderSettings(await res.json());
+  }
+
+  async function save() {
+    const num = value => value === "" ? null : Number(value);
+    const body = {
+      model: $("s-model").value,
+      command: $("s-command").value,
+      tasks: $("s-tasks").value.split(/\s+/).filter(Boolean),
+      daily_limit: num($("s-daily-limit").value),
+      author_name: $("s-author-name").value,
+      author_email: $("s-author-email").value,
+      turn_timeout_secs: num($("s-timeout").value) ?? 0,
+      nice: num($("s-nice").value),
+      ionice: $("s-ionice").value || null,
+    };
+    for (const forge of FORGES) {
+      body[forge] = {
+        enabled: $(`f-${forge}-enabled`).checked,
+        // Empty means "keep the stored token"; the server never sends it back.
+        token: $(`f-${forge}-token`).value,
+        url: $(`f-${forge}-url`).value,
+        user: forge === "gitea" ? $("f-gitea-user").value : "",
+        disabled_repos: [...disabledRepos[forge]].sort(),
+      };
+    }
+    const result = $("save-result");
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const returned = await res.json();
+      if (!res.ok) throw new Error(returned.error || res.status);
+      renderSettings(returned);
+      result.className = "ok";
+      result.textContent = "saved — applies from the next turn";
+    } catch (err) {
+      result.className = "err";
+      result.textContent = String(err.message || err);
+    }
+  }
+
+  $("forges").append(...FORGES.map(forgeCard));
+  $("save").onclick = save;
+  loadSettings();
 
   setInterval(refresh, 2000);
   setInterval(refreshLog, 3000);

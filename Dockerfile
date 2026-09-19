@@ -47,7 +47,7 @@ RUN command -v codegraph \
 RUN mkdir -p /workspace
 WORKDIR /workspace
 
-# Conventional port for the optional status web UI (CODEMINE_WEBUI).
+# Default port for the always-on web UI (--listen).
 EXPOSE 8080
 
 ENTRYPOINT [ "/usr/local/bin/codemine" ]

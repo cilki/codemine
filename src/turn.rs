@@ -31,10 +31,19 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     let task = &cfg.tasks[fastrand::usize(..cfg.tasks.len())];
     let mut pool = Vec::new();
     for forge in &cfg.forges {
-        pool.extend(list_repos(forge)?.into_iter().map(|repo| (forge, repo)));
+        pool.extend(
+            list_repos(forge)?
+                .into_iter()
+                .filter(|repo| !forge.disabled_repos.contains(repo))
+                .map(|repo| (forge, repo)),
+        );
     }
     if pool.is_empty() {
-        bail!("no repositories reachable on any forge");
+        eprintln!("no repositories enabled on any forge");
+        return Ok(Report {
+            backoff: Backoff::Normal,
+            completed: false,
+        });
     }
     let (forge, repo) = &pool[fastrand::usize(..pool.len())];
 
@@ -106,8 +115,11 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         .process_group(0)
         .current_dir(&dir)
         .env("NO_COLOR", "1")
-        // The bash runner exported these for everything it ran; only opencode's
-        // subprocesses ever used them.
+        // The agent's skills run gh/glab inside the session; every configured
+        // forge's auth has to reach them since nothing is in the process env.
+        .envs(cfg.forges.iter().flat_map(|forge| forge.env()))
+        .env("GIT_AUTHOR_NAME", &cfg.author_name)
+        .env("GIT_AUTHOR_EMAIL", &cfg.author_email)
         .env("GIT_COMMITTER_NAME", &cfg.author_name)
         .env("GIT_COMMITTER_EMAIL", &cfg.author_email)
         .stdin(Stdio::null())
@@ -176,12 +188,12 @@ const PAGE_SIZE: usize = 50;
 /// The repositories the bot can reach on a forge, as `<owner>/<repo>`.
 /// Queried fresh each turn so new repositories join the pool without a
 /// restart.
-fn list_repos(forge: &Forge) -> Result<Vec<String>> {
+pub fn list_repos(forge: &Forge) -> Result<Vec<String>> {
     match forge.kind {
         ForgeKind::Gitea => list_gitea_repos(),
-        ForgeKind::Github => list_api_repos("gh", "user/repos", "full_name"),
+        ForgeKind::Github => list_api_repos(forge, "gh", "user/repos", "full_name"),
         ForgeKind::Gitlab => {
-            list_api_repos("glab", "projects?membership=true", "path_with_namespace")
+            list_api_repos(forge, "glab", "projects?membership=true", "path_with_namespace")
         }
     }
 }
@@ -224,8 +236,8 @@ fn list_gitea_repos() -> Result<Vec<String>> {
 
 /// Page through a REST listing and pluck one field per repository; gh and
 /// glab expose the same `api` subcommand shape and authenticate from the
-/// environment.
-fn list_api_repos(program: &str, path: &str, field: &str) -> Result<Vec<String>> {
+/// forge's environment variables.
+fn list_api_repos(forge: &Forge, program: &str, path: &str, field: &str) -> Result<Vec<String>> {
     let separator = if path.contains('?') { '&' } else { '?' };
     let mut repos = Vec::new();
     for page in 1.. {
@@ -234,6 +246,7 @@ fn list_api_repos(program: &str, path: &str, field: &str) -> Result<Vec<String>>
                 "api",
                 &format!("{path}{separator}per_page={PAGE_SIZE}&page={page}"),
             ])
+            .envs(forge.env())
             .stdin(Stdio::null())
             .output()
             .with_context(|| format!("failed to run {program}"))?;
