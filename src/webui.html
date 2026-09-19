@@ -17,9 +17,8 @@
     min-height: 100vh;
   }
   .container { max-width: 1100px; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
-  .header { display: flex; align-items: baseline; gap: 12px; }
-  .header h1 { font-size: 1.5em; }
-  .header .sub { color: #9aa0a6; }
+  .header { display: flex; align-items: center; justify-content: center; gap: 12px; }
+  .header .emblem { height: 88px; display: block; max-width: 100%; object-fit: contain; }
   .disconnected { color: #e74c3c; font-size: 0.85em; }
   .panel {
     background: rgb(24, 26, 27);
@@ -36,7 +35,8 @@
   }
   .badge.running { background: rgba(46, 204, 113, 0.15); color: #2ecc71; }
   .badge.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
-  .badge.usage_limit, .badge.waiting_for_tomorrow, .badge.unconfigured { background: rgba(230, 126, 34, 0.15); color: #e67e22; }
+  .badge.usage_limit, .badge.waiting_for_tomorrow, .badge.unconfigured, .badge.paused { background: rgba(230, 126, 34, 0.15); color: #e67e22; }
+  #pause { margin-left: auto; }
   @keyframes pulse { 50% { opacity: 0.3; } }
   .mono { font-family: "Courier New", monospace; }
   .muted { color: #9aa0a6; }
@@ -48,14 +48,19 @@
   .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
   @media (max-width: 800px) { .columns { grid-template-columns: 1fr; } }
   #recent { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
-  .turn { border: 1px solid rgb(62, 68, 70); border-radius: 6px; padding: 8px 10px; font-size: 0.9em; }
+  .turn { border: 1px solid rgb(62, 68, 70); border-radius: 6px; padding: 8px 10px; font-size: 0.9em; cursor: pointer; }
+  .turn:hover { border-color: #9aa0a6; }
+  .turn.selected { border-color: #2ecc71; }
   .turn-top { display: flex; justify-content: space-between; gap: 8px; }
   .turn-meta { color: #9aa0a6; font-size: 0.85em; margin-top: 4px; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
   .outcome { font-weight: bold; }
+  .outcome.running { color: #2ecc71; }
+  .outcome.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
   .outcome.completed { color: #2ecc71; }
   .outcome.skipped { color: #9aa0a6; }
   .outcome.failed { color: #e74c3c; }
   .outcome.timeout { color: #e67e22; }
+  .log-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
   #log {
     font-family: "Courier New", monospace; font-size: 0.8em; color: #b8bcbf;
     white-space: pre-wrap; word-break: break-word;
@@ -64,7 +69,7 @@
 
   /* Settings */
   .field { display: flex; flex-direction: column; gap: 4px; }
-  .field label { font-size: 0.75em; color: #9aa0a6; text-transform: uppercase; letter-spacing: 1px; }
+  .field label { font-size: 0.75em; color: #9aa0a6; letter-spacing: 1px; }
   .field input, .field select {
     background: rgb(38, 42, 43); color: #e8eaed;
     border: 1px solid rgb(62, 68, 70); border-radius: 6px;
@@ -111,9 +116,7 @@
 <body>
 <div class="container">
   <div class="header">
-    <h1>codemine</h1>
-    <span class="sub" id="uptime"></span>
-    <span class="disconnected" id="disconnected" hidden>disconnected</span>
+    <img src="/emblem.svg" alt="codemine" class="emblem">
   </div>
 
   <div class="panel">
@@ -122,6 +125,8 @@
       <span class="badge" id="badge">starting</span>
       <span id="detail"></span>
       <span class="mono muted" id="timer"></span>
+      <span class="disconnected" id="disconnected" hidden>disconnected</span>
+      <button type="button" class="small" id="pause" hidden></button>
     </div>
     <div class="mono muted" id="workspace"></div>
   </div>
@@ -141,7 +146,8 @@
       <div id="recent"><span class="muted">No turns yet.</span></div>
     </div>
     <div class="panel">
-      <div class="panel-title">Log</div>
+      <div class="panel-title log-head"><span id="log-title">Log</span>
+        <button type="button" class="small" id="log-live" hidden>back to live</button></div>
       <pre id="log" class="muted"></pre>
     </div>
   </div>
@@ -205,8 +211,8 @@
 
   const BADGES = {
     starting: "starting", running: "running", sleeping: "sleeping",
-    usage_limit: "usage limit", waiting_for_tomorrow: "daily limit",
-    unconfigured: "unconfigured",
+    paused: "paused", usage_limit: "usage limit",
+    waiting_for_tomorrow: "daily limit", unconfigured: "unconfigured",
   };
 
   // Outline every field the runner is waiting on, and clear the ones that
@@ -241,7 +247,10 @@
       timer = fmtDuration(a.until - serverNow()) + " remaining";
     }
     $("timer").textContent = timer;
-    $("uptime").textContent = "up " + fmtDuration(serverNow() - state.started);
+    const elapsed = $("running-elapsed");
+    if (elapsed && a.state === "running") {
+      elapsed.textContent = fmtDuration(serverNow() - a.started);
+    }
   }
 
   function render() {
@@ -252,7 +261,11 @@
     let detail = "", workspace = "";
     if (a.state === "running") {
       detail = a.task + " on " + a.repo + " (" + a.forge + ")";
+      // A pause takes hold at the turn boundary; say so meanwhile.
+      if (state.paused) detail += " — pausing after this turn";
       workspace = a.workspace;
+    } else if (a.state === "paused") {
+      detail = "no new turns until resumed";
     } else if (a.state === "waiting_for_tomorrow") {
       detail = "daily limit reached; waiting for " + a.day + " to end";
     } else if (a.state === "unconfigured") {
@@ -263,6 +276,8 @@
     markProblems(a.state === "unconfigured" ? a.problems : []);
     $("detail").textContent = detail;
     $("workspace").textContent = workspace;
+    $("pause").textContent = state.paused ? "resume" : "pause";
+    $("pause").hidden = false;
     renderClock();
 
     $("stat-today").textContent =
@@ -276,40 +291,174 @@
         ? fmtTokens(tokenTotal(state.totals.tokens)) : "–";
 
     const rows = state.recent.map(turn => {
-      const row = document.createElement("div");
-      row.className = "turn";
-
-      const top = document.createElement("div");
-      top.className = "turn-top";
-      const title = document.createElement("span");
-      title.textContent = turn.task + " on " + turn.repo;
-      const outcome = document.createElement("span");
-      outcome.className = "outcome " + turn.outcome;
-      outcome.textContent = turn.outcome;
-      top.append(title, outcome);
-
-      const meta = document.createElement("div");
-      meta.className = "turn-meta";
-      const when = document.createElement("span");
-      when.textContent = turn.forge + " · " + new Date(turn.started * 1000).toLocaleString();
-      const cost = document.createElement("span");
-      cost.textContent = fmtDuration(turn.duration_secs) +
-        (turn.tokens ? " · " + fmtTokens(tokenTotal(turn.tokens)) + " tokens" : "");
-      meta.append(when, cost);
-
-      row.append(top, meta);
+      const row = turnRow(turn.task + " on " + turn.repo, turn.outcome,
+        turn.forge + " · " + new Date(turn.started * 1000).toLocaleString(),
+        fmtDuration(turn.duration_secs) +
+          (turn.tokens ? " · " + fmtTokens(tokenTotal(turn.tokens)) + " tokens" : ""));
+      row.className = "turn" + (viewing === turn.started ? " selected" : "");
+      // Clicking a turn shows its full log; clicking again goes back to live.
+      row.onclick = () => viewing === turn.started ? viewLive() : viewTurn(turn);
       return row;
     });
+    // The in-flight turn leads the list; its log is the live tail, so
+    // clicking it goes there. The elapsed time ticks from renderClock.
+    if (a.state === "running") {
+      const row = turnRow(a.task + " on " + a.repo, "running",
+        a.forge + " · " + new Date(a.started * 1000).toLocaleString(), "");
+      row.querySelector(".turn-meta").lastChild.id = "running-elapsed";
+      row.onclick = viewLive;
+      rows.unshift(row);
+    }
     if (rows.length) $("recent").replaceChildren(...rows);
   }
+
+  function turnRow(title, outcome, when, cost) {
+    const row = document.createElement("div");
+    row.className = "turn";
+    const top = document.createElement("div");
+    top.className = "turn-top";
+    top.append(
+      Object.assign(document.createElement("span"), { textContent: title }),
+      Object.assign(document.createElement("span"),
+        { className: "outcome " + outcome, textContent: outcome }));
+    const meta = document.createElement("div");
+    meta.className = "turn-meta";
+    meta.append(
+      Object.assign(document.createElement("span"), { textContent: when }),
+      Object.assign(document.createElement("span"), { textContent: cost }));
+    row.append(top, meta);
+    return row;
+  }
+
+  // ---- Log rendering ----
+  // Logs come off a terminal-oriented tool, so SGR escapes are rendered as
+  // colors and everything else terminal-shaped (cursor moves, OSC titles) is
+  // dropped.
+
+  // The standard 16 colors, tuned for the dark background.
+  const ANSI16 = [
+    "#5c6370", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#d7dae0",
+    "#7f848e", "#ff7a85", "#a9dc76", "#ffd866", "#78c6ff", "#d88fff", "#66d9e8", "#ffffff",
+  ];
+
+  function ansi256(n) {
+    if (n < 16) return ANSI16[n];
+    if (n < 232) {
+      const level = i => (i ? i * 40 + 55 : 0);
+      n -= 16;
+      return `rgb(${level(Math.floor(n / 36))},${level(Math.floor(n / 6) % 6)},${level(n % 6)})`;
+    }
+    const gray = (n - 232) * 10 + 8;
+    return `rgb(${gray},${gray},${gray})`;
+  }
+
+  function applySgr(style, params) {
+    const codes = params.split(";").map(s => Number(s || "0"));
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (code === 0) Object.assign(style, { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false });
+      else if (code === 1) style.bold = true;
+      else if (code === 2) style.dim = true;
+      else if (code === 3) style.italic = true;
+      else if (code === 4) style.underline = true;
+      else if (code === 22) style.bold = style.dim = false;
+      else if (code === 23) style.italic = false;
+      else if (code === 24) style.underline = false;
+      else if (code === 39) style.fg = null;
+      else if (code === 49) style.bg = null;
+      else if (code >= 30 && code <= 37) style.fg = ANSI16[code - 30];
+      else if (code >= 90 && code <= 97) style.fg = ANSI16[code - 82];
+      else if (code >= 40 && code <= 47) style.bg = ANSI16[code - 40];
+      else if (code >= 100 && code <= 107) style.bg = ANSI16[code - 92];
+      else if (code === 38 || code === 48) {
+        // Extended colors: 38;5;n and 38;2;r;g;b, likewise for 48.
+        const target = code === 38 ? "fg" : "bg";
+        if (codes[i + 1] === 5) { style[target] = ansi256(codes[i + 2] ?? 0); i += 2; }
+        else if (codes[i + 1] === 2) { style[target] = `rgb(${codes[i + 2] ?? 0},${codes[i + 3] ?? 0},${codes[i + 4] ?? 0})`; i += 4; }
+        else break;
+      }
+    }
+  }
+
+  // Every escape sequence is consumed; only the SGR ones (first group) style
+  // the text that follows.
+  const ANSI_RE = /\x1b(?:\[([0-9;]*)m|\[[0-9;?]*[ -\/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])/g;
+
+  function renderLog(el, text) {
+    // A carriage return overwrites its line, the way spinners and progress
+    // bars use it; only what each line ends up as is kept.
+    text = text.replace(/\r\n/g, "\n").replace(/[^\n\r]*\r/g, "");
+    const style = { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false };
+    const nodes = [];
+    let last = 0;
+    const flush = end => {
+      if (end <= last) return;
+      const chunk = text.slice(last, end);
+      if (!style.fg && !style.bg && !style.bold && !style.dim && !style.italic && !style.underline) {
+        nodes.push(document.createTextNode(chunk));
+        return;
+      }
+      const span = document.createElement("span");
+      if (style.fg) span.style.color = style.fg;
+      if (style.bg) span.style.backgroundColor = style.bg;
+      if (style.bold) span.style.fontWeight = "bold";
+      if (style.dim) span.style.opacity = "0.6";
+      if (style.italic) span.style.fontStyle = "italic";
+      if (style.underline) span.style.textDecoration = "underline";
+      span.textContent = chunk;
+      nodes.push(span);
+    };
+    for (const match of text.matchAll(ANSI_RE)) {
+      flush(match.index);
+      last = match.index + match[0].length;
+      if (match[1] !== undefined) applySgr(style, match[1]);
+    }
+    flush(text.length);
+    el.replaceChildren(...nodes);
+  }
+
+  // The live tail, or a finished turn's full log when one is selected;
+  // `viewing` holds the selected turn's start epoch, which is its identifier.
+  let liveLog = "";
+  let viewing = null;
 
   // Stay pinned to the bottom unless the reader has scrolled up to look at
   // something.
   function setLog(text) {
+    liveLog = text;
+    if (viewing !== null) return;
     const log = $("log");
     const follow = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-    log.textContent = text;
+    renderLog(log, text);
     if (follow) log.scrollTop = log.scrollHeight;
+  }
+
+  async function viewTurn(turn) {
+    viewing = turn.started;
+    $("log-title").textContent = "Log — " + turn.task + " on " + turn.repo;
+    $("log-live").hidden = false;
+    render();
+    let text;
+    try {
+      const res = await fetch(`/api/turns/${turn.started}/log`);
+      text = await res.text();
+      if (!res.ok) throw new Error(text || res.status);
+    } catch (err) {
+      text = String(err.message || err);
+    }
+    // Ignore a fetch that finished after the reader moved on.
+    if (viewing !== turn.started) return;
+    renderLog($("log"), text);
+    $("log").scrollTop = 0;
+  }
+
+  function viewLive() {
+    viewing = null;
+    $("log-title").textContent = "Log";
+    $("log-live").hidden = true;
+    render();
+    setLog(liveLog);
+    $("log").scrollTop = $("log").scrollHeight;
   }
 
   // The server pushes status on every change and the log tail as it grows;
@@ -410,10 +559,8 @@
       <div class="field"><label for="f-gitea-user">User</label><input id="f-gitea-user"></div>` : ""}
       <div class="field"><label>Repositories</label>
         <div class="repos" id="f-${name}-repos"><span class="muted">Not loaded.</span></div>
-        <button type="button" class="small" id="f-${name}-load">Load repos</button>
         <span class="muted" id="f-${name}-repos-note"></span>
       </div>`;
-    card.querySelector(`#f-${name}-load`).onclick = () => loadRepos(name);
     return card;
   }
 
@@ -438,6 +585,10 @@
         { className: "muted", textContent: "No repositories." })]));
   }
 
+  // Forges whose live listing already came in, so edits and saves don't
+  // refetch it on every keystroke.
+  const loadedRepos = new Set();
+
   async function loadRepos(forge) {
     const note = $(`f-${forge}-repos-note`);
     note.textContent = "loading…";
@@ -446,9 +597,21 @@
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || res.status);
       note.textContent = "";
+      loadedRepos.add(forge);
       renderRepos(forge, body.repos.map(r => r.name));
     } catch (err) {
       note.textContent = String(err.message || err);
+    }
+  }
+
+  // Fetch each configured forge's repositories as soon as its settings allow
+  // it: on page load, and again after a save makes a forge newly listable.
+  function autoLoadRepos(s) {
+    for (const forge of FORGES) {
+      const f = s[forge];
+      const listable = f.enabled && f.token_set
+        && (forge !== "gitea" || (f.url && f.user));
+      if (listable && !loadedRepos.has(forge)) loadRepos(forge);
     }
   }
 
@@ -474,6 +637,7 @@
       // unreachable forge can't silently drop them.
       renderRepos(forge, [...disabledRepos[forge]].sort());
     }
+    autoLoadRepos(s);
   }
 
   async function loadSettings() {
@@ -548,6 +712,8 @@
       }
       status.className = "ok";
       status.textContent = "saved — applies from the next turn";
+      // A save can make a forge newly listable (enabled, token stored).
+      autoLoadRepos(returned);
     } catch (err) {
       status.className = "err";
       status.textContent = String(err.message || err);
@@ -568,6 +734,14 @@
     if (event.target.type !== "password") scheduleSave(600);
   });
   $("settings").addEventListener("change", () => scheduleSave(0));
+  $("log-live").onclick = viewLive;
+  // The new state comes right back over the event stream, which repaints the
+  // button and badge; nothing to do here beyond sending the toggle.
+  $("pause").onclick = () => fetch("/api/paused", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paused: !state.paused }),
+  }).catch(() => {});
   loadSettings();
 
   setInterval(() => { if (state) renderClock(); }, 1000);

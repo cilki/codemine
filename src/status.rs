@@ -73,12 +73,16 @@ pub struct TurnRecord {
     pub task: String,
     pub repo: String,
     pub forge: String,
-    /// Epoch seconds.
+    /// Epoch seconds; doubles as the turn's identifier in the web UI, which
+    /// is unambiguous because the runner sleeps between turns.
     pub started: u64,
     pub duration_secs: u64,
     pub outcome: Outcome,
     /// None when opencode's session storage couldn't be read.
     pub tokens: Option<TokenUsage>,
+    /// The turn's full log on disk, kept until the record ages out.
+    #[serde(skip)]
+    pub log_path: PathBuf,
 }
 
 #[derive(Serialize, Clone)]
@@ -102,6 +106,8 @@ pub enum Activity {
     Sleeping {
         until: u64,
     },
+    /// Paused through the web UI; no new turns start until resumed.
+    Paused,
     UsageLimit {
         until: u64,
     },
@@ -125,6 +131,9 @@ pub struct Status {
     /// Process start, epoch seconds.
     pub started: u64,
     pub activity: Activity,
+    /// The persisted pause setting, mirrored here so the page sees it even
+    /// while a turn is still finishing.
+    pub paused: bool,
     pub day: String,
     pub completed_today: u32,
     pub daily_limit: Option<u32>,
@@ -142,6 +151,7 @@ impl Shared {
             status: Arc::new(Mutex::new(Status {
                 started: epoch_now(),
                 activity: Activity::Starting,
+                paused: false,
                 day: String::new(),
                 completed_today: 0,
                 daily_limit: None,
@@ -173,7 +183,12 @@ impl Status {
         if let Some(tokens) = &record.tokens {
             self.totals.tokens.add(tokens);
         }
-        self.recent.truncate(RECENT_CAP - 1);
+        while self.recent.len() >= RECENT_CAP {
+            if let Some(evicted) = self.recent.pop_back() {
+                // Best effort: without the file there is just no log to serve.
+                std::fs::remove_file(&evicted.log_path).ok();
+            }
+        }
         self.recent.push_front(record);
     }
 }
@@ -202,6 +217,7 @@ mod tests {
                 output: 5,
                 ..Default::default()
             }),
+            log_path: PathBuf::new(),
         }
     }
 

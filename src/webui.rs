@@ -19,7 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::{ForgeKind, MODELS};
 use crate::settings::{Settings, SharedSettings};
-use crate::status::{Activity, Shared, epoch_now};
+use crate::status::{Activity, Shared, Status, epoch_now};
 
 /// How often the live log tail is re-read. Status updates are pushed the
 /// moment they happen; a log file growing signals nothing, so it needs a
@@ -61,10 +61,13 @@ pub fn spawn(addr: SocketAddr, status: Shared, settings: SharedSettings) -> Resu
 async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
     let app = axum::Router::new()
         .route("/", get(index))
+        .route("/emblem.svg", get(emblem))
         .route("/api/status", get(api_status))
         .route("/api/log", get(api_log))
+        .route("/api/turns/{started}/log", get(api_turn_log))
         .route("/api/events", get(api_events))
         .route("/api/settings", get(api_settings).put(api_put_settings))
+        .route("/api/paused", axum::routing::put(api_put_paused))
         .route("/api/options", get(api_options))
         .route("/api/repos/{forge}", get(api_repos))
         .with_state(state);
@@ -77,6 +80,14 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+/// The codemine emblem the page shows in place of a textual title.
+async fn emblem() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+        crate::emblem::SVG.as_str(),
+    )
+}
+
 async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(status_value(&state.status))
 }
@@ -84,6 +95,25 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// The live log tail while a turn is running, else the last finished turn's.
 async fn api_log(State(state): State<AppState>) -> String {
     log_tail(&state.status)
+}
+
+/// One recent turn's full log, identified by its start epoch. Served raw,
+/// ANSI escapes and all; the page renders them.
+async fn api_turn_log(State(state): State<AppState>, Path(started): Path<u64>) -> Response {
+    let path = state
+        .status
+        .lock()
+        .recent
+        .iter()
+        .find(|record| record.started == started)
+        .map(|record| record.log_path.clone());
+    let Some(path) = path else {
+        return (StatusCode::NOT_FOUND, "no such turn").into_response();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned().into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "the turn's log is gone").into_response(),
+    }
 }
 
 /// Push state to the page so it never has to poll: a `status` event on every
@@ -201,6 +231,31 @@ async fn api_put_settings(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct Paused {
+    paused: bool,
+}
+
+/// Pause or resume the runner. The flag lives in the persisted settings so a
+/// restart keeps it, and is mirrored into the status so the page hears about
+/// the change immediately; the main loop applies it at the next turn boundary.
+async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paused>) -> Response {
+    match state.settings.update(|settings| {
+        settings.paused = incoming.paused;
+        Ok(())
+    }) {
+        Ok(()) => {
+            Status::update(&state.status, |s| s.paused = incoming.paused);
+            Json(json!({ "paused": incoming.paused })).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{err:#}") })),
+        )
+            .into_response(),
+    }
+}
+
 /// Live repository listing for one forge, merged with the disabled set so
 /// the UI can render checkboxes. Disabled repositories missing from the
 /// listing still appear, so an unreachable forge can't silently drop them.
@@ -292,6 +347,10 @@ mod tests {
         assert!(value["now"].is_u64());
 
         assert!(request(addr, "GET", "/", "").contains("<html"));
+
+        let response = request(addr, "GET", "/emblem.svg", "");
+        assert!(response.contains("image/svg+xml"), "{response}");
+        assert!(response.contains("<svg"), "{response}");
     }
 
     #[test]
@@ -321,6 +380,29 @@ mod tests {
         assert!(dir.path().join("config.json").exists());
         let response = request(addr, "PUT", "/api/settings", &update.to_string());
         assert_eq!(body_json(&response)["github"]["token_set"], true);
+    }
+
+    #[test]
+    fn pause_round_trips_and_persists() {
+        let (addr, dir) = serve_in_tempdir();
+
+        let response = request(addr, "PUT", "/api/paused", r#"{"paused":true}"#);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(body_json(&response)["paused"], true);
+
+        // Mirrored into the status for the page, and persisted for restarts.
+        let status = body_json(&request(addr, "GET", "/api/status", ""));
+        assert_eq!(status["paused"], true);
+        let stored: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["paused"], true);
+
+        let response = request(addr, "PUT", "/api/paused", r#"{"paused":false}"#);
+        assert_eq!(body_json(&response)["paused"], false);
+        let status = body_json(&request(addr, "GET", "/api/status", ""));
+        assert_eq!(status["paused"], false);
     }
 
     #[test]
@@ -368,6 +450,37 @@ mod tests {
         // JSON payloads, so a log line's own newlines can't break the framing.
         assert!(seen.contains(r#""state":"starting""#), "{seen}");
         assert!(seen.contains("data: \"\""), "{seen}");
+    }
+
+    #[test]
+    fn turn_log_serves_full_file_by_start_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("100.log");
+        std::fs::write(&path, "\x1b[32mall good\x1b[0m\n").unwrap();
+        let status = Shared::new();
+        Status::update(&status, |s| {
+            s.record_turn(crate::status::TurnRecord {
+                task: "todo".into(),
+                repo: "o/r".into(),
+                forge: "gitea".into(),
+                started: 100,
+                duration_secs: 1,
+                outcome: crate::status::Outcome::Completed,
+                tokens: None,
+                log_path: path.clone(),
+            })
+        });
+        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
+        let addr = spawn("127.0.0.1:0".parse().unwrap(), status, store).unwrap();
+
+        // The full log comes back raw, ANSI escapes included.
+        let response = request(addr, "GET", "/api/turns/100/log", "");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\x1b[32mall good\x1b[0m"), "{response:?}");
+
+        assert!(request(addr, "GET", "/api/turns/999/log", "").starts_with("HTTP/1.1 404"));
+        std::fs::remove_file(&path).unwrap();
+        assert!(request(addr, "GET", "/api/turns/100/log", "").starts_with("HTTP/1.1 404"));
     }
 
     #[test]

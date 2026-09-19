@@ -5,7 +5,9 @@
 //! configured through the always-on web UI and persisted in the workspace.
 
 mod config;
+mod emblem;
 mod prompts;
+mod sandbox;
 mod scan;
 mod settings;
 mod status;
@@ -32,12 +34,19 @@ use crate::status::{Activity, Shared, Status};
 use crate::turn::Backoff;
 
 fn main() -> Result<()> {
-    let Some(cli) = Cli::parse(std::env::args())? else {
+    // The hidden sandbox wrapper mode the turn runner spawns opencode
+    // through; on success it execs the wrapped command and never returns.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(sandbox::MARKER) {
+        return sandbox::exec(&args[2..]);
+    }
+
+    let Some(mut cli) = Cli::parse(std::env::args())? else {
         println!("{USAGE}");
         return Ok(());
     };
     init_logging();
-    setup(&cli)?;
+    setup(&mut cli)?;
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
     let status = Shared::new();
@@ -49,6 +58,14 @@ fn main() -> Result<()> {
     let mut applied_generation = None;
     loop {
         let (settings, generation) = store.snapshot();
+        Status::update(&status, |s| s.paused = settings.paused);
+        // A pause applies at the turn boundary: the running turn finishes,
+        // and no new one starts until resumed.
+        if settings.paused {
+            Status::update(&status, |s| s.activity = Activity::Paused);
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
         let mut problems = settings.problems();
         if !claude_oauth_usable() {
             problems.push(Problem::new(
@@ -164,7 +181,7 @@ fn init_logging() {
 }
 
 /// One-time startup work that doesn't depend on the mutable settings.
-fn setup(cli: &Cli) -> Result<()> {
+fn setup(cli: &mut Cli) -> Result<()> {
     // Install the embedded prompts where opencode resolves commands and
     // skills by name, so the binary works without the image copying them, and
     // wire the codegraph MCP server into opencode's config when the CLI is
@@ -177,6 +194,30 @@ fn setup(cli: &Cli) -> Result<()> {
 
     std::fs::create_dir_all(&cli.workspace)
         .with_context(|| format!("failed to create {}", cli.workspace.display()))?;
+    // Run from the workspace: everything the runner owns lives there, and
+    // this way it doesn't pin whatever directory it was launched from. The
+    // path is made absolute first so a relative --workspace still resolves
+    // correctly everywhere after the change of directory.
+    cli.workspace = cli
+        .workspace
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", cli.workspace.display()))?;
+    std::env::set_current_dir(&cli.workspace)
+        .with_context(|| format!("failed to chdir to {}", cli.workspace.display()))?;
+    // set_current_dir doesn't touch the $PWD convention variable, which
+    // would otherwise keep naming the launch directory to every child that
+    // trusts it over getcwd.
+    // SAFETY: setup() runs before the web UI and agent threads exist, so no
+    // other thread can be touching the environment.
+    unsafe { std::env::set_var("PWD", &cli.workspace) };
+
+    // Turn logs are only reachable through the in-memory recent list, so
+    // whatever a previous process left behind is unreachable garbage.
+    let logs = cli.workspace.join("logs");
+    if logs.exists() {
+        std::fs::remove_dir_all(&logs)
+            .with_context(|| format!("failed to clear {}", logs.display()))?;
+    }
 
     let gitconfig = install_git_config(cli)?;
     // SAFETY: setup() runs before the web UI and agent threads exist, so no
