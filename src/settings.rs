@@ -35,10 +35,6 @@ pub struct Settings {
     pub nice: Option<u8>,
     /// I/O scheduling class for the agent process tree.
     pub ionice: Option<IoClass>,
-    /// Whether the runner is paused: no new turns start until resumed.
-    /// Persisted so a restart stays paused; toggled only through its own
-    /// endpoint, never the settings form.
-    pub paused: bool,
 }
 
 impl Default for Settings {
@@ -55,7 +51,6 @@ impl Default for Settings {
             turn_timeout_secs: 21600,
             nice: None,
             ionice: None,
-            paused: false,
         }
     }
 }
@@ -250,8 +245,6 @@ impl Settings {
     /// token keeps the stored one (the UI never sees tokens back), a nonempty
     /// one overwrites it.
     pub fn apply_update(&mut self, mut incoming: Settings) -> Result<()> {
-        // The form doesn't carry the pause flag, so a save must not resume.
-        incoming.paused = self.paused;
         incoming.model = incoming.model.trim().to_owned();
         incoming.author_name = incoming.author_name.trim().to_owned();
         incoming.author_email = incoming.author_email.trim().to_owned();
@@ -442,20 +435,6 @@ mod tests {
         overwrite.github.token = " newtok ".into();
         settings.apply_update(overwrite).unwrap();
         assert_eq!(settings.github.token, "newtok");
-    }
-
-    #[test]
-    fn form_updates_cannot_flip_the_pause() {
-        let mut settings = configured();
-        settings.paused = true;
-        // The form serializes paused: false by default; the save keeps it.
-        settings.apply_update(configured()).unwrap();
-        assert!(settings.paused);
-        settings.paused = false;
-        let mut incoming = configured();
-        incoming.paused = true;
-        settings.apply_update(incoming).unwrap();
-        assert!(!settings.paused);
     }
 
     #[test]

@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>codemine</title>
 <style>
+  /* Copper, following the cilki emblem palette's #c8__37 family. */
+  :root { --accent: #c87137; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: Arial, sans-serif;
@@ -16,9 +18,9 @@
     background-size: 80px 80px;
     min-height: 100vh;
   }
-  .container { max-width: 1100px; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
+  .container { max-width: 1100px; min-height: 100vh; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
   .header { display: flex; align-items: center; justify-content: center; gap: 12px; }
-  .header .emblem { height: 88px; display: block; max-width: 100%; object-fit: contain; }
+  .header .emblem { height: 106px; display: block; max-width: 100%; object-fit: contain; }
   .disconnected { color: #e74c3c; font-size: 0.85em; }
   .panel {
     background: rgb(24, 26, 27);
@@ -27,20 +29,13 @@
     padding: 16px;
   }
   .panel-title { text-transform: uppercase; letter-spacing: 1px; font-size: 0.75em; color: #9aa0a6; margin-bottom: 10px; }
-  .now-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  .badge {
-    padding: 3px 10px; border-radius: 12px; font-size: 0.8em;
-    text-transform: uppercase; letter-spacing: 1px;
-    background: rgb(62, 68, 70); color: #e8eaed;
-  }
-  .badge.running { background: rgba(46, 204, 113, 0.15); color: #2ecc71; }
-  .badge.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
-  .badge.usage_limit, .badge.waiting_for_tomorrow, .badge.unconfigured, .badge.paused { background: rgba(230, 126, 34, 0.15); color: #e67e22; }
-  #pause { margin-left: auto; }
   @keyframes pulse { 50% { opacity: 0.3; } }
   .mono { font-family: "Courier New", monospace; }
   .muted { color: #9aa0a6; }
-  #workspace { margin-top: 8px; font-size: 0.85em; }
+  .host-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .host-grid .stat-label { margin-bottom: 4px; }
+  .host-value { font-family: "Courier New", monospace; font-size: 0.95em; word-break: break-word; }
+  .log-buttons { display: flex; gap: 8px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
   .stat { background: rgb(24, 26, 27); border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px 16px; }
   .stat-label { text-transform: uppercase; letter-spacing: 1px; font-size: 0.7em; color: #9aa0a6; }
@@ -49,20 +44,22 @@
   @media (max-width: 800px) { .columns { grid-template-columns: 1fr; } }
   #recent { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
   .turn { border: 1px solid rgb(62, 68, 70); border-radius: 6px; padding: 8px 10px; font-size: 0.9em; cursor: pointer; }
-  .turn:hover { border-color: #9aa0a6; }
-  .turn.selected { border-color: #2ecc71; }
+  .turn:hover { border-color: var(--accent); }
+  .turn.selected { border-color: var(--accent); background: rgba(200, 113, 55, 0.08); }
   .turn-top { display: flex; justify-content: space-between; gap: 8px; }
   .turn-meta { color: #9aa0a6; font-size: 0.85em; margin-top: 4px; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
   .outcome { font-weight: bold; }
   .outcome.running { color: #2ecc71; }
   .outcome.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
+  .outcome.paused { color: #e67e22; }
   .outcome.completed { color: #2ecc71; }
   .outcome.skipped { color: #9aa0a6; }
   .outcome.failed { color: #e74c3c; }
   .outcome.timeout { color: #e67e22; }
   .log-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
   #log {
-    font-family: "Courier New", monospace; font-size: 0.8em; color: #b8bcbf;
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    font-size: 12px; line-height: 1.45; color: #b8bcbf;
     white-space: pre-wrap; word-break: break-word;
     max-height: 420px; overflow-y: auto;
   }
@@ -75,14 +72,14 @@
     border: 1px solid rgb(62, 68, 70); border-radius: 6px;
     padding: 7px 10px; font-size: 0.9em; font-family: inherit;
   }
-  .field input:focus, .field select:focus { outline: none; border-color: #9aa0a6; }
+  .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
   .general-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
   .forges { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
   .forge { border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
   .forge-head { display: flex; align-items: center; justify-content: space-between; }
   .forge-head .name { font-weight: bold; }
   .check { display: flex; align-items: center; gap: 6px; font-size: 0.85em; color: #9aa0a6; }
-  .check input { accent-color: #2ecc71; }
+  .check input { accent-color: var(--accent); }
   .repos { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
   .repos .check { color: #e8eaed; font-size: 0.9em; }
   .repos .check.off { color: #9aa0a6; text-decoration: line-through; }
@@ -104,6 +101,14 @@
   .field input.invalid, .field select.invalid { border-color: #e74c3c; }
   .forges.invalid { outline: 1px solid #e74c3c; outline-offset: 8px; }
   details.panel.has-problems > summary { color: #e74c3c; }
+  /* The settings float at the bottom of the screen: pushed to the end of
+     the page when the content is short, pinned above the viewport edge
+     while the rest scrolls. */
+  #settings {
+    position: sticky; bottom: 16px; margin-top: auto;
+    max-height: calc(100vh - 32px); overflow-y: auto;
+    box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.5);
+  }
   details.panel > summary { cursor: pointer; margin-bottom: 0; }
   details.panel > summary::marker { color: #9aa0a6; }
   details.panel[open] > summary { margin-bottom: 10px; }
@@ -120,15 +125,9 @@
   </div>
 
   <div class="panel">
-    <div class="panel-title">Now</div>
-    <div class="now-row">
-      <span class="badge" id="badge">starting</span>
-      <span id="detail"></span>
-      <span class="mono muted" id="timer"></span>
-      <span class="disconnected" id="disconnected" hidden>disconnected</span>
-      <button type="button" class="small" id="pause" hidden></button>
-    </div>
-    <div class="mono muted" id="workspace"></div>
+    <div class="panel-title log-head"><span>Host</span>
+      <span class="disconnected" id="disconnected" hidden>disconnected</span></div>
+    <div class="host-grid" id="host"><span class="muted">Loading…</span></div>
   </div>
 
   <div class="stats">
@@ -147,7 +146,10 @@
     </div>
     <div class="panel">
       <div class="panel-title log-head"><span id="log-title">Log</span>
-        <button type="button" class="small" id="log-live" hidden>back to live</button></div>
+        <span class="log-buttons">
+          <button type="button" class="small" id="pause" hidden></button>
+          <button type="button" class="small" id="log-live" hidden>back to live</button>
+        </span></div>
       <pre id="log" class="muted"></pre>
     </div>
   </div>
@@ -198,6 +200,13 @@
     return String(n);
   }
 
+  function fmtBytes(n) {
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let u = 0;
+    while (n >= 1024 && u < units.length - 1) { n /= 1024; u++; }
+    return (u ? n.toFixed(1) : n) + " " + units[u];
+  }
+
   function fmtDuration(secs) {
     secs = Math.max(0, Math.round(secs));
     const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
@@ -209,44 +218,34 @@
   // Server time, extrapolated from the last response.
   const serverNow = () => state.now + (Date.now() - state.received) / 1000;
 
-  const BADGES = {
-    starting: "starting", running: "running", sleeping: "sleeping",
-    paused: "paused", usage_limit: "usage limit",
-    waiting_for_tomorrow: "daily limit", unconfigured: "unconfigured",
-  };
-
   // Outline every field the runner is waiting on, and clear the ones that
   // were fixed. Values are never touched, so this is safe to run on the
-  // status poll while the form is being edited.
+  // status poll while the form is being edited. Problems nothing in the form
+  // can fix become the settings summary's tooltip.
   function markProblems(problems) {
     for (const marked of document.querySelectorAll(".invalid")) {
       marked.classList.remove("invalid");
       marked.title = "";
     }
-    const fields = problems.map(p => p.field).filter(Boolean);
-    for (const field of fields) $(field)?.classList.add("invalid");
-    $("settings").classList.toggle("has-problems", fields.length > 0);
-    // The message still belongs to the field — as its tooltip.
     for (const problem of problems) {
       if (problem.field) {
         const el = $(problem.field);
-        if (el) el.title = problem.message;
+        if (el) {
+          el.classList.add("invalid");
+          el.title = problem.message;
+        }
       }
     }
+    $("settings").classList.toggle("has-problems", problems.length > 0);
+    $("settings").querySelector("summary").title =
+      problems.filter(p => !p.field).map(p => p.message).join(" · ");
   }
 
-  // Elapsed and remaining advance on their own between events, so they are
-  // redrawn on a local timer rather than waiting for the server to say
+  // The running turn's elapsed time advances on its own between events, so
+  // it is redrawn on a local timer rather than waiting for the server to say
   // something.
   function renderClock() {
     const a = state.activity;
-    let timer = "";
-    if (a.state === "running") {
-      timer = fmtDuration(serverNow() - a.started) + " elapsed";
-    } else if (a.state === "sleeping" || a.state === "usage_limit") {
-      timer = fmtDuration(a.until - serverNow()) + " remaining";
-    }
-    $("timer").textContent = timer;
     const elapsed = $("running-elapsed");
     if (elapsed && a.state === "running") {
       elapsed.textContent = fmtDuration(serverNow() - a.started);
@@ -255,29 +254,11 @@
 
   function render() {
     const a = state.activity;
-    $("badge").textContent = BADGES[a.state] || a.state;
-    $("badge").className = "badge " + a.state;
-
-    let detail = "", workspace = "";
-    if (a.state === "running") {
-      detail = a.task + " on " + a.repo + " (" + a.forge + ")";
-      // A pause takes hold at the turn boundary; say so meanwhile.
-      if (state.paused) detail += " — pausing after this turn";
-      workspace = a.workspace;
-    } else if (a.state === "paused") {
-      detail = "no new turns until resumed";
-    } else if (a.state === "waiting_for_tomorrow") {
-      detail = "daily limit reached; waiting for " + a.day + " to end";
-    } else if (a.state === "unconfigured") {
-      // Problems that map to a setting are marked on the field itself; only
-      // the ones nothing in the form can fix are spelled out here.
-      detail = a.problems.filter(p => !p.field).map(p => p.message).join(" · ");
-    }
     markProblems(a.state === "unconfigured" ? a.problems : []);
-    $("detail").textContent = detail;
-    $("workspace").textContent = workspace;
+    // The pause button lives with the log because it freezes the running
+    // turn's process tree; without a turn there is nothing to signal.
+    $("pause").hidden = a.state !== "running";
     $("pause").textContent = state.paused ? "resume" : "pause";
-    $("pause").hidden = false;
     renderClock();
 
     $("stat-today").textContent =
@@ -303,7 +284,7 @@
     // The in-flight turn leads the list; its log is the live tail, so
     // clicking it goes there. The elapsed time ticks from renderClock.
     if (a.state === "running") {
-      const row = turnRow(a.task + " on " + a.repo, "running",
+      const row = turnRow(a.task + " on " + a.repo, state.paused ? "paused" : "running",
         a.forge + " · " + new Date(a.started * 1000).toLocaleString(), "");
       row.querySelector(".turn-meta").lastChild.id = "running-elapsed";
       row.onclick = viewLive;
@@ -461,9 +442,32 @@
     $("log").scrollTop = $("log").scrollHeight;
   }
 
-  // The server pushes status on every change and the log tail as it grows;
-  // EventSource reconnects on its own, so a dropped stream only shows up as
-  // the disconnected marker until it comes back.
+  function renderHost(h) {
+    const memory = h.mem_total
+      ? fmtBytes(h.mem_total - h.mem_available) + " / " + fmtBytes(h.mem_total) : "–";
+    const items = [
+      ["hostname", h.hostname || "–"],
+      ["ip", h.ip || "–"],
+      ["cpu", h.cpu_model ? h.cpu_model + " × " + h.cpus : h.cpus + " cpus"],
+      ["memory", memory],
+      ["cpu temp", h.temp_c == null ? "–" : Math.round(h.temp_c) + " °C"],
+      ["uptime", fmtDuration(h.uptime_secs)],
+      ["network", "↓ " + fmtBytes(h.rx_bytes) + " · ↑ " + fmtBytes(h.tx_bytes)],
+    ];
+    $("host").replaceChildren(...items.map(([label, value]) => {
+      const item = document.createElement("div");
+      item.append(
+        Object.assign(document.createElement("div"),
+          { className: "stat-label", textContent: label }),
+        Object.assign(document.createElement("div"),
+          { className: "host-value", textContent: value }));
+      return item;
+    }));
+  }
+
+  // The server pushes status on every change, and the log tail and host
+  // details as they move; EventSource reconnects on its own, so a dropped
+  // stream only shows up as the disconnected marker until it comes back.
   function listen() {
     const events = new EventSource("/api/events");
     events.addEventListener("status", event => {
@@ -472,6 +476,7 @@
       render();
     });
     events.addEventListener("log", event => setLog(JSON.parse(event.data)));
+    events.addEventListener("host", event => renderHost(JSON.parse(event.data)));
     events.onopen = () => $("disconnected").hidden = true;
     events.onerror = () => $("disconnected").hidden = false;
   }

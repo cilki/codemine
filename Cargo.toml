@@ -10,7 +10,7 @@ version = "0.1.0"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-cilki = { version = "0.1.2", features = ["project-codemine"] }
+cilki = { version = "0.1.3", features = ["project-codemine"] }
 fastrand = "2"
 landlock = "0.4"
 libc = "0.2"

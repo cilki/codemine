@@ -101,13 +101,15 @@ pub enum Activity {
         workspace: String,
         #[serde(skip)]
         log_path: PathBuf,
+        /// The agent's process group, for the web UI's pause and resume
+        /// signals; 0 until the process is actually spawned.
+        #[serde(skip)]
+        pgid: i32,
         started: u64,
     },
     Sleeping {
         until: u64,
     },
-    /// Paused through the web UI; no new turns start until resumed.
-    Paused,
     UsageLimit {
         until: u64,
     },
@@ -131,8 +133,8 @@ pub struct Status {
     /// Process start, epoch seconds.
     pub started: u64,
     pub activity: Activity,
-    /// The persisted pause setting, mirrored here so the page sees it even
-    /// while a turn is still finishing.
+    /// Whether the running turn's process tree is currently SIGSTOPped
+    /// through the web UI.
     pub paused: bool,
     pub day: String,
     pub completed_today: u32,

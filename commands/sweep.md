@@ -55,7 +55,7 @@ the user decide what to do.
 - If any of your open PR branches are behind their base branch, rebase them
   and force-push
 
-## "bump-deps"
+## "bump"
 
 - Bump the project's dependencies to the latest releases in `Cargo.toml`
   - Only make a PR if we had to make code changes as a result of the dependency
@@ -77,6 +77,48 @@ the user decide what to do.
 - Attempt to run the software as a user typically would and fix any issues you
   encounter
 - Run the test suite and fix any failures
+
+## "benchmark"
+
+- Run the software while measuring its performance: use the project's own
+  benchmarks if it has any, otherwise measure whatever fits it best (startup
+  time, throughput, latency, memory)
+- Profile to find where the time goes and attempt to improve the hottest path
+- Verify the improvement by measuring again; only make a PR for a measurable
+  win, and include the before and after numbers in the PR description
+
+## "audit"
+
+- Audit dependencies for known vulnerabilities (`cargo audit`, `npm audit`, or
+  the ecosystem's equivalent) and update or patch the affected ones
+- Look for the classic mistakes: injection points, path traversal, secrets
+  committed to the tree, unchecked `unsafe` blocks
+- Open an issue instead of a PR for anything too large to fix safely in one
+  turn
+
+## "docs"
+
+- Compare the README and the rest of the documentation against the code and
+  fix any drift: flags or commands that no longer exist, renamed options,
+  stale examples
+- Verify that documented examples actually work before committing them
+
+## "coverage"
+
+- Find an important code path with no test coverage and add a meaningful test
+  for it
+- Prefer paths that recently changed, or that fixed a bug without adding a
+  test
+- Do not add trivial tests just to raise the count
+
+## "feature"
+
+- Come up with a brand new feature that fits the project's purpose and would
+  genuinely help its users; check the existing issues and PRs first so you
+  don't propose something already planned or rejected
+- If the feature is straightforward, implement it and make a PR
+- Otherwise open an issue describing the feature, why it's worth having, and
+  a sketch of how it could be built
 
 # General information
 

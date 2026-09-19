@@ -21,9 +21,9 @@ use crate::config::{ForgeKind, MODELS};
 use crate::settings::{Settings, SharedSettings};
 use crate::status::{Activity, Shared, Status, epoch_now};
 
-/// How often the live log tail is re-read. Status updates are pushed the
-/// moment they happen; a log file growing signals nothing, so it needs a
-/// timer.
+/// How often the live log tail is re-read and the host details refreshed.
+/// Status updates are pushed the moment they happen; a log file growing or a
+/// temperature moving signals nothing, so they need a timer.
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 static INDEX_HTML: &str = include_str!("webui.html");
@@ -64,6 +64,7 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/emblem.svg", get(emblem))
         .route("/api/status", get(api_status))
         .route("/api/log", get(api_log))
+        .route("/api/host", get(api_host))
         .route("/api/turns/{started}/log", get(api_turn_log))
         .route("/api/events", get(api_events))
         .route("/api/settings", get(api_settings).put(api_put_settings))
@@ -92,6 +93,11 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(status_value(&state.status))
 }
 
+/// A fresh host-details snapshot; the event stream pushes the same shape.
+async fn api_host() -> Json<crate::host::Host> {
+    Json(crate::host::snapshot())
+}
+
 /// The live log tail while a turn is running, else the last finished turn's.
 async fn api_log(State(state): State<AppState>) -> String {
     log_tail(&state.status)
@@ -117,16 +123,16 @@ async fn api_turn_log(State(state): State<AppState>, Path(started): Path<u64>) -
 }
 
 /// Push state to the page so it never has to poll: a `status` event on every
-/// change to the shared state, and a `log` event whenever the tail moves.
-/// Both carry JSON, which keeps a log line's own newlines and carriage
-/// returns out of the SSE framing.
+/// change to the shared state, a `log` event whenever the tail moves, and a
+/// `host` event as the host details drift. All carry JSON, which keeps a log
+/// line's own newlines and carriage returns out of the SSE framing.
 async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
         let mut changes = state.status.subscribe();
-        // Both start as None so the first pass always sends a full snapshot,
+        // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
-        let (mut sent_status, mut sent_log) = (None, None);
+        let (mut sent_status, mut sent_log, mut sent_host) = (None, None, None);
         loop {
             // Compared without the server timestamp, which moves on its own
             // and would make every state look new.
@@ -146,6 +152,14 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                     return;
                 }
                 sent_log = Some(log);
+            }
+            let host = serde_json::to_string(&crate::host::snapshot())
+                .unwrap_or_else(|_| "{}".into());
+            if sent_host.as_ref() != Some(&host) {
+                if send(&tx, "host", &host).await.is_err() {
+                    return;
+                }
+                sent_host = Some(host);
             }
             // Wake on the next state change, or on the log timer.
             tokio::select! {
@@ -236,14 +250,22 @@ struct Paused {
     paused: bool,
 }
 
-/// Pause or resume the runner. The flag lives in the persisted settings so a
-/// restart keeps it, and is mirrored into the status so the page hears about
-/// the change immediately; the main loop applies it at the next turn boundary.
+/// Pause or resume the running turn by SIGSTOPping or SIGCONTing the agent's
+/// whole process group. Only meaningful while a turn is running; the state is
+/// not persisted, so a restart always starts running.
 async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paused>) -> Response {
-    match state.settings.update(|settings| {
-        settings.paused = incoming.paused;
-        Ok(())
-    }) {
+    let pgid = match &state.status.lock().activity {
+        Activity::Running { pgid, .. } => *pgid,
+        _ => 0,
+    };
+    if pgid <= 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "no turn is running" })),
+        )
+            .into_response();
+    }
+    match crate::workspace::pause_group(pgid, incoming.paused) {
         Ok(()) => {
             Status::update(&state.status, |s| s.paused = incoming.paused);
             Json(json!({ "paused": incoming.paused })).into_response()
@@ -382,27 +404,74 @@ mod tests {
         assert_eq!(body_json(&response)["github"]["token_set"], true);
     }
 
+    /// The scheduler state letter from /proc/pid/stat, polled until it
+    /// matches so signal delivery timing can't flake the test.
+    fn await_state(pid: u32, expected: &str) -> String {
+        let mut state = String::new();
+        for _ in 0..100 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            state = stat
+                .rsplit(") ")
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_default()
+                .to_owned();
+            if state == expected {
+                return state;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        state
+    }
+
     #[test]
-    fn pause_round_trips_and_persists() {
-        let (addr, dir) = serve_in_tempdir();
+    fn pause_stops_and_resumes_the_running_group() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
+        let status = Shared::new();
+        let addr = spawn("127.0.0.1:0".parse().unwrap(), status.clone(), store).unwrap();
+
+        // Nothing running: the toggle has nothing to signal.
+        let response = request(addr, "PUT", "/api/paused", r#"{"paused":true}"#);
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        Status::update(&status, |s| {
+            s.activity = Activity::Running {
+                task: "simplify".into(),
+                repo: "o/r".into(),
+                forge: "github".into(),
+                workspace: "/w".into(),
+                log_path: dir.path().join("log"),
+                pgid: child.id() as i32,
+                started: 0,
+            }
+        });
 
         let response = request(addr, "PUT", "/api/paused", r#"{"paused":true}"#);
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert_eq!(body_json(&response)["paused"], true);
-
-        // Mirrored into the status for the page, and persisted for restarts.
-        let status = body_json(&request(addr, "GET", "/api/status", ""));
-        assert_eq!(status["paused"], true);
-        let stored: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(dir.path().join("config.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(stored["paused"], true);
+        assert_eq!(await_state(child.id(), "T"), "T");
+        assert_eq!(
+            body_json(&request(addr, "GET", "/api/status", ""))["paused"],
+            true
+        );
 
         let response = request(addr, "PUT", "/api/paused", r#"{"paused":false}"#);
-        assert_eq!(body_json(&response)["paused"], false);
-        let status = body_json(&request(addr, "GET", "/api/status", ""));
-        assert_eq!(status["paused"], false);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(await_state(child.id(), "S"), "S");
+        assert_eq!(
+            body_json(&request(addr, "GET", "/api/status", ""))["paused"],
+            false
+        );
+
+        child.kill().ok();
+        child.wait().ok();
     }
 
     #[test]
@@ -502,6 +571,7 @@ mod tests {
                 forge: "github".into(),
                 workspace: "/w".into(),
                 log_path: path.clone(),
+                pgid: 0,
                 started: 0,
             }
         });

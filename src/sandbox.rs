@@ -93,6 +93,9 @@ fn writable_paths(repo: &Path, log: &Path) -> Vec<PathBuf> {
         home.join(".claude"),
         home.join(".npm"),
         home.join(".bun"),
+        // Rust builds unpack registry crates and fetch toolchains here.
+        home.join(".cargo"),
+        home.join(".rustup"),
         xdg("XDG_CONFIG_HOME", ".config"),
         xdg("XDG_CACHE_HOME", ".cache"),
         xdg("XDG_DATA_HOME", ".local/share"),

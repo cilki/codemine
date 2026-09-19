@@ -171,15 +171,32 @@ pub fn throttle_argv(cfg: &Config) -> Vec<String> {
 }
 
 /// SIGTERM the child's whole process group with a grace period, then SIGKILL;
-/// signalling only the child would orphan its grandchildren.
+/// signalling only the child would orphan its grandchildren. The SIGCONT
+/// alongside the SIGTERM lets a paused (stopped) tree wake up and die
+/// gracefully instead of eating the SIGKILL.
 pub fn kill_group(child: &mut Child) -> Result<()> {
     let pgid = -(child.id() as i32);
-    unsafe { libc::kill(pgid, libc::SIGTERM) };
+    unsafe {
+        libc::kill(pgid, libc::SIGTERM);
+        libc::kill(pgid, libc::SIGCONT);
+    }
     if child.wait_timeout(Duration::from_secs(10))?.is_none() {
         unsafe { libc::kill(pgid, libc::SIGKILL) };
         child.wait().ok();
     }
     Ok(())
+}
+
+/// Stop or continue a whole process group, for the web UI's pause button.
+pub fn pause_group(pgid: i32, pause: bool) -> Result<()> {
+    if pgid <= 0 {
+        bail!("no process group to signal");
+    }
+    let signal = if pause { libc::SIGSTOP } else { libc::SIGCONT };
+    match unsafe { libc::kill(-pgid, signal) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()).context("failed to signal the process group"),
+    }
 }
 
 /// Run a command with its output appended to the turn log, killing its whole

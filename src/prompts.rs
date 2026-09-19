@@ -166,10 +166,15 @@ mod tests {
             [
                 "feedback",
                 "rebase",
-                "bump-deps",
+                "bump",
                 "simplify",
                 "todo",
-                "roleplay"
+                "roleplay",
+                "benchmark",
+                "audit",
+                "docs",
+                "coverage",
+                "feature"
             ]
         );
     }
@@ -195,9 +200,9 @@ mod tests {
         assert_eq!(by_slug("feedback").lines().count(), 2);
         // Nested bullets keep their indentation.
         assert!(
-            by_slug("bump-deps").contains("\n  - Only make a PR"),
+            by_slug("bump").contains("\n  - Only make a PR"),
             "{}",
-            by_slug("bump-deps")
+            by_slug("bump")
         );
         // The `# General information` section is not a task and its prose
         // never lands on the task above it.

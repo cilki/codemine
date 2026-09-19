@@ -6,6 +6,7 @@
 
 mod config;
 mod emblem;
+mod host;
 mod prompts;
 mod sandbox;
 mod scan;
@@ -58,14 +59,6 @@ fn main() -> Result<()> {
     let mut applied_generation = None;
     loop {
         let (settings, generation) = store.snapshot();
-        Status::update(&status, |s| s.paused = settings.paused);
-        // A pause applies at the turn boundary: the running turn finishes,
-        // and no new one starts until resumed.
-        if settings.paused {
-            Status::update(&status, |s| s.activity = Activity::Paused);
-            std::thread::sleep(Duration::from_secs(5));
-            continue;
-        }
         let mut problems = settings.problems();
         if !claude_oauth_usable() {
             problems.push(Problem::new(

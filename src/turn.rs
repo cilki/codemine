@@ -70,12 +70,14 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     );
 
     Status::update(status, |s| {
+        s.paused = false;
         s.activity = Activity::Running {
             task: task.clone(),
             repo: repo.clone(),
             forge: forge.kind.name().into(),
             workspace: dir.display().to_string(),
             log_path: log_path.clone(),
+            pgid: 0,
             started: started_epoch,
         };
     });
@@ -140,10 +142,13 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         .env("PWD", &dir)
         .env("NO_COLOR", "1")
         // Headless runs auto-reject permission prompts, so every tool the
-        // agent needs has to be pre-approved.
+        // agent needs has to be pre-approved. The Landlock sandbox is the
+        // real boundary, and legitimate work (cargo's registry, tool caches)
+        // lives outside the clone, so opencode's own external-directory gate
+        // stays open too.
         .env(
             "OPENCODE_PERMISSION",
-            r#"{"edit":"allow","bash":"allow","webfetch":"allow"}"#,
+            r#"{"edit":"allow","bash":"allow","webfetch":"allow","external_directory":"allow"}"#,
         )
         // The agent's skills run gh/glab inside the session; every configured
         // forge's auth has to reach them since nothing is in the process env.
@@ -157,6 +162,13 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         .stderr(Stdio::from(log.try_clone()?))
         .spawn()
         .with_context(|| format!("failed to spawn {}", argv[0]))?;
+
+    // Now that the group exists, let the web UI pause and resume it.
+    Status::update(status, |s| {
+        if let Activity::Running { pgid, .. } = &mut s.activity {
+            *pgid = child.id() as i32;
+        }
+    });
 
     let exit = child.wait_timeout(cfg.turn_timeout)?;
     if exit.is_none() {
@@ -192,6 +204,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
 
     let tokens = crate::usage::collect_since(started_wall);
     Status::update(status, |s| {
+        s.paused = false;
         s.log_tail = last_lines(&tail, 100).to_owned();
         s.record_turn(TurnRecord {
             task: task.clone(),
