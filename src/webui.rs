@@ -134,32 +134,28 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         // even when the log tail is legitimately empty.
         let (mut sent_status, mut sent_log, mut sent_host) = (None, None, None);
         loop {
-            // Compared without the server timestamp, which moves on its own
-            // and would make every state look new.
+            // Status is compared without the server timestamp, which moves on
+            // its own and would make every state look new, but sent with it;
+            // the log and host events compare and send the same JSON.
             let snapshot = serde_json::to_string(&*state.status.lock()).unwrap_or_default();
-            if sent_status.as_ref() != Some(&snapshot) {
-                let payload = serde_json::to_string(&status_value(&state.status))
-                    .unwrap_or_else(|_| "{}".into());
-                if send(&tx, "status", &payload).await.is_err() {
-                    return;
-                }
-                sent_status = Some(snapshot);
-            }
+            let status =
+                serde_json::to_string(&status_value(&state.status)).unwrap_or_else(|_| "{}".into());
             let log =
                 serde_json::to_string(&log_tail(&state.status)).unwrap_or_else(|_| "\"\"".into());
-            if sent_log.as_ref() != Some(&log) {
-                if send(&tx, "log", &log).await.is_err() {
+            let host =
+                serde_json::to_string(&crate::host::snapshot()).unwrap_or_else(|_| "{}".into());
+            for (name, key, payload, sent) in [
+                ("status", &snapshot, &status, &mut sent_status),
+                ("log", &log, &log, &mut sent_log),
+                ("host", &host, &host, &mut sent_host),
+            ] {
+                if sent.as_ref() == Some(key) {
+                    continue;
+                }
+                if send(&tx, name, payload).await.is_err() {
                     return;
                 }
-                sent_log = Some(log);
-            }
-            let host = serde_json::to_string(&crate::host::snapshot())
-                .unwrap_or_else(|_| "{}".into());
-            if sent_host.as_ref() != Some(&host) {
-                if send(&tx, "host", &host).await.is_err() {
-                    return;
-                }
-                sent_host = Some(host);
+                *sent = Some(key.clone());
             }
             // Wake on the next state change, or on the log timer.
             tokio::select! {
