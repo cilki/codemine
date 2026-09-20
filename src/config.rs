@@ -142,8 +142,8 @@ pub struct Config {
     /// sections in the sweep command template.
     pub tasks: Vec<String>,
     /// Completed (not skipped) tasks allowed per hour; None is unlimited.
-    /// A fractional rate spaces turns further apart: 0.5 is one every two
-    /// hours.
+    /// Spent from a bucket holding an hour's worth, so the rate can be
+    /// fractional: 0.5 is one turn every two hours.
     pub hourly_limit: Option<f64>,
     pub author_name: String,
     pub author_email: String,

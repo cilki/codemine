@@ -111,6 +111,21 @@ the user decide what to do.
   test
 - Do not add trivial tests just to raise the count
 
+## "mutation"
+
+- Mutation test the project: pick a well-tested module and mutate it, one
+  load-bearing detail at a time (flip a comparison, swap a boundary, negate a
+  condition, drop a side effect, return a default), rerunning the module's
+  tests after each mutation to see whether they catch it
+- Use the ecosystem's mutation tester if the project has one configured
+  (`cargo mutants`, Stryker, `mutmut`, PIT), otherwise mutate by hand and
+  revert each mutation before trying the next
+- For every mutation that survives, add or strengthen a test that kills it;
+  the PR contains only the new tests, never the mutations themselves
+- Verify the tree is back to its unmutated state and the full suite passes
+  before committing
+- Skip the turn if no mutation survives — a clean run is not worth a PR
+
 ## "feature"
 
 - Come up with a brand new feature that fits the project's purpose and would

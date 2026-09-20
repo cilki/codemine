@@ -24,8 +24,9 @@ pub struct Settings {
     /// The task pool the runner draws from each turn.
     pub tasks: Vec<String>,
     /// Completed (not skipped) tasks allowed per hour; None is unlimited.
-    /// Fractional rates are the point of the unit: 0.5 is one task every two
-    /// hours.
+    /// Fractional rates are the point of the unit: 0.5 is one task every
+    /// two hours. The runner spends them from a bucket, so a whole hour's
+    /// worth can run back to back.
     pub hourly_limit: Option<f64>,
     /// The name and email commits are authored (and committed) as; empty
     /// means unconfigured.

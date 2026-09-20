@@ -174,6 +174,7 @@ mod tests {
                 "audit",
                 "docs",
                 "coverage",
+                "mutation",
                 "feature"
             ]
         );

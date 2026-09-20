@@ -1,7 +1,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
@@ -82,6 +82,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             log_path: log_path.clone(),
             pgid: 0,
             started: started_epoch,
+            tokens: None,
         };
     });
 
@@ -174,7 +175,31 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         }
     });
 
-    let exit = child.wait_timeout(cfg.turn_timeout)?;
+    // Wait in short hops rather than one long one, resampling what the turn
+    // has spent between them: opencode records each message as it goes, so
+    // the page can watch the cost climb instead of learning it at the end.
+    let run_start = Instant::now();
+    let mut sampled = None;
+    let exit = loop {
+        let left = cfg.turn_timeout.saturating_sub(run_start.elapsed());
+        if left.is_zero() {
+            break None;
+        }
+        if let Some(exit) = child.wait_timeout(SAMPLE_INTERVAL.min(left))? {
+            break Some(exit);
+        }
+        // A failed read (opencode mid-write, say) leaves the last good
+        // sample up rather than blinking the figure away.
+        let tokens = crate::usage::collect_since(started_wall);
+        if tokens.is_some() && tokens != sampled {
+            sampled = tokens.clone();
+            Status::update(status, |s| {
+                if let Activity::Running { tokens: live, .. } = &mut s.activity {
+                    *live = tokens;
+                }
+            });
+        }
+    };
     if exit.is_none() {
         workspace::kill_group(&mut child)?;
     }
@@ -231,6 +256,10 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         oauth_revoked: scan::oauth_revoked(&tail),
     })
 }
+
+/// How often a running turn's token usage is resampled. Frequent enough to
+/// read as live, rare enough that the scan is noise next to the agent.
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 const PAGE_SIZE: usize = 50;
 

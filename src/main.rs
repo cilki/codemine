@@ -55,10 +55,14 @@ fn main() -> Result<()> {
     let addr = webui::spawn(cli.listen, status.clone(), store.clone())?;
     info!("webui listening on http://{addr}");
 
-    // Epochs of completed turns: the newest one gates the next turn, and the
-    // last hour's worth is what the UI counts.
+    // Epochs of completed turns, for the UI's trailing-hour count.
     let mut completions: VecDeque<u64> = VecDeque::new();
-    let mut last_completed: Option<u64> = None;
+    // Turns available to spend right now. The bucket refills at the
+    // configured rate and holds at most an hour's worth, so a limit of 2
+    // runs two turns back to back and then one every half hour. It starts
+    // full, whatever limit is configured later.
+    let mut allowance = f64::INFINITY;
+    let mut refilled = status::epoch_now();
     let mut applied_generation = None;
     // The credentials file's mtime when a turn last died on revoked OAuth;
     // turns stay gated until a fresh login rewrites the file.
@@ -115,23 +119,29 @@ fn main() -> Result<()> {
         }
 
         let now = status::epoch_now();
+        // The bucket's clock advances every pass, so the time it grew for is
+        // counted once whether or not this pass gets to run a turn.
+        let since = std::mem::replace(&mut refilled, now);
         let recent = prune_completions(&mut completions, now);
         Status::update(&status, |s| {
             s.completed_last_hour = recent;
             s.hourly_limit = cfg.hourly_limit;
         });
-        let ready = cfg
-            .hourly_limit
-            .zip(last_completed)
-            .map(|(limit, last)| last.saturating_add(spacing(limit)));
-        if let Some(ready) = ready
-            && ready > now
-        {
-            Status::update(&status, |s| s.activity = Activity::RateLimited { until: ready });
-            // Sleep in slices and fall back into the loop, so a raised limit
-            // applies within a minute instead of at the end of the wait.
-            std::thread::sleep(Duration::from_secs((ready - now).min(60)));
-            continue;
+        if let Some(limit) = cfg.hourly_limit {
+            allowance = refill(allowance, since, now, limit);
+            if allowance < 1.0 {
+                // Whole seconds rounded up, so the wait can't expire a hair
+                // early and spin the loop.
+                let wait = ((1.0 - allowance) * HOUR / limit).ceil() as u64;
+                Status::update(&status, |s| {
+                    s.activity = Activity::RateLimited { until: now + wait }
+                });
+                // Sleep in slices and fall back into the loop, so a raised
+                // limit applies within a minute instead of at the end of
+                // the wait.
+                std::thread::sleep(Duration::from_secs(wait.min(60)));
+                continue;
+            }
         }
 
         match turn::run(&cfg, &status) {
@@ -146,13 +156,13 @@ fn main() -> Result<()> {
                 if report.completed {
                     let at = status::epoch_now();
                     completions.push_back(at);
-                    last_completed = Some(at);
                     let recent = prune_completions(&mut completions, at);
                     Status::update(&status, |s| s.completed_last_hour = recent);
+                    allowance -= 1.0;
                     if let Some(limit) = cfg.hourly_limit {
                         info!(
-                            "completed {recent} tasks in the last hour; next turn in {}s at {limit}/hour",
-                            spacing(limit)
+                            "completed {recent} tasks in the last hour; {allowance:.1} of {} turns left at {limit}/hour",
+                            capacity(limit)
                         );
                     }
                 }
@@ -172,14 +182,20 @@ fn main() -> Result<()> {
     }
 }
 
-const HOUR: u64 = 3600;
+const HOUR: f64 = 3600.0;
 
-/// The shortest gap allowed between completed turns at `limit` turns an
-/// hour, which is what makes fractional limits meaningful: 0.5 is one turn
-/// every two hours. The cast saturates, so an absurdly small limit just
-/// means never.
-fn spacing(limit: f64) -> u64 {
-    (HOUR as f64 / limit) as u64
+/// How many turns the bucket holds when full: an hour's worth, but never
+/// less than one, so a fractional limit still lets a turn through — 0.5 an
+/// hour is one turn every two hours rather than none at all.
+fn capacity(limit: f64) -> f64 {
+    limit.floor().max(1.0)
+}
+
+/// The allowance grown for the time since it was last topped up, capped at
+/// the bucket's capacity so an idle runner banks at most one hour.
+fn refill(allowance: f64, since: u64, now: u64, limit: f64) -> f64 {
+    let earned = now.saturating_sub(since) as f64 * limit / HOUR;
+    (allowance + earned).min(capacity(limit))
 }
 
 /// Drop completions older than an hour and report how many are left, for the
@@ -187,7 +203,7 @@ fn spacing(limit: f64) -> u64 {
 fn prune_completions(completions: &mut VecDeque<u64>, now: u64) -> u32 {
     while completions
         .front()
-        .is_some_and(|&at| now.saturating_sub(at) >= HOUR)
+        .is_some_and(|&at| now.saturating_sub(at) >= HOUR as u64)
     {
         completions.pop_front();
     }
@@ -416,4 +432,41 @@ fn iso8601(epoch: u64) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bucket_allows_a_burst_then_the_rate() {
+        // Two an hour: two turns in hand at once, one back every half hour.
+        assert_eq!(capacity(2.0), 2.0);
+        let full = refill(f64::INFINITY, 0, 0, 2.0);
+        assert_eq!(full, 2.0);
+        let spent = full - 2.0;
+        assert_eq!(refill(spent, 100, 100, 2.0), 0.0);
+        assert_eq!(refill(spent, 100, 100 + 1800, 2.0), 1.0);
+        // An idle day banks an hour's worth and not a turn more.
+        assert_eq!(refill(spent, 0, 86_400, 2.0), 2.0);
+    }
+
+    #[test]
+    fn a_fractional_limit_holds_one_turn() {
+        assert_eq!(capacity(0.5), 1.0);
+        assert_eq!(refill(0.0, 0, 3600, 0.5), 0.5);
+        assert_eq!(refill(0.0, 0, 7200, 0.5), 1.0);
+        assert_eq!(refill(0.0, 0, 86_400, 0.5), 1.0);
+    }
+
+    #[test]
+    fn only_the_last_hour_of_completions_counts() {
+        let mut completions: VecDeque<u64> = VecDeque::from([1_000, 4_000, 4_500]);
+        // 1_000 is still inside the hour here, and an hour old at 4_600.
+        assert_eq!(prune_completions(&mut completions, 4_500), 3);
+        assert_eq!(prune_completions(&mut completions, 4_600), 2);
+        assert_eq!(prune_completions(&mut completions, 7_000), 2);
+
+        assert_eq!(prune_completions(&mut completions, 100_000), 0);
+    }
 }

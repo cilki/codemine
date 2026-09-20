@@ -464,6 +464,7 @@ mod tests {
                 log_path: dir.path().join("log"),
                 pgid: child.id() as i32,
                 started: 0,
+                tokens: None,
             }
         });
 
@@ -586,6 +587,7 @@ mod tests {
                 log_path: path.clone(),
                 pgid: 0,
                 started: 0,
+                tokens: None,
             }
         });
         assert_eq!(log_tail(&status), "first\n");

@@ -2,6 +2,9 @@
 //! Everything is best-effort: a field that can't be read just comes back
 //! empty or zero and the page shows a dash.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use serde::Serialize;
 
 #[derive(Serialize, Default)]
@@ -9,28 +12,25 @@ pub struct Host {
     pub hostname: String,
     /// The address the default route leaves from; empty when unroutable.
     pub ip: String,
-    pub cpu_model: String,
     pub cpus: usize,
+    /// Busy time across all cores as a percentage, 0-100; None before the
+    /// first measurement window closes.
+    pub cpu_usage: Option<f32>,
     /// Bytes.
     pub mem_total: u64,
     pub mem_available: u64,
     /// Degrees Celsius; None when no sensor is exposed.
     pub temp_c: Option<f32>,
     pub uptime_secs: u64,
-    /// Cumulative since boot, all interfaces except loopback.
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
 }
 
 pub fn snapshot() -> Host {
-    let (cpu_model, cpus) = cpu_info();
     let (mem_total, mem_available) = mem_info();
-    let (rx_bytes, tx_bytes) = net_totals();
     Host {
         hostname: read_trimmed("/proc/sys/kernel/hostname"),
         ip: local_ip(),
-        cpu_model,
-        cpus,
+        cpus: cpu_count(),
+        cpu_usage: cpu_usage(),
         mem_total,
         mem_available,
         temp_c: cpu_temp(),
@@ -39,8 +39,6 @@ pub fn snapshot() -> Host {
             .next()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0) as u64,
-        rx_bytes,
-        tx_bytes,
     }
 }
 
@@ -62,23 +60,88 @@ fn local_ip() -> String {
         .unwrap_or_default()
 }
 
-fn cpu_info() -> (String, usize) {
-    let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let model = info
-        .lines()
-        .find(|line| line.starts_with("model name"))
-        .and_then(|line| line.split_once(':'))
-        .map(|(_, model)| model.trim().to_owned())
-        .unwrap_or_default();
-    let cpus = info
+fn cpu_count() -> usize {
+    let cpus = std::fs::read_to_string("/proc/cpuinfo")
+        .unwrap_or_default()
         .lines()
         .filter(|line| line.starts_with("processor"))
         .count();
-    let cpus = match cpus {
+    match cpus {
         0 => std::thread::available_parallelism().map_or(0, |n| n.get()),
         n => n,
+    }
+}
+
+/// The last /proc/stat reading and the usage computed from it. Kept process
+/// wide so every caller — each open event stream, plus `/api/host` — shares
+/// one measurement window instead of racing each other for ever shorter,
+/// ever noisier deltas.
+static CPU: Mutex<Option<CpuSample>> = Mutex::new(None);
+
+struct CpuSample {
+    at: Instant,
+    /// Jiffies since boot, all of them and the idle ones.
+    total: u64,
+    idle: u64,
+    usage: f32,
+}
+
+/// The shortest span a usage figure is measured over; below this it is
+/// mostly quantization noise.
+const CPU_WINDOW: Duration = Duration::from_millis(500);
+
+/// Busy time as a percentage of all CPU time since the previous reading.
+fn cpu_usage() -> Option<f32> {
+    let mut cached = CPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut now = cpu_times()?;
+    let (prev_total, prev_idle) = match cached.take() {
+        // Asked again within the window: the answer hasn't had time to
+        // change, and re-diffing would only add noise.
+        Some(prev) if prev.at.elapsed() < CPU_WINDOW => {
+            let usage = prev.usage;
+            *cached = Some(prev);
+            return Some(usage);
+        }
+        Some(prev) => (prev.total, prev.idle),
+        // The first call has nothing to diff against, so it measures a
+        // window of its own rather than leave the page blank.
+        None => {
+            let first = now;
+            std::thread::sleep(CPU_WINDOW);
+            now = cpu_times()?;
+            first
+        }
     };
-    (model, cpus)
+    let (total, idle) = now;
+    let elapsed = total.saturating_sub(prev_total);
+    let idled = idle.saturating_sub(prev_idle);
+    let usage = match elapsed {
+        0 => 0.0,
+        _ => 100.0 * elapsed.saturating_sub(idled) as f32 / elapsed as f32,
+    };
+    *cached = Some(CpuSample {
+        at: Instant::now(),
+        total,
+        idle,
+        usage,
+    });
+    Some(usage)
+}
+
+/// Total and idle jiffies since boot, from /proc/stat's summary line.
+fn cpu_times() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let fields: Vec<u64> = stat
+        .lines()
+        .next()?
+        .strip_prefix("cpu ")?
+        .split_whitespace()
+        .filter_map(|field| field.parse().ok())
+        .collect();
+    // user nice system idle iowait irq softirq steal ...; idle and iowait
+    // are both time the CPU had nothing to run.
+    let idle = *fields.get(3)? + *fields.get(4)?;
+    Some((fields.iter().sum(), idle))
 }
 
 /// MemTotal and MemAvailable in bytes.
@@ -115,24 +178,6 @@ fn cpu_temp() -> Option<f32> {
     fallback
 }
 
-/// Cumulative receive and transmit bytes across every interface but lo.
-fn net_totals() -> (u64, u64) {
-    let dev = std::fs::read_to_string("/proc/net/dev").unwrap_or_default();
-    let (mut rx, mut tx) = (0, 0);
-    for line in dev.lines().skip(2) {
-        let Some((name, rest)) = line.split_once(':') else {
-            continue;
-        };
-        if name.trim() == "lo" {
-            continue;
-        }
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        rx += fields.first().and_then(|f| f.parse().ok()).unwrap_or(0u64);
-        tx += fields.get(8).and_then(|f| f.parse().ok()).unwrap_or(0u64);
-    }
-    (rx, tx)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +190,15 @@ mod tests {
         assert!(host.mem_total > 0);
         assert!(host.mem_available <= host.mem_total);
         assert!(host.uptime_secs > 0);
+        let usage = host.cpu_usage.expect("the first call measures its own window");
+        assert!((0.0..=100.0).contains(&usage), "{usage}");
+    }
+
+    #[test]
+    fn cpu_times_only_move_forward() {
+        let (total, idle) = cpu_times().expect("/proc/stat is readable");
+        assert!(total > 0 && idle <= total, "{idle} of {total}");
+        let (later, later_idle) = cpu_times().unwrap();
+        assert!(later >= total && later_idle >= idle);
     }
 }

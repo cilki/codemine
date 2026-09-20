@@ -6,7 +6,13 @@
 <title>codemine</title>
 <style>
   /* Copper, following the cilki emblem palette's #c8__37 family. */
-  :root { --accent: #c87137; }
+  :root {
+    --accent: #c87137;
+    /* Steel, for every section and field heading: enough tint to read as a
+       heading, too desaturated to compete with the accent or with the
+       colors the outcomes and stats carry. */
+    --label: #8ea9c1;
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: Arial, sans-serif;
@@ -17,23 +23,24 @@
       linear-gradient(90deg, rgba(56, 60, 63, 0.5) 1px, transparent 1px);
     background-size: 80px 80px;
     min-height: 100vh;
+    /* The grid squares light up inside #glow, which is anchored here so it
+       lines up with the background whatever the page scrolls to. */
+    position: relative;
   }
-  .container { max-width: 1100px; min-height: 100vh; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
-  /* Three columns so the emblem stays centered whatever the badge says. */
-  .header { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; }
-  .header .emblem { height: 106px; display: block; max-width: 100%; object-fit: contain; }
-  .header .now { justify-self: end; display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
-  .badge {
-    padding: 3px 10px; border-radius: 12px; font-size: 0.8em; white-space: nowrap;
-    text-transform: uppercase; letter-spacing: 1px;
-    background: rgb(62, 68, 70); color: #e8eaed;
+  #glow { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  /* Sized to sit inside the grid lines, which stay drawn over the fill. */
+  .glow-cell {
+    position: absolute; width: 79px; height: 79px;
+    background: rgba(200, 113, 55, 0.07);
+    opacity: 0;
+    animation: glow 3.2s ease-in-out forwards;
   }
-  .badge.running { background: rgba(97, 175, 239, 0.15); color: #61afef; }
-  .badge.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
-  .badge.paused, .badge.usage_limit, .badge.rate_limited, .badge.unconfigured {
-    background: rgba(230, 126, 34, 0.15); color: #e67e22;
-  }
-  #timer { font-size: 0.85em; }
+  @keyframes glow { 40% { opacity: 1; } 100% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { #glow { display: none; } }
+  /* Above the glow layer, which shares the body's stacking context. */
+  .container { position: relative; max-width: 1100px; min-height: 100vh; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
+  .header { display: flex; align-items: center; justify-content: center; gap: 12px; }
+  .header .emblem { height: 124px; display: block; max-width: 100%; object-fit: contain; }
   .disconnected { color: #e74c3c; font-size: 0.85em; }
   .panel {
     background: rgb(24, 26, 27);
@@ -41,19 +48,24 @@
     border-radius: 8px;
     padding: 16px;
   }
-  .panel-title { text-transform: uppercase; letter-spacing: 1px; font-size: 0.75em; color: var(--accent); margin-bottom: 10px; }
+  .panel-title { text-transform: uppercase; letter-spacing: 1px; font-size: 0.75em; color: var(--label); margin-bottom: 10px; }
   @keyframes pulse { 50% { opacity: 0.3; } }
   .mono { font-family: "Courier New", monospace; }
   .muted { color: #9aa0a6; }
   .host-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
   .host-grid .stat-label { margin-bottom: 4px; }
+  #host-name { text-transform: none; }
   .host-value { font-family: "Courier New", monospace; font-size: 0.95em; word-break: break-word; }
   .log-buttons { display: flex; gap: 8px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
   .stat { background: rgb(24, 26, 27); border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px 16px; }
-  .stat-label { text-transform: uppercase; letter-spacing: 1px; font-size: 0.7em; color: #9aa0a6; }
+  .stat-label { text-transform: uppercase; letter-spacing: 1px; font-size: 0.7em; color: var(--label); }
   .stat-value { font-family: "Courier New", monospace; font-size: 1.4em; margin-top: 4px; }
   #stat-hour { color: var(--accent); }
+  /* The runner tile's label is the state, so the value can be the clock. */
+  #stat-state.running { color: #61afef; }
+  #stat-state.paused, #stat-state.rate_limited,
+  #stat-state.usage_limit, #stat-state.unconfigured { color: #e67e22; }
   #stat-completed { color: #2ecc71; }
   #stat-skipped { color: #9aa0a6; }
   #stat-failed { color: #e74c3c; }
@@ -144,25 +156,21 @@
 </style>
 </head>
 <body>
+<div id="glow"></div>
 <div class="container">
   <div class="header">
-    <span></span>
     <img src="/emblem.svg" alt="codemine" class="emblem">
-    <span class="now">
-      <span class="mono muted" id="timer"></span>
-      <span class="badge" id="badge">starting</span>
-    </span>
   </div>
 
   <div class="panel">
-    <div class="panel-title log-head"><span>Host</span>
+    <div class="panel-title log-head"><span>Host - <span id="host-name">–</span></span>
       <span class="disconnected" id="disconnected" hidden>disconnected</span></div>
     <div class="host-grid" id="host"><span class="muted">Loading…</span></div>
   </div>
 
   <div class="stats">
+    <div class="stat"><div class="stat-label" id="stat-state-label">Runner</div><div class="stat-value" id="stat-state">–</div></div>
     <div class="stat"><div class="stat-label">Past hour</div><div class="stat-value" id="stat-hour">–</div></div>
-    <div class="stat"><div class="stat-label">Turns</div><div class="stat-value" id="stat-turns">–</div></div>
     <div class="stat"><div class="stat-label">Completed</div><div class="stat-value" id="stat-completed">–</div></div>
     <div class="stat"><div class="stat-label">Skipped</div><div class="stat-value" id="stat-skipped">–</div></div>
     <div class="stat"><div class="stat-label">Failed</div><div class="stat-value" id="stat-failed">–</div></div>
@@ -229,6 +237,12 @@
 
   const tokenTotal = t => t.input + t.output + t.reasoning + t.cache_read + t.cache_write;
 
+  const tokenBreakdown = t =>
+    "input " + fmtTokens(t.input) + " · output " + fmtTokens(t.output)
+      + " · reasoning " + fmtTokens(t.reasoning)
+      + " · cache " + fmtTokens(t.cache_read) + " read / "
+      + fmtTokens(t.cache_write) + " write";
+
   function fmtTokens(n) {
     if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
     if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
@@ -251,22 +265,17 @@
     return s + "s";
   }
 
+  // Just the largest unit, for the runner tile, where the value shares a
+  // small box with the state and a second figure only adds noise.
+  function fmtCoarse(secs) {
+    secs = Math.max(0, Math.round(secs));
+    if (secs >= 3600) return Math.floor(secs / 3600) + "h";
+    if (secs >= 60) return Math.floor(secs / 60) + "m";
+    return secs + "s";
+  }
+
   // Server time, extrapolated from the last response.
   const serverNow = () => state.now + (Date.now() - state.received) / 1000;
-
-  const BADGES = {
-    starting: "starting", running: "running", sleeping: "sleeping",
-    paused: "paused", usage_limit: "usage limit", rate_limited: "rate limit",
-    unconfigured: "unconfigured",
-  };
-
-  // What the badge's tooltip spells out, since the badge itself is one word.
-  function activityDetail(a) {
-    if (a.state === "running") return a.task + " on " + a.repo + " (" + a.forge + ")";
-    if (a.state === "rate_limited") return "hourly task limit reached";
-    if (a.state === "unconfigured") return a.problems.map(p => p.message).join(" · ");
-    return "";
-  }
 
   // Outline every field the runner is waiting on, and clear the ones that
   // were fixed. Values are never touched, so this is safe to run on the
@@ -293,29 +302,41 @@
   // The running turn's elapsed time advances on its own between events, so
   // it is redrawn on a local timer rather than waiting for the server to say
   // something.
+  const STATES = {
+    starting: "starting", running: "running", sleeping: "sleeping",
+    usage_limit: "usage limit", rate_limited: "rate limit",
+    unconfigured: "unconfigured",
+  };
+
+  // What the runner is doing, and for how much longer: the state names the
+  // tile, the countdown fills it. Redrawn on the clock so the wait ticks
+  // down between server events.
+  function renderRunnerState() {
+    const a = state.activity;
+    // A pause holds the running turn's tree, so it outranks "running".
+    const paused = state.paused && a.state === "running";
+    const value = $("stat-state");
+    $("stat-state-label").textContent = paused ? "paused" : STATES[a.state] || a.state;
+    value.className = "stat-value " + (paused ? "paused" : a.state);
+    value.textContent = a.state === "running"
+      ? fmtCoarse(serverNow() - a.started)
+      : a.until ? fmtCoarse(a.until - serverNow()) : "–";
+  }
+
   function renderClock() {
     const a = state.activity;
-    let timer = "";
-    if (a.state === "running") {
-      timer = fmtDuration(serverNow() - a.started) + " elapsed";
-    } else if (a.until) {
-      timer = fmtDuration(a.until - serverNow()) + " remaining";
-    }
-    $("timer").textContent = timer;
+    renderRunnerState();
     const elapsed = $("running-elapsed");
     if (elapsed && a.state === "running") {
-      elapsed.textContent = fmtDuration(serverNow() - a.started);
+      // Tokens sit beside the clock because the row's other slot is the
+      // turn's identity; they only move when a new sample lands.
+      elapsed.textContent = fmtDuration(serverNow() - a.started)
+        + (a.tokens ? " · " + fmtTokens(tokenTotal(a.tokens)) + " tokens" : "");
     }
   }
 
   function render() {
     const a = state.activity;
-    // A pause only holds the running turn's process tree, so it outranks
-    // "running" on the badge and means nothing otherwise.
-    const overall = state.paused && a.state === "running" ? "paused" : a.state;
-    $("badge").textContent = BADGES[overall] || overall;
-    $("badge").className = "badge " + overall;
-    $("badge").title = activityDetail(a);
     markProblems(a.state === "unconfigured" ? a.problems : []);
     // The pause button lives with the log because it freezes the running
     // turn's process tree; without a turn there is nothing to signal.
@@ -325,13 +346,14 @@
 
     $("stat-hour").textContent =
       state.completed_last_hour + " / " + (state.hourly_limit ?? "∞");
-    $("stat-turns").textContent = state.totals.turns;
     $("stat-completed").textContent = state.totals.completed;
     $("stat-skipped").textContent = state.totals.skipped;
     $("stat-failed").textContent = state.totals.failed + state.totals.timeout;
-    $("stat-tokens").textContent =
-      state.totals.tokens && tokenTotal(state.totals.tokens)
-        ? fmtTokens(tokenTotal(state.totals.tokens)) : "–";
+    // The in-flight turn's tally is not in the totals yet, so it is added
+    // here; the stat then climbs during a turn instead of jumping at its end.
+    const spent = (state.totals.tokens ? tokenTotal(state.totals.tokens) : 0)
+      + (a.state === "running" && a.tokens ? tokenTotal(a.tokens) : 0);
+    $("stat-tokens").textContent = spent ? fmtTokens(spent) : "–";
 
     const rows = state.turns.map(turn => {
       const row = turnRow(turn.task + " on " + turn.repo, turn.outcome,
@@ -341,13 +363,7 @@
       row.className = "turn" + (viewing === turn.started ? " selected" : "");
       // Clicking a turn shows its full log; clicking again goes back to live.
       row.onclick = () => viewing === turn.started ? viewLive() : viewTurn(turn);
-      if (turn.tokens) {
-        const t = turn.tokens;
-        row.title = "input " + fmtTokens(t.input) + " · output " + fmtTokens(t.output)
-          + " · reasoning " + fmtTokens(t.reasoning)
-          + " · cache " + fmtTokens(t.cache_read) + " read / "
-          + fmtTokens(t.cache_write) + " write";
-      }
+      if (turn.tokens) row.title = tokenBreakdown(turn.tokens);
       return row;
     });
     // The in-flight turn leads the list; its log is the live tail, so
@@ -356,6 +372,7 @@
       const row = turnRow(a.task + " on " + a.repo, state.paused ? "paused" : "running",
         a.forge + " · " + new Date(a.started * 1000).toLocaleString(), "");
       row.querySelector(".turn-meta").lastChild.id = "running-elapsed";
+      if (a.tokens) row.title = tokenBreakdown(a.tokens);
       row.onclick = viewLive;
       rows.unshift(row);
     }
@@ -514,15 +531,14 @@
   function renderHost(h) {
     const memory = h.mem_total
       ? fmtBytes(h.mem_total - h.mem_available) + " / " + fmtBytes(h.mem_total) : "–";
+    const temp = h.temp_c == null ? "" : " (" + Math.round(h.temp_c) + " °C)";
     const items = [
-      ["hostname", h.hostname || "–"],
       ["ip", h.ip || "–"],
-      ["cpu", h.cpu_model ? h.cpu_model + " × " + h.cpus : h.cpus + " cpus"],
+      ["cpu", (h.cpu_usage == null ? "–" : Math.round(h.cpu_usage) + "%") + temp],
       ["memory", memory],
-      ["cpu temp", h.temp_c == null ? "–" : Math.round(h.temp_c) + " °C"],
       ["uptime", fmtDuration(h.uptime_secs)],
-      ["network", "↓ " + fmtBytes(h.rx_bytes) + " · ↑ " + fmtBytes(h.tx_bytes)],
     ];
+    $("host-name").textContent = h.hostname || "–";
     $("host").replaceChildren(...items.map(([label, value]) => {
       const item = document.createElement("div");
       item.append(
@@ -830,7 +846,7 @@
   });
   $("log-live").onclick = viewLive;
   // The new state comes right back over the event stream, which repaints the
-  // button and badge; nothing to do here beyond sending the toggle.
+  // button; nothing to do here beyond sending the toggle.
   $("pause").onclick = () => fetch("/api/paused", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -840,6 +856,29 @@
 
   setInterval(() => { if (state) renderClock(); }, 1000);
   listen();
+
+  // Grid squares lighting up is how the page says a turn is under way: the
+  // background stirs while the agent works and settles back to a static
+  // grid the moment it stops. Skipped while the tab is hidden or when
+  // motion is unwelcome, since it is decoration either way.
+  const GRID = 80;
+  const LIT_CAP = 24;
+  const glow = $("glow");
+  const dimmed = matchMedia("(prefers-reduced-motion: reduce)");
+  // A pause freezes the turn's process tree, so nothing is running to show.
+  const working = () => state && state.activity.state === "running" && !state.paused;
+  setInterval(() => {
+    if (!working() || document.hidden || dimmed.matches) return;
+    if (glow.childElementCount >= LIT_CAP) return;
+    const cell = document.createElement("div");
+    cell.className = "glow-cell";
+    // Offset by one so the fill starts after the line that opens the square.
+    cell.style.left = Math.floor(Math.random() * glow.offsetWidth / GRID) * GRID + 1 + "px";
+    cell.style.top = Math.floor(Math.random() * glow.offsetHeight / GRID) * GRID + 1 + "px";
+    cell.style.animationDelay = (Math.random() * 0.6).toFixed(2) + "s";
+    cell.onanimationend = () => cell.remove();
+    glow.append(cell);
+  }, 300);
 </script>
 </body>
 </html>

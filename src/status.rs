@@ -35,7 +35,7 @@ impl Shared {
     }
 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Clone, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
@@ -103,6 +103,9 @@ pub enum Activity {
         #[serde(skip)]
         pgid: i32,
         started: u64,
+        /// What the turn has spent so far, resampled while it runs; None
+        /// until opencode has recorded its first message.
+        tokens: Option<TokenUsage>,
     },
     Sleeping {
         until: u64,
