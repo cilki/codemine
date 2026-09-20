@@ -2,7 +2,7 @@
 	<img src="https://raw.githubusercontent.com/cilki/cilki/master/emblems/codemine.svg" style="width:90%; height:auto;"/>
 </p>
 
-![License](https://img.shields.io/github/license/cilki/codemin)
+![License](https://img.shields.io/github/license/cilki/codemine)
 ![Stars](https://img.shields.io/github/stars/cilki/codemine?style=social)
 
 <hr>
@@ -30,33 +30,33 @@ Each "turn" does one of the following on a repo:
 
 > I run **codemine** on a cluster of physically isolated Raspberry PIs.
 
-## Features
+### Features
 
-### Codegraph
+#### Codegraph
 
 With [codegraph](https://github.com/colbymchenry/codegraph) installed, the agent
 avoids rereading the tree every turn, which cuts token usage substantially on
 large projects.
 
-### Prioritization
+#### Prioritization
 
 On low-resource machines, the nice and I/O class settings throttle the agent by
 spawning it through `nice`/`ionice`; the whole process tree (cargo, rustc, test
 runs, ...) inherits the reduced priorities. I/O priorities only take effect on
 schedulers that honor them (e.g. bfq); CPU niceness works everywhere.
 
-### Multiple forge support
+#### Multiple forge support
 
 **codemine** works with Gitea, GitHub, and GitLab. Just add an access token and
 select what repos **codemine** is enabled on.
 
-### `AGENTS.md` customizations
+#### `AGENTS.md` customizations
 
 Mount deployment-specific instructions at `/root/.config/opencode/AGENTS.md`;
 opencode loads them into every session automatically. This is the place for
 anything unique to your projects, such as a description of the branching scheme.
 
-### Web interface
+#### Web interface
 
 You can manage the **codemine** instance via a simple web UI on port 8080. This
 is where you configure your forge settings, rate limits, select a model, choose
