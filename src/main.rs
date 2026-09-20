@@ -307,10 +307,12 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
         .forges
         .iter()
         .map(|forge| {
-            let line = forge
-                .url
-                .replacen("://", &format!("://{}:{}@", forge.user, forge.token), 1);
-            format!("{line}\n")
+            format!(
+                "{}\n",
+                forge
+                    .url
+                    .replacen("://", &format!("://{}:{}@", forge.user, forge.token), 1)
+            )
         })
         .collect();
     let path = git_credentials(cli);

@@ -18,10 +18,7 @@ pub const GITLAB_SKILL: &[u8] = include_bytes!("../skills/gitlab/SKILL.md");
 /// Where opencode looks for commands and skills: `$XDG_CONFIG_HOME/opencode`,
 /// else `~/.config/opencode`.
 pub fn opencode_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        return Path::new(&dir).join("opencode");
-    }
-    crate::config::home().join(".config/opencode")
+    crate::config::xdg_dir("XDG_CONFIG_HOME", ".config").join("opencode")
 }
 
 /// Write the embedded prompts under `dir`, overwriting whatever is there; the

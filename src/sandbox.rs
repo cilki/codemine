@@ -82,11 +82,7 @@ fn restrict_writes(repo: &Path, log: &Path) -> Result<()> {
 /// with no rule there is nothing to allow.
 fn writable_paths(repo: &Path, log: &Path) -> Vec<PathBuf> {
     let home = crate::config::home();
-    let xdg = |var: &str, default: &str| {
-        std::env::var_os(var)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(default))
-    };
+    let xdg = crate::config::xdg_dir;
     let mut paths = vec![
         repo.to_path_buf(),
         log.to_path_buf(),

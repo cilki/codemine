@@ -213,6 +213,13 @@ pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()))
 }
 
+/// An XDG base directory: the value of `$var` if set, else `home()/default`.
+pub fn xdg_dir(var: &str, default: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(default))
+}
+
 fn default_workspace() -> PathBuf {
     home().join(".codemine")
 }

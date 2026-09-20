@@ -16,17 +16,13 @@ const MAX_FILES: usize = 10_000;
 
 /// opencode's data dir: `$XDG_DATA_HOME/opencode`, else
 /// `$HOME/.local/share/opencode`.
-fn opencode_data_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
-        return Some(PathBuf::from(dir).join("opencode"));
-    }
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".local/share/opencode"))
+fn opencode_data_dir() -> PathBuf {
+    crate::config::xdg_dir("XDG_DATA_HOME", ".local/share").join("opencode")
 }
 
 /// Sum the token counts recorded since `since`, or None if none were found.
 pub fn collect_since(since: SystemTime) -> Option<TokenUsage> {
-    let data = opencode_data_dir()?;
+    let data = opencode_data_dir();
     from_database(&data.join("opencode.db"), since)
         .or_else(|| from_files(&data.join("storage"), since))
 }

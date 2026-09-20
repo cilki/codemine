@@ -2,6 +2,7 @@
 //! Everything is best-effort: a field that can't be read just comes back
 //! empty or zero and the page shows a dash.
 
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -42,7 +43,7 @@ pub fn snapshot() -> Host {
     }
 }
 
-fn read_trimmed(path: &str) -> String {
+fn read_trimmed(path: impl AsRef<Path>) -> String {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_owned())
         .unwrap_or_default()
@@ -169,7 +170,7 @@ fn cpu_temp() -> Option<f32> {
             continue;
         };
         let temp = milli / 1000.0;
-        let kind = read_trimmed(&path.join("type").display().to_string()).to_lowercase();
+        let kind = read_trimmed(path.join("type")).to_lowercase();
         if ["cpu", "pkg", "core", "soc"].iter().any(|k| kind.contains(k)) {
             return Some(temp);
         }

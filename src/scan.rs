@@ -44,7 +44,7 @@ pub fn usage_limit_epoch(tail: &str) -> Option<u64> {
         let digits = &rest[..rest
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(rest.len())];
-        (digits.len() >= 9).then(|| digits.parse().ok())?
+        (digits.len() >= 9).then(|| digits.parse().ok()).flatten()
     })
 }
 
