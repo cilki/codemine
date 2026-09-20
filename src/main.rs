@@ -28,7 +28,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tracing::{error, info};
@@ -229,7 +229,7 @@ fn main() -> Result<()> {
                     // backoff still holds, since retrying early just burns
                     // the next turn on the same limit.
                     Backoff::Normal if report.canceled => {}
-                    backoff => sleep(&cli, backoff, &status, &pending)?,
+                    backoff => sleep(&cli, backoff, &status, &pending),
                 }
             }
             // A failing turn (bad token, unreachable forge, ...) must not
@@ -237,7 +237,7 @@ fn main() -> Result<()> {
             Err(err) => {
                 error!("turn failed: {err:#}");
                 Status::update(&status, |s| s.log_tail = format!("turn failed: {err:#}"));
-                sleep(&cli, Backoff::Normal, &status, &pending)?;
+                sleep(&cli, Backoff::Normal, &status, &pending);
             }
         }
         if cli.once {
@@ -457,16 +457,11 @@ fn run(command: &mut Command) -> Result<()> {
 /// When the usage window is exhausted, Anthropic reports the epoch at which it
 /// reopens; wait for that instead of burning turns until then. Otherwise pause
 /// just long enough to keep a failing run from spinning the loop.
-fn sleep(
-    cli: &Cli,
-    backoff: Backoff,
-    status: &status::Shared,
-    pending: &events::Pending,
-) -> Result<()> {
+fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared, pending: &events::Pending) {
     if cli.once {
-        return Ok(());
+        return;
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let now = status::epoch_now();
     let (seconds, limited) = match backoff {
         Backoff::UsageLimit(epoch) if epoch > now => {
             info!(
@@ -502,7 +497,6 @@ fn sleep(
         }
         std::thread::sleep(left.min(Duration::from_secs(5)));
     }
-    Ok(())
 }
 
 fn iso8601(epoch: u64) -> Option<String> {
