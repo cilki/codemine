@@ -21,14 +21,16 @@ pub enum Backoff {
 pub struct Report {
     pub backoff: Backoff,
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
-    /// only these turns count toward the daily limit.
+    /// only these turns count toward the hourly limit.
     pub completed: bool,
+    /// The turn died on revoked Claude OAuth credentials; the main loop
+    /// gates further turns until a fresh login replaces them.
+    pub oauth_revoked: bool,
 }
 
 /// Run one opencode turn against the repository's persistent workspace clone
 /// and report how it went. The workspace survives across turns, and so does
-/// the turn's log under `<workspace>/logs`, until its record ages out of the
-/// recent list.
+/// the turn's log under `<workspace>/logs`, for as long as the process runs.
 pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     let task = &cfg.tasks[fastrand::usize(..cfg.tasks.len())];
     let mut pool = Vec::new();
@@ -45,6 +47,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         return Ok(Report {
             backoff: Backoff::Normal,
             completed: false,
+            oauth_revoked: false,
         });
     }
     let (forge, repo) = &pool[fastrand::usize(..pool.len())];
@@ -108,6 +111,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         return Ok(Report {
             backoff: Backoff::Normal,
             completed: false,
+            oauth_revoked: false,
         });
     }
 
@@ -224,6 +228,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             None => Backoff::Normal,
         },
         completed,
+        oauth_revoked: scan::oauth_revoked(&tail),
     })
 }
 

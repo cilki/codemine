@@ -23,8 +23,10 @@ pub struct Settings {
     pub model: String,
     /// The task pool the runner draws from each turn.
     pub tasks: Vec<String>,
-    /// Maximum completed (not skipped) tasks per local day; None is unlimited.
-    pub daily_limit: Option<u32>,
+    /// Completed (not skipped) tasks allowed per hour; None is unlimited.
+    /// Fractional rates are the point of the unit: 0.5 is one task every two
+    /// hours.
+    pub hourly_limit: Option<f64>,
     /// The name and email commits are authored (and committed) as; empty
     /// means unconfigured.
     pub author_name: String,
@@ -45,7 +47,7 @@ impl Default for Settings {
             gitlab: ForgeSettings::default(),
             model: String::new(),
             tasks: crate::prompts::default_tasks(),
-            daily_limit: None,
+            hourly_limit: None,
             author_name: String::new(),
             author_email: String::new(),
             turn_timeout_secs: 21600,
@@ -214,7 +216,7 @@ impl Settings {
                 .collect(),
             model: self.model.clone(),
             tasks: self.tasks.clone(),
-            daily_limit: self.daily_limit,
+            hourly_limit: self.hourly_limit,
             author_name: self.author_name.clone(),
             author_email: self.author_email.clone(),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
@@ -265,6 +267,11 @@ impl Settings {
             && !(1..=19).contains(&nice)
         {
             bail!("nice must be between 1 and 19");
+        }
+        if let Some(limit) = self.hourly_limit
+            && !(limit.is_finite() && limit > 0.0)
+        {
+            bail!("hourly limit must be a positive number");
         }
         if self.turn_timeout_secs == 0 {
             bail!("turn timeout must be positive");
@@ -442,6 +449,9 @@ mod tests {
         let mut settings = configured();
         let mut bad = configured();
         bad.nice = Some(40);
+        assert!(settings.apply_update(bad).is_err());
+        let mut bad = configured();
+        bad.hourly_limit = Some(0.0);
         assert!(settings.apply_update(bad).is_err());
         let mut bad = configured();
         bad.turn_timeout_secs = 0;

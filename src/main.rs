@@ -17,6 +17,7 @@ mod usage;
 mod webui;
 mod workspace;
 
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -54,12 +55,28 @@ fn main() -> Result<()> {
     let addr = webui::spawn(cli.listen, status.clone(), store.clone())?;
     info!("webui listening on http://{addr}");
 
-    let mut day = local_day()?;
-    let mut completed_today = 0u32;
+    // Epochs of completed turns: the newest one gates the next turn, and the
+    // last hour's worth is what the UI counts.
+    let mut completions: VecDeque<u64> = VecDeque::new();
+    let mut last_completed: Option<u64> = None;
     let mut applied_generation = None;
+    // The credentials file's mtime when a turn last died on revoked OAuth;
+    // turns stay gated until a fresh login rewrites the file.
+    let mut revoked_stamp: Option<SystemTime> = None;
     loop {
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
+        if let Some(stamp) = revoked_stamp {
+            if credentials_stamp() == stamp {
+                problems.push(Problem::new(
+                    "",
+                    "the Claude OAuth login was revoked; log in again with Claude Code",
+                ));
+            } else {
+                info!("Claude credentials were replaced; resuming turns");
+                revoked_stamp = None;
+            }
+        }
         if !claude_oauth_usable() {
             problems.push(Problem::new(
                 "",
@@ -97,36 +114,46 @@ fn main() -> Result<()> {
             applied_generation = Some(generation);
         }
 
-        let today = local_day()?;
-        if today != day {
-            day = today;
-            completed_today = 0;
-        }
+        let now = status::epoch_now();
+        let recent = prune_completions(&mut completions, now);
         Status::update(&status, |s| {
-            s.day = day.clone();
-            s.completed_today = completed_today;
-            s.daily_limit = cfg.daily_limit;
+            s.completed_last_hour = recent;
+            s.hourly_limit = cfg.hourly_limit;
         });
-        if cfg
-            .daily_limit
-            .is_some_and(|limit| completed_today >= limit)
+        let ready = cfg
+            .hourly_limit
+            .zip(last_completed)
+            .map(|(limit, last)| last.saturating_add(spacing(limit)));
+        if let Some(ready) = ready
+            && ready > now
         {
-            Status::update(&status, |s| {
-                s.activity = Activity::WaitingForTomorrow { day: day.clone() }
-            });
-            // Sleep in slices and fall back into the loop, so the date check
-            // stays DST-safe and a raised limit applies within minutes.
-            std::thread::sleep(Duration::from_secs(600));
+            Status::update(&status, |s| s.activity = Activity::RateLimited { until: ready });
+            // Sleep in slices and fall back into the loop, so a raised limit
+            // applies within a minute instead of at the end of the wait.
+            std::thread::sleep(Duration::from_secs((ready - now).min(60)));
             continue;
         }
 
         match turn::run(&cfg, &status) {
             Ok(report) => {
+                if report.oauth_revoked {
+                    error!(
+                        "the Claude OAuth login was revoked; holding turns until {} changes",
+                        claude_credentials().display()
+                    );
+                    revoked_stamp = Some(credentials_stamp());
+                }
                 if report.completed {
-                    completed_today += 1;
-                    Status::update(&status, |s| s.completed_today = completed_today);
-                    if let Some(limit) = cfg.daily_limit {
-                        info!("completed {completed_today}/{limit} tasks today");
+                    let at = status::epoch_now();
+                    completions.push_back(at);
+                    last_completed = Some(at);
+                    let recent = prune_completions(&mut completions, at);
+                    Status::update(&status, |s| s.completed_last_hour = recent);
+                    if let Some(limit) = cfg.hourly_limit {
+                        info!(
+                            "completed {recent} tasks in the last hour; next turn in {}s at {limit}/hour",
+                            spacing(limit)
+                        );
                     }
                 }
                 sleep(&cli, report.backoff, &status)?;
@@ -145,17 +172,26 @@ fn main() -> Result<()> {
     }
 }
 
-/// The current local date, e.g. "2026-09-14"; the daily task limit resets
-/// when it changes.
-fn local_day() -> Result<String> {
-    let output = Command::new("date")
-        .arg("+%F")
-        .output()
-        .context("failed to run date")?;
-    if !output.status.success() {
-        bail!("date exited with {}", output.status);
+const HOUR: u64 = 3600;
+
+/// The shortest gap allowed between completed turns at `limit` turns an
+/// hour, which is what makes fractional limits meaningful: 0.5 is one turn
+/// every two hours. The cast saturates, so an absurdly small limit just
+/// means never.
+fn spacing(limit: f64) -> u64 {
+    (HOUR as f64 / limit) as u64
+}
+
+/// Drop completions older than an hour and report how many are left, for the
+/// UI's counter.
+fn prune_completions(completions: &mut VecDeque<u64>, now: u64) -> u32 {
+    while completions
+        .front()
+        .is_some_and(|&at| now.saturating_sub(at) >= HOUR)
+    {
+        completions.pop_front();
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    completions.len() as u32
 }
 
 /// Send logs to stderr at info and above, overridable per-module with
@@ -204,8 +240,9 @@ fn setup(cli: &mut Cli) -> Result<()> {
     // other thread can be touching the environment.
     unsafe { std::env::set_var("PWD", &cli.workspace) };
 
-    // Turn logs are only reachable through the in-memory recent list, so
-    // whatever a previous process left behind is unreachable garbage.
+    // Turn logs are only reachable through the in-memory turn list, which
+    // starts empty, so whatever a previous process left behind is
+    // unreachable garbage.
     let logs = cli.workspace.join("logs");
     if logs.exists() {
         std::fs::remove_dir_all(&logs)
@@ -300,6 +337,14 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
 /// plugin reads and refreshes.
 fn claude_credentials() -> PathBuf {
     config::home().join(".claude/.credentials.json")
+}
+
+/// A fingerprint of the credentials file that changes when it's rewritten,
+/// so a fresh login is detectable; a missing file maps to the epoch.
+fn credentials_stamp() -> SystemTime {
+    std::fs::metadata(claude_credentials())
+        .and_then(|meta| meta.modified())
+        .unwrap_or(UNIX_EPOCH)
 }
 
 /// Whether opencode can authenticate: the opencode-claude-auth plugin reads

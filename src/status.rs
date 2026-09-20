@@ -35,9 +35,6 @@ impl Shared {
     }
 }
 
-/// How many finished turns the UI remembers.
-const RECENT_CAP: usize = 50;
-
 #[derive(Serialize, Clone, Default)]
 pub struct TokenUsage {
     pub input: u64,
@@ -58,7 +55,7 @@ impl TokenUsage {
 }
 
 /// How a finished turn went, for display only; whether a turn counts toward
-/// the daily limit is decided separately in the turn runner.
+/// the hourly limit is decided separately in the turn runner.
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
@@ -113,8 +110,10 @@ pub enum Activity {
     UsageLimit {
         until: u64,
     },
-    WaitingForTomorrow {
-        day: String,
+    /// The hourly task limit is spent; the next turn may start at this
+    /// epoch.
+    RateLimited {
+        until: u64,
     },
 }
 
@@ -136,12 +135,14 @@ pub struct Status {
     /// Whether the running turn's process tree is currently SIGSTOPped
     /// through the web UI.
     pub paused: bool,
-    pub day: String,
-    pub completed_today: u32,
-    pub daily_limit: Option<u32>,
+    /// Turns completed in the last hour, for display; the limit itself is
+    /// enforced as a minimum spacing between turns.
+    pub completed_last_hour: u32,
+    pub hourly_limit: Option<f64>,
     pub totals: Totals,
-    /// Finished turns, newest first.
-    pub recent: VecDeque<TurnRecord>,
+    /// Every turn finished since startup, newest first; the process owns no
+    /// history across restarts, so this is the whole list the UI shows.
+    pub turns: VecDeque<TurnRecord>,
     /// Tail of the last finished turn's log.
     pub log_tail: String,
 }
@@ -154,11 +155,10 @@ impl Shared {
                 started: epoch_now(),
                 activity: Activity::Starting,
                 paused: false,
-                day: String::new(),
-                completed_today: 0,
-                daily_limit: None,
+                completed_last_hour: 0,
+                hourly_limit: None,
                 totals: Totals::default(),
-                recent: VecDeque::new(),
+                turns: VecDeque::new(),
                 log_tail: String::new(),
             })),
             changes: watch::channel(0).0,
@@ -185,13 +185,7 @@ impl Status {
         if let Some(tokens) = &record.tokens {
             self.totals.tokens.add(tokens);
         }
-        while self.recent.len() >= RECENT_CAP {
-            if let Some(evicted) = self.recent.pop_back() {
-                // Best effort: without the file there is just no log to serve.
-                std::fs::remove_file(&evicted.log_path).ok();
-            }
-        }
-        self.recent.push_front(record);
+        self.turns.push_front(record);
     }
 }
 
@@ -224,21 +218,21 @@ mod tests {
     }
 
     #[test]
-    fn record_turn_caps_and_totals() {
+    fn record_turn_keeps_every_turn_and_totals() {
         let shared = Shared::new();
         Status::update(&shared, |status| {
-            for _ in 0..RECENT_CAP + 10 {
+            for _ in 0..60 {
                 status.record_turn(record(Outcome::Completed));
             }
             status.record_turn(record(Outcome::Skipped));
         });
 
         let status = shared.lock();
-        assert_eq!(status.recent.len(), RECENT_CAP);
-        assert_eq!(status.recent[0].outcome, Outcome::Skipped);
-        assert_eq!(status.totals.turns, RECENT_CAP as u64 + 11);
-        assert_eq!(status.totals.completed, RECENT_CAP as u64 + 10);
+        assert_eq!(status.turns.len(), 61);
+        assert_eq!(status.turns[0].outcome, Outcome::Skipped);
+        assert_eq!(status.totals.turns, 61);
+        assert_eq!(status.totals.completed, 60);
         assert_eq!(status.totals.skipped, 1);
-        assert_eq!(status.totals.tokens.input, (RECENT_CAP as u64 + 11) * 10);
+        assert_eq!(status.totals.tokens.input, 61 * 10);
     }
 }

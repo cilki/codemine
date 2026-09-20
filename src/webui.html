@@ -19,8 +19,21 @@
     min-height: 100vh;
   }
   .container { max-width: 1100px; min-height: 100vh; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
-  .header { display: flex; align-items: center; justify-content: center; gap: 12px; }
+  /* Three columns so the emblem stays centered whatever the badge says. */
+  .header { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; }
   .header .emblem { height: 106px; display: block; max-width: 100%; object-fit: contain; }
+  .header .now { justify-self: end; display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+  .badge {
+    padding: 3px 10px; border-radius: 12px; font-size: 0.8em; white-space: nowrap;
+    text-transform: uppercase; letter-spacing: 1px;
+    background: rgb(62, 68, 70); color: #e8eaed;
+  }
+  .badge.running { background: rgba(97, 175, 239, 0.15); color: #61afef; }
+  .badge.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
+  .badge.paused, .badge.usage_limit, .badge.rate_limited, .badge.unconfigured {
+    background: rgba(230, 126, 34, 0.15); color: #e67e22;
+  }
+  #timer { font-size: 0.85em; }
   .disconnected { color: #e74c3c; font-size: 0.85em; }
   .panel {
     background: rgb(24, 26, 27);
@@ -40,21 +53,21 @@
   .stat { background: rgb(24, 26, 27); border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px 16px; }
   .stat-label { text-transform: uppercase; letter-spacing: 1px; font-size: 0.7em; color: #9aa0a6; }
   .stat-value { font-family: "Courier New", monospace; font-size: 1.4em; margin-top: 4px; }
-  #stat-today { color: var(--accent); }
+  #stat-hour { color: var(--accent); }
   #stat-completed { color: #2ecc71; }
   #stat-skipped { color: #9aa0a6; }
   #stat-failed { color: #e74c3c; }
   #stat-tokens { color: #61afef; }
   .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
   @media (max-width: 800px) { .columns { grid-template-columns: 1fr; } }
-  #recent { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  #turns { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
   .turn { border: 1px solid rgb(62, 68, 70); border-radius: 6px; padding: 8px 10px; font-size: 0.9em; cursor: pointer; }
   .turn:hover { border-color: var(--accent); }
   .turn.selected { border-color: var(--accent); background: rgba(200, 113, 55, 0.08); }
   .turn-top { display: flex; justify-content: space-between; gap: 8px; }
   .turn-meta { color: #9aa0a6; font-size: 0.85em; margin-top: 4px; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
   .outcome { font-weight: bold; }
-  .outcome.running { color: #2ecc71; }
+  .outcome.running { color: #61afef; }
   .outcome.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
   .outcome.paused { color: #e67e22; }
   .outcome.completed { color: #2ecc71; }
@@ -133,7 +146,12 @@
 <body>
 <div class="container">
   <div class="header">
+    <span></span>
     <img src="/emblem.svg" alt="codemine" class="emblem">
+    <span class="now">
+      <span class="mono muted" id="timer"></span>
+      <span class="badge" id="badge">starting</span>
+    </span>
   </div>
 
   <div class="panel">
@@ -143,7 +161,7 @@
   </div>
 
   <div class="stats">
-    <div class="stat"><div class="stat-label">Today</div><div class="stat-value" id="stat-today">–</div></div>
+    <div class="stat"><div class="stat-label">Past hour</div><div class="stat-value" id="stat-hour">–</div></div>
     <div class="stat"><div class="stat-label">Turns</div><div class="stat-value" id="stat-turns">–</div></div>
     <div class="stat"><div class="stat-label">Completed</div><div class="stat-value" id="stat-completed">–</div></div>
     <div class="stat"><div class="stat-label">Skipped</div><div class="stat-value" id="stat-skipped">–</div></div>
@@ -153,8 +171,8 @@
 
   <div class="columns">
     <div class="panel">
-      <div class="panel-title">Recent turns</div>
-      <div id="recent"><span class="muted">No turns yet.</span></div>
+      <div class="panel-title">Turns</div>
+      <div id="turns"><span class="muted">No turns yet.</span></div>
     </div>
     <div class="panel">
       <div class="panel-title log-head"><span id="log-title">Log</span>
@@ -178,7 +196,7 @@
       <div class="field"><label for="s-model">Model</label>
         <select id="s-model"></select>
       </div>
-      <div class="field"><label for="s-daily-limit">Daily task limit (blank = unlimited)</label><input id="s-daily-limit" type="number" min="1"></div>
+      <div class="field"><label for="s-hourly-limit">Hourly task limit (blank = unlimited)</label><input id="s-hourly-limit" type="number" min="0" step="any"></div>
       <div class="field"><label for="s-author-name">Git author name</label><input id="s-author-name"></div>
       <div class="field"><label for="s-author-email">Git author email</label><input id="s-author-email"></div>
       <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
@@ -236,6 +254,20 @@
   // Server time, extrapolated from the last response.
   const serverNow = () => state.now + (Date.now() - state.received) / 1000;
 
+  const BADGES = {
+    starting: "starting", running: "running", sleeping: "sleeping",
+    paused: "paused", usage_limit: "usage limit", rate_limited: "rate limit",
+    unconfigured: "unconfigured",
+  };
+
+  // What the badge's tooltip spells out, since the badge itself is one word.
+  function activityDetail(a) {
+    if (a.state === "running") return a.task + " on " + a.repo + " (" + a.forge + ")";
+    if (a.state === "rate_limited") return "hourly task limit reached";
+    if (a.state === "unconfigured") return a.problems.map(p => p.message).join(" · ");
+    return "";
+  }
+
   // Outline every field the runner is waiting on, and clear the ones that
   // were fixed. Values are never touched, so this is safe to run on the
   // status poll while the form is being edited. Problems nothing in the form
@@ -263,6 +295,13 @@
   // something.
   function renderClock() {
     const a = state.activity;
+    let timer = "";
+    if (a.state === "running") {
+      timer = fmtDuration(serverNow() - a.started) + " elapsed";
+    } else if (a.until) {
+      timer = fmtDuration(a.until - serverNow()) + " remaining";
+    }
+    $("timer").textContent = timer;
     const elapsed = $("running-elapsed");
     if (elapsed && a.state === "running") {
       elapsed.textContent = fmtDuration(serverNow() - a.started);
@@ -271,6 +310,12 @@
 
   function render() {
     const a = state.activity;
+    // A pause only holds the running turn's process tree, so it outranks
+    // "running" on the badge and means nothing otherwise.
+    const overall = state.paused && a.state === "running" ? "paused" : a.state;
+    $("badge").textContent = BADGES[overall] || overall;
+    $("badge").className = "badge " + overall;
+    $("badge").title = activityDetail(a);
     markProblems(a.state === "unconfigured" ? a.problems : []);
     // The pause button lives with the log because it freezes the running
     // turn's process tree; without a turn there is nothing to signal.
@@ -278,8 +323,8 @@
     $("pause").textContent = state.paused ? "resume" : "pause";
     renderClock();
 
-    $("stat-today").textContent =
-      state.completed_today + " / " + (state.daily_limit ?? "∞");
+    $("stat-hour").textContent =
+      state.completed_last_hour + " / " + (state.hourly_limit ?? "∞");
     $("stat-turns").textContent = state.totals.turns;
     $("stat-completed").textContent = state.totals.completed;
     $("stat-skipped").textContent = state.totals.skipped;
@@ -288,7 +333,7 @@
       state.totals.tokens && tokenTotal(state.totals.tokens)
         ? fmtTokens(tokenTotal(state.totals.tokens)) : "–";
 
-    const rows = state.recent.map(turn => {
+    const rows = state.turns.map(turn => {
       const row = turnRow(turn.task + " on " + turn.repo, turn.outcome,
         turn.forge + " · " + new Date(turn.started * 1000).toLocaleString(),
         fmtDuration(turn.duration_secs) +
@@ -296,6 +341,13 @@
       row.className = "turn" + (viewing === turn.started ? " selected" : "");
       // Clicking a turn shows its full log; clicking again goes back to live.
       row.onclick = () => viewing === turn.started ? viewLive() : viewTurn(turn);
+      if (turn.tokens) {
+        const t = turn.tokens;
+        row.title = "input " + fmtTokens(t.input) + " · output " + fmtTokens(t.output)
+          + " · reasoning " + fmtTokens(t.reasoning)
+          + " · cache " + fmtTokens(t.cache_read) + " read / "
+          + fmtTokens(t.cache_write) + " write";
+      }
       return row;
     });
     // The in-flight turn leads the list; its log is the live tail, so
@@ -307,7 +359,7 @@
       row.onclick = viewLive;
       rows.unshift(row);
     }
-    if (rows.length) $("recent").replaceChildren(...rows);
+    if (rows.length) $("turns").replaceChildren(...rows);
   }
 
   function turnRow(title, outcome, when, cost) {
@@ -647,7 +699,7 @@
   function renderSettings(s) {
     renderModels(s.model);
     renderTasks(s.tasks);
-    $("s-daily-limit").value = s.daily_limit ?? "";
+    $("s-hourly-limit").value = s.hourly_limit ?? "";
     $("s-author-name").value = s.author_name;
     $("s-author-email").value = s.author_email;
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
@@ -682,7 +734,7 @@
     const body = {
       model: $("s-model").value,
       tasks: [...enabledTasks],
-      daily_limit: num($("s-daily-limit").value),
+      hourly_limit: num($("s-hourly-limit").value),
       author_name: $("s-author-name").value,
       author_email: $("s-author-email").value,
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,

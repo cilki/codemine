@@ -50,7 +50,7 @@ never shown again and can only be overwritten.
 
 The general settings cover the model (chosen from the Claude models the
 bundled OAuth login can reach), the task pool (a checkbox per task in the
-sweep command, showing that task's instructions on hover), the daily completed-task limit (blank = unlimited), the git
+sweep command, showing that task's instructions on hover), the hourly completed-task limit (blank = unlimited), the git
 author name/email, the turn timeout in minutes, and the resource limits (CPU
 priority high/normal/low and I/O class `best-effort`/`idle`). Edits save
 themselves and apply from the next turn; there is no save button.
@@ -87,10 +87,12 @@ the repository's forge — into the sweep prompt. The available tasks:
 
 Each turn ends as either completed or skipped: the agent closes its final
 message with a `TASK COMPLETED` or `TASK SKIPPED` marker line, which the
-runner reads from the log. The daily limit caps how many completed turns run
-per local day — skipped turns don't count, and turns with no marker do. When
-the limit is reached the runner sleeps until the date changes. The count
-lives in memory, so restarting the container resets it.
+runner reads from the log. The hourly limit is a rate: completed turns are
+spaced at least an hour divided by the limit apart, so `4` is one every 15
+minutes and `0.5` is one every two hours. Only turns with the `TASK
+COMPLETED` marker count — skipped ones and turns with no marker don't. The
+last completion lives in memory, so restarting the container clears the
+wait.
 
 A writable mount of Claude Code's OAuth credentials is expected at
 `~/.claude/.credentials.json` — `/root/.claude/.credentials.json` in the image,
@@ -107,9 +109,10 @@ niceness works everywhere.
 
 The web UI is always on (bind address via `--listen`) and serves both the
 status page and the settings panel. The status page shows what the runner is
-currently doing (with a live log tail while a turn runs), today's completed
-count, cumulative totals, and the recent turns with their durations and token
-usage. It does not poll: the server pushes over SSE (`/api/events`) as soon as
+currently doing (a badge in the header, with a live log tail while a turn
+runs), the last hour's completed count, cumulative totals, and every turn
+since startup with its duration and token usage. Turns live in memory only,
+so a restart empties the list and deletes the logs behind it. It does not poll: the server pushes over SSE (`/api/events`) as soon as
 the state changes, and the log tail as it grows. `/api/status` and `/api/log`
 remain as one-shot endpoints for scripting.
 

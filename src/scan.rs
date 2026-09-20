@@ -23,11 +23,17 @@ fn has_error_name(line: &str) -> bool {
 
 /// Whether the agent reported real forge changes: a `TASK COMPLETED` marker
 /// line. Only this marker counts as completed, so a turn that skipped, forgot
-/// the marker, or died halfway can't eat into the daily limit.
+/// the marker, or died halfway can't eat into the hourly limit.
 pub fn reported_completed(tail: &str) -> bool {
     strip_ansi(tail)
         .lines()
         .any(|line| line.trim_start().starts_with("TASK COMPLETED"))
+}
+
+/// Whether the turn died on revoked Claude OAuth credentials. Retrying is
+/// pointless until they're replaced by a fresh login.
+pub fn oauth_revoked(tail: &str) -> bool {
+    strip_ansi(tail).contains("token has been revoked")
 }
 
 /// The epoch at which an exhausted usage window reopens, parsed from a

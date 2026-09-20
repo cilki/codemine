@@ -141,8 +141,10 @@ pub struct Config {
     /// The task pool the runner draws from each turn; the slugs name the task
     /// sections in the sweep command template.
     pub tasks: Vec<String>,
-    /// Maximum completed (not skipped) tasks per local day; None is unlimited.
-    pub daily_limit: Option<u32>,
+    /// Completed (not skipped) tasks allowed per hour; None is unlimited.
+    /// A fractional rate spaces turns further apart: 0.5 is one every two
+    /// hours.
+    pub hourly_limit: Option<f64>,
     pub author_name: String,
     pub author_email: String,
     pub turn_timeout: Duration,
