@@ -282,7 +282,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .unwrap();
+            .expect("git must be on PATH to run this test");
         assert!(status.success(), "git {args:?} failed");
     }
 

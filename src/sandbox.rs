@@ -133,6 +133,31 @@ fn probe_abi() -> i64 {
 mod tests {
     use super::*;
 
+    /// A path the test could really write to before the ruleset was applied
+    /// and that no rule covers, so a later denial is Landlock's doing rather
+    /// than the filesystem's own permissions. The build tree is the natural
+    /// pick, but a Nix build with `sandbox = false` unpacks into $TMPDIR, and
+    /// /tmp is allowlisted, so fall back to somewhere else that is not.
+    fn uncovered_writable_path(repo: &Path, log: &Path) -> Option<PathBuf> {
+        let allowed = writable_paths(repo, log);
+        let candidates = [
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+            PathBuf::from("/run"),
+            PathBuf::from("/var/log"),
+            PathBuf::from("/home"),
+            PathBuf::from("/"),
+        ];
+        candidates.into_iter().find_map(|dir| {
+            if allowed.iter().any(|root| dir.starts_with(root)) {
+                return None;
+            }
+            let probe = dir.join("codemine-landlock-probe");
+            let writable = std::fs::write(&probe, "probe").is_ok();
+            std::fs::remove_file(&probe).ok();
+            writable.then_some(probe)
+        })
+    }
+
     /// Landlock restrictions apply per thread, so each test confines only
     /// itself and the rest of the suite runs unrestricted.
     #[test]
@@ -144,10 +169,10 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let log = repo.path().join("turn.log");
         std::fs::write(&log, "").unwrap();
-        // Somewhere real that is not on the allowlist; target/ is already
-        // build scratch space.
-        let outside = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/landlock-probe");
-        std::fs::remove_file(&outside).ok();
+        let Some(outside) = uncovered_writable_path(repo.path(), &log) else {
+            eprintln!("nowhere writable outside the allowlist; skipping");
+            return;
+        };
 
         restrict_writes(repo.path(), &log).unwrap();
         assert!(std::fs::write(repo.path().join("inside"), "ok").is_ok());
