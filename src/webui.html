@@ -37,8 +37,16 @@
   }
   @keyframes glow { 40% { opacity: 1; } 100% { opacity: 0; } }
   @media (prefers-reduced-motion: reduce) { #glow { display: none; } }
-  /* Above the glow layer, which shares the body's stacking context. */
-  .container { position: relative; max-width: 1100px; min-height: 100vh; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
+  /* Above the glow layer, which shares the body's stacking context. Tall as
+     the screen, so the panels below can take what the tiles leave; the bottom
+     padding clears the floating buttons, which would otherwise sit on the
+     log's corner. dvh keeps that true under a phone's toolbars. */
+  .container {
+    position: relative; max-width: 1100px; margin: 0 auto;
+    min-height: 100vh; min-height: 100dvh;
+    padding: 24px 16px 72px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
   .header { display: flex; align-items: center; justify-content: center; gap: 12px; }
   .header .emblem { height: 124px; display: block; max-width: 100%; object-fit: contain; }
   .disconnected { color: #e74c3c; font-size: 0.85em; }
@@ -61,7 +69,6 @@
   .stat { background: rgb(24, 26, 27); border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px 16px; }
   .stat-label { text-transform: uppercase; letter-spacing: 1px; font-size: 0.7em; color: var(--label); }
   .stat-value { font-family: "Courier New", monospace; font-size: 1.4em; margin-top: 4px; }
-  #stat-hour { color: var(--accent); }
   /* The runner tile's label is the state, so the value can be the clock. */
   #stat-state.running { color: #61afef; }
   #stat-state.paused, #stat-state.rate_limited,
@@ -70,14 +77,18 @@
   #stat-skipped { color: #9aa0a6; }
   #stat-failed { color: #e74c3c; }
   #stat-tokens { color: #61afef; }
-  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
-  @media (max-width: 800px) { .columns { grid-template-columns: 1fr; } }
-  #turns { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .columns {
+    display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr);
+    gap: 16px; flex: 1; min-height: 0;
+  }
+  .columns > .panel { display: flex; flex-direction: column; min-height: 0; }
+  #turns { flex: 1; min-height: 120px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
   .turn { border: 1px solid rgb(62, 68, 70); border-radius: 6px; padding: 8px 10px; font-size: 0.9em; cursor: pointer; }
   .turn:hover { border-color: var(--accent); }
   .turn.selected { border-color: var(--accent); background: rgba(200, 113, 55, 0.08); }
   .turn-top { display: flex; justify-content: space-between; gap: 8px; }
   .turn-meta { color: #9aa0a6; font-size: 0.85em; margin-top: 4px; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .turn-meta .forge-icon { width: 1.1em; height: 1.1em; vertical-align: -0.2em; margin-right: 5px; }
   .outcome { font-weight: bold; }
   .outcome.running { color: #61afef; }
   .outcome.running::before { content: "●"; margin-right: 6px; animation: pulse 1.5s infinite; }
@@ -86,12 +97,34 @@
   .outcome.skipped { color: #9aa0a6; }
   .outcome.failed { color: #e74c3c; }
   .outcome.timeout { color: #e67e22; }
+  /* One hue per task type, handed out by `badge`, so a turn's kind reads
+     before its text does. */
+  .task {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 0.85em; font-weight: bold; letter-spacing: 0.3px;
+    color: hsl(var(--task-hue) 65% var(--task-light, 70%));
+    background: hsl(var(--task-hue) 65% var(--task-light, 70%) / 0.13);
+    border: 1px solid hsl(var(--task-hue) 65% var(--task-light, 70%) / 0.4);
+  }
+  /* The log heading is small caps; keep its badge legible there. */
+  .log-head .task { font-size: 0.95em; }
   .log-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
   #log {
     font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
     font-size: 12px; line-height: 1.45; color: #b8bcbf;
     white-space: pre-wrap; word-break: break-word;
-    max-height: 420px; overflow-y: auto;
+    flex: 1; min-height: 120px; overflow-y: auto;
+  }
+  /* Stacked, the two panels can't share one screen's height, so they take
+     what they need and the page scrolls; each is still capped, so a long
+     list can't bury the other one below the fold. */
+  @media (max-width: 800px) {
+    .columns { grid-template-columns: 1fr; grid-template-rows: auto; flex: none; }
+    #turns, #log { flex: none; max-height: 60vh; }
+    .header .emblem { height: 84px; }
+    /* A long repo name drops the outcome onto its own line rather than
+       squeezing the badge. */
+    .turn-top { flex-wrap: wrap; }
   }
 
   /* Settings */
@@ -126,7 +159,7 @@
   }
   .tasks .check { color: #e8eaed; font-size: 0.9em; }
   .tasks .check[title] { cursor: help; }
-  .tasks .check.off { color: #9aa0a6; }
+  .tasks .check.off .task { filter: saturate(0.25); opacity: 0.5; }
   /* Unrunnable settings are marked on the field that fixes them, so the
      collapsed panel has to advertise that there is something to fix. */
   .field input.invalid, .field select.invalid { border-color: #e74c3c; }
@@ -356,8 +389,8 @@
     $("stat-tokens").textContent = spent ? fmtTokens(spent) : "–";
 
     const rows = state.turns.map(turn => {
-      const row = turnRow(turn.task + " on " + turn.repo, turn.outcome,
-        turn.forge + " · " + new Date(turn.started * 1000).toLocaleString(),
+      const row = turnRow(turn.task, turn.repo, turn.forge, turn.outcome,
+        new Date(turn.started * 1000).toLocaleString(),
         fmtDuration(turn.duration_secs) +
           (turn.tokens ? " · " + fmtTokens(tokenTotal(turn.tokens)) + " tokens" : ""));
       row.className = "turn" + (viewing === turn.started ? " selected" : "");
@@ -369,8 +402,8 @@
     // The in-flight turn leads the list; its log is the live tail, so
     // clicking it goes there. The elapsed time ticks from renderClock.
     if (a.state === "running") {
-      const row = turnRow(a.task + " on " + a.repo, state.paused ? "paused" : "running",
-        a.forge + " · " + new Date(a.started * 1000).toLocaleString(), "");
+      const row = turnRow(a.task, a.repo, a.forge, state.paused ? "paused" : "running",
+        new Date(a.started * 1000).toLocaleString(), "");
       row.querySelector(".turn-meta").lastChild.id = "running-elapsed";
       if (a.tokens) row.title = tokenBreakdown(a.tokens);
       row.onclick = viewLive;
@@ -379,19 +412,60 @@
     if (rows.length) $("turns").replaceChildren(...rows);
   }
 
-  function turnRow(title, outcome, when, cost) {
+  // A hue per task type, spaced around the wheel so the tasks the sweep
+  // command lists next to each other land far apart. Hues are handed out in
+  // pool order and remembered, so a task keeps its color across the page;
+  // past the palette they come back a shade deeper, which keeps every task
+  // distinct however many a sweep command grows to define.
+  const TASK_HUES = [205, 30, 155, 330, 265, 95, 0, 180, 240, 55, 300, 120];
+  const taskHues = new Map();
+
+  function badge(slug) {
+    if (!taskHues.has(slug)) taskHues.set(slug, taskHues.size);
+    const rank = taskHues.get(slug);
+    const el = document.createElement("span");
+    el.className = "task";
+    el.textContent = slug;
+    el.style.setProperty("--task-hue", TASK_HUES[rank % TASK_HUES.length]);
+    el.style.setProperty("--task-light",
+      70 - 18 * Math.floor(rank / TASK_HUES.length) + "%");
+    return el;
+  }
+
+  // The forge as its brand mark: the turn's own facts are what the meta line
+  // is for, and the name is still there on hover. `FORGE_ICONS` is the same
+  // table the settings cards draw from; a forge without one keeps its name.
+  function forgeIcon(forge) {
+    const icon = FORGE_ICONS[forge];
+    if (!icon) return forge + " · ";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "forge-icon");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", icon.color);
+    const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    title.textContent = forge;
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", icon.path);
+    svg.append(title, path);
+    return svg;
+  }
+
+  function turnRow(task, repo, forge, outcome, when, cost) {
     const row = document.createElement("div");
     row.className = "turn";
     const top = document.createElement("div");
     top.className = "turn-top";
+    const title = document.createElement("span");
+    title.append(badge(task), " on " + repo);
     top.append(
-      Object.assign(document.createElement("span"), { textContent: title }),
+      title,
       Object.assign(document.createElement("span"),
         { className: "outcome " + outcome, textContent: outcome }));
     const meta = document.createElement("div");
     meta.className = "turn-meta";
-    meta.append(
-      Object.assign(document.createElement("span"), { textContent: when }),
+    const stamp = document.createElement("span");
+    stamp.append(forgeIcon(forge), when);
+    meta.append(stamp,
       Object.assign(document.createElement("span"), { textContent: cost }));
     row.append(top, meta);
     return row;
@@ -502,7 +576,7 @@
 
   async function viewTurn(turn) {
     viewing = turn.started;
-    $("log-title").textContent = "Log — " + turn.task + " on " + turn.repo;
+    $("log-title").replaceChildren("Log — ", badge(turn.task), " on " + turn.repo);
     $("log-live").hidden = false;
     render();
     let text;
@@ -620,7 +694,7 @@
       paint();
     };
     paint();
-    label.append(box, document.createTextNode(name));
+    label.append(box, badge(name));
     return label;
   }
 
@@ -740,7 +814,16 @@
 
   async function loadSettings() {
     const res = await fetch("/api/options");
-    if (res.ok) options = await res.json();
+    if (res.ok) {
+      options = await res.json();
+      // Re-hand the hues in pool order: a turn rendered before this landed
+      // took whatever came first, and the colors are easier to learn when a
+      // task's hue is the same on every page load. Slugs the pool no longer
+      // offers are handed theirs on sight, after the pool's.
+      taskHues.clear();
+      for (const task of options.tasks) taskHues.set(task.slug, taskHues.size);
+      if (state) render();
+    }
     const settings = await fetch("/api/settings");
     if (settings.ok) renderSettings(await settings.json());
   }
