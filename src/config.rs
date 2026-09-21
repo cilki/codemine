@@ -33,50 +33,48 @@ impl ForgeKind {
     }
 }
 
-/// A model the runner can be pointed at, as an opencode provider/model ID.
-#[derive(Serialize)]
-pub struct Model {
-    pub id: &'static str,
-    pub label: &'static str,
+/// The models the web UI offers, straight from `opencode models`: the exact
+/// provider/model IDs the runner can be pointed at. opencode only lists
+/// providers whose auth loaded, so a missing provider (no Claude credentials,
+/// say) shows up here as an empty or shortened list instead of a cryptic
+/// "Model not found" on the first turn. An unrunnable listing is logged and
+/// treated as no models on offer.
+pub fn available_models() -> Vec<String> {
+    let output = std::process::Command::new("opencode")
+        .arg("models")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_models(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(output) => {
+            tracing::warn!(
+                "opencode models failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            tracing::warn!("failed to run opencode models: {err}");
+            Vec::new()
+        }
+    }
 }
 
-/// The models offered in the web UI. Only Anthropic's are listed, because the
-/// runner authenticates through the Claude OAuth credentials Claude Code
-/// maintains and no other provider can log in.
-pub const MODELS: [Model; 8] = [
-    Model {
-        id: "anthropic/claude-fable-5",
-        label: "Claude Fable 5",
-    },
-    Model {
-        id: "anthropic/claude-opus-5",
-        label: "Claude Opus 5",
-    },
-    Model {
-        id: "anthropic/claude-opus-4-8",
-        label: "Claude Opus 4.8",
-    },
-    Model {
-        id: "anthropic/claude-opus-4-7",
-        label: "Claude Opus 4.7",
-    },
-    Model {
-        id: "anthropic/claude-opus-4-6",
-        label: "Claude Opus 4.6",
-    },
-    Model {
-        id: "anthropic/claude-sonnet-5",
-        label: "Claude Sonnet 5",
-    },
-    Model {
-        id: "anthropic/claude-sonnet-4-6",
-        label: "Claude Sonnet 4.6",
-    },
-    Model {
-        id: "anthropic/claude-haiku-4-5",
-        label: "Claude Haiku 4.5",
-    },
-];
+/// The provider/model IDs in the listing, skipping opencode's startup chatter
+/// (migration notices, plugin warnings): an ID is a single word containing a
+/// slash.
+fn parse_models(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains('/') && !line.contains(char::is_whitespace))
+        .map(str::to_owned)
+        .collect()
+}
 
 /// I/O scheduling class for the agent process tree, passed to ionice.
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -262,6 +260,21 @@ mod tests {
         assert!(parse(&["--listen"]).is_err());
         assert!(parse(&["--listen", "nonsense"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn parse_models_keeps_only_ids() {
+        let stdout = "Performing one time database migration, may take a few minutes...\n\
+                      sqlite-migration:done\n\
+                      Database migration complete.\n\
+                      opencode-claude-auth: No Claude Code credentials found. Plugin disabled.\n\
+                      anthropic/claude-opus-4-8\n\
+                      anthropic/claude-sonnet-5\n\
+                      \n";
+        assert_eq!(
+            parse_models(stdout),
+            ["anthropic/claude-opus-4-8", "anthropic/claude-sonnet-5"]
+        );
     }
 
     #[test]

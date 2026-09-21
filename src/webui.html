@@ -587,22 +587,23 @@
   // Per forge: Set of disabled repo names, edited by the checkboxes.
   const disabledRepos = {};
 
-  // The fixed choices from /api/options: the models the runner can be pointed
-  // at, and the task pool parsed out of the sweep command.
+  // The choices from /api/options: the model IDs opencode can resolve right
+  // now, and the task pool parsed out of the sweep command.
   let options = { models: [], tasks: [] };
   // The enabled tasks, edited by the checkboxes.
   const enabledTasks = new Set();
 
-  // A stored value that is no longer on offer (a model we dropped, a task
-  // slug an older sweep.md defined) is kept as an extra choice rather than
-  // silently rewritten to something else.
+  // A stored value that is no longer on offer (auth that stopped loading, a
+  // task slug an older sweep.md defined) is kept as an extra choice rather
+  // than silently rewritten to something else.
   function renderModels(selected) {
-    const ids = options.models.map(m => m.id);
-    const extra = selected && !ids.includes(selected)
-      ? [{ id: selected, label: `${selected} (not offered)` }] : [];
-    $("s-model").replaceChildren(...[...options.models, ...extra].map(model =>
-      Object.assign(document.createElement("option"),
-        { value: model.id, textContent: model.label })));
+    const choices = options.models.map(id => ({ value: id, textContent: id }));
+    if (selected && !options.models.includes(selected))
+      choices.push({ value: selected, textContent: `${selected} (not offered)` });
+    if (!choices.length)
+      choices.push({ value: "", textContent: "none — is opencode authenticated?", disabled: true });
+    $("s-model").replaceChildren(...choices.map(choice =>
+      Object.assign(document.createElement("option"), choice)));
     $("s-model").value = selected;
   }
 

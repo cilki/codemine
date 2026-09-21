@@ -74,6 +74,123 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
     Ok(())
 }
 
+/// Symlink the opencode-claude-auth plugin into opencode's plugin directory,
+/// so any image that ships the package gets the anthropic provider without
+/// image-specific wiring. The package must be recent enough to present
+/// requests as a Claude Code session, or Anthropic bills them as a
+/// third-party app drawing extra usage instead of the subscription
+/// (opencode-claude-auth#145); nix/nixpkgs.nix overlays the pin accordingly.
+/// A missing package is only a warning: opencode still runs, just without
+/// Claude models.
+pub fn install_plugin(dir: &Path) -> Result<()> {
+    scrub_plugin_config(dir)?;
+    match claude_auth_entrypoint() {
+        Some(entrypoint) => link_plugin(dir, &entrypoint),
+        None => {
+            tracing::warn!(
+                "opencode-claude-auth is not installed; opencode will have no anthropic provider"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Drop npm references to the plugin (under its current or previous name)
+/// from opencode's config: alongside the symlink they'd load a second,
+/// differently-versioned copy from the npm registry. The config is only
+/// rewritten when something was actually dropped, because it is often
+/// mounted read-only.
+fn scrub_plugin_config(dir: &Path) -> Result<()> {
+    let path = dir.join("opencode.json");
+    let Some(mut config) = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return Ok(());
+    };
+    let Some(plugins) = config["plugin"].as_array() else {
+        return Ok(());
+    };
+    let kept: Vec<serde_json::Value> = plugins
+        .iter()
+        .filter(|entry| {
+            !entry.as_str().is_some_and(|entry| {
+                entry.contains("opencode-claude-auth") || entry.contains("opencode-auth-plugin")
+            })
+        })
+        .cloned()
+        .collect();
+    if kept.len() == plugins.len() {
+        return Ok(());
+    }
+    config["plugin"] = kept.into();
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// The plugin's entrypoint under the usual global node_modules roots.
+fn claude_auth_entrypoint() -> Option<PathBuf> {
+    [
+        crate::config::home().join(".nix-profile/lib/node_modules"),
+        PathBuf::from("/usr/local/lib/node_modules"),
+        PathBuf::from("/usr/lib/node_modules"),
+    ]
+    .iter()
+    .map(|root| root.join("opencode-claude-auth"))
+    .find_map(|pkg| package_entrypoint(&pkg))
+}
+
+/// The file package.json's `main` names, defaulting to index.js like node;
+/// None when the package or the file isn't there.
+fn package_entrypoint(pkg: &Path) -> Option<PathBuf> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(pkg.join("package.json")).ok()?).ok()?;
+    let entrypoint = pkg.join(manifest["main"].as_str().unwrap_or("index.js"));
+    entrypoint.is_file().then_some(entrypoint)
+}
+
+fn link_plugin(dir: &Path, entrypoint: &Path) -> Result<()> {
+    let plugin_dir = dir.join("plugin");
+    std::fs::create_dir_all(&plugin_dir)
+        .with_context(|| format!("failed to create {}", plugin_dir.display()))?;
+    let link = plugin_dir.join("opencode-claude-auth.js");
+    if let Err(err) = std::fs::remove_file(&link)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err).with_context(|| format!("failed to remove {}", link.display()));
+    }
+    std::os::unix::fs::symlink(entrypoint, &link)
+        .with_context(|| format!("failed to link {}", link.display()))
+}
+
+/// Where opencode stores provider credentials.
+pub fn opencode_auth_json() -> PathBuf {
+    crate::config::xdg_dir("XDG_DATA_HOME", ".local/share").join("opencode/auth.json")
+}
+
+/// Drop the anthropic entry from opencode's stored credentials so the plugin
+/// re-derives it from the Claude Code credentials file: a stale or hand-added
+/// entry makes opencode call Anthropic as a plain third-party app, which
+/// bills extra usage instead of the subscription. A missing or malformed
+/// file is left for opencode to sort out.
+pub fn scrub_anthropic_auth(path: &Path) -> Result<()> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(());
+    };
+    let Ok(mut auth) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        tracing::warn!("{} is not valid JSON; leaving it alone", path.display());
+        return Ok(());
+    };
+    if auth
+        .as_object_mut()
+        .is_some_and(|auth| auth.remove("anthropic").is_some())
+    {
+        std::fs::write(path, serde_json::to_vec_pretty(&auth)?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Whether opencode's config already names the codegraph MCP server; an
 /// unreadable or malformed file is treated as not configuring it, so this
 /// never turns into a startup failure.

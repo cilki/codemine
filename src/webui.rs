@@ -17,7 +17,7 @@ use axum::routing::get;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::config::{ForgeKind, MODELS};
+use crate::config::ForgeKind;
 use crate::settings::{Settings, SharedSettings};
 use crate::status::{Activity, Shared, Status, epoch_now};
 
@@ -206,12 +206,18 @@ fn log_tail(status: &Shared) -> String {
         .unwrap_or(fallback)
 }
 
-/// The fixed choices the settings form renders: the models the runner can be
-/// pointed at and the task pool, which comes from the embedded sweep command
-/// so the checkboxes can't drift from the prompt.
+/// The choices the settings form renders: the models opencode can actually
+/// resolve (a live `opencode models` listing, so a provider whose auth didn't
+/// load is visibly absent) and the task pool, which comes from the embedded
+/// sweep command so the checkboxes can't drift from the prompt.
 async fn api_options() -> Json<serde_json::Value> {
+    // The listing shells out to opencode; keep it off the current-thread
+    // runtime so status polling stays responsive meanwhile.
+    let models = tokio::task::spawn_blocking(crate::config::available_models)
+        .await
+        .unwrap_or_default();
     Json(json!({
-        "models": MODELS,
+        "models": models,
         "tasks": crate::prompts::tasks(),
     }))
 }
@@ -595,9 +601,10 @@ mod tests {
     fn options_lists_models_and_tasks() {
         let (addr, _dir) = serve_in_tempdir();
         let value = body_json(&request(addr, "GET", "/api/options", ""));
-        assert_eq!(value["models"][0]["id"], "anthropic/claude-fable-5");
+        // The model list mirrors `opencode models`, so its content depends on
+        // the machine; every entry is a provider/model ID either way.
         assert!(value["models"].as_array().unwrap().iter().all(|m| {
-            m["id"].as_str().unwrap().starts_with("anthropic/") && m["label"].is_string()
+            m.as_str().is_some_and(|id| id.contains('/'))
         }));
         let tasks = value["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), crate::prompts::default_tasks().len());

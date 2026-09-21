@@ -228,10 +228,14 @@ fn init_logging() {
 /// One-time startup work that doesn't depend on the mutable settings.
 fn setup(cli: &mut Cli) -> Result<()> {
     // Install the embedded prompts where opencode resolves commands and
-    // skills by name, so the binary works without the image copying them, and
-    // wire the codegraph MCP server into opencode's config when the CLI is
-    // actually installed.
+    // skills by name, so the binary works without the image copying them,
+    // link the Claude OAuth plugin into opencode's plugin directory
+    // (dropping any stale anthropic credential a previous version left
+    // behind), and wire the codegraph MCP server into opencode's config when
+    // the CLI is actually installed.
     prompts::install(&prompts::opencode_config_dir())?;
+    prompts::install_plugin(&prompts::opencode_config_dir())?;
+    prompts::scrub_anthropic_auth(&prompts::opencode_auth_json())?;
     prompts::install_mcp(
         &prompts::opencode_config_dir(),
         workspace::codegraph_available(),

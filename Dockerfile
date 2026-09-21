@@ -23,14 +23,6 @@ RUN nix-env -if /work/nix/profile.nix \
   && nix-collect-garbage -d \
   && rm -rf /root/.cache/nix /nix/var/log/nix /work
 
-# Load the Claude OAuth plugin from the nix store so opencode never has to
-# fetch it from npm at startup.
-RUN pkg=/root/.nix-profile/lib/node_modules/opencode-claude-auth \
-  && main=$(jq -r '.main // "index.js"' "$pkg/package.json") \
-  && test -f "$pkg/$main" \
-  && mkdir -p /root/.config/opencode/plugins \
-  && ln -s "$pkg/$main" /root/.config/opencode/plugins/opencode-claude-auth.js
-
 COPY --from=build /out/bin/codemine /usr/local/bin/codemine
 
 ENV PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH
