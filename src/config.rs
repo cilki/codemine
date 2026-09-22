@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -33,13 +34,35 @@ impl ForgeKind {
     }
 }
 
-/// The models the web UI offers, straight from `opencode models`: the exact
-/// provider/model IDs the runner can be pointed at. opencode only lists
-/// providers whose auth loaded, so a missing provider (no Claude credentials,
-/// say) shows up here as an empty or shortened list instead of a cryptic
-/// "Model not found" on the first turn. An unrunnable listing is logged and
-/// treated as no models on offer.
-pub fn available_models() -> Vec<String> {
+/// The `opencode models` listing, cached for the life of the process: it
+/// shells out to opencode, which can take the better part of a minute on
+/// small hosts. Only a non-empty listing sticks — caching a failure (say,
+/// opencode misconfigured at startup) would pin an empty dropdown until the
+/// next restart, so an empty result is retried on the next call instead.
+static MODELS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// The models the web UI offers, from the cache, fetching on a miss;
+/// main warms it in a background thread at startup.
+pub fn models() -> Vec<String> {
+    if let Some(models) = MODELS.get() {
+        return models.clone();
+    }
+    let models = available_models();
+    if !models.is_empty() {
+        // A concurrent caller may have set it first; both fetched live, so
+        // either listing is fine to keep.
+        let _ = MODELS.set(models.clone());
+    }
+    models
+}
+
+/// The models straight from `opencode models`: the exact provider/model IDs
+/// the runner can be pointed at. opencode only lists providers whose auth
+/// loaded, so a missing provider (no Claude credentials, say) shows up here
+/// as an empty or shortened list instead of a cryptic "Model not found" on
+/// the first turn. An unrunnable listing is logged and treated as no models
+/// on offer.
+fn available_models() -> Vec<String> {
     let output = std::process::Command::new("opencode")
         .arg("models")
         .env("NO_COLOR", "1")

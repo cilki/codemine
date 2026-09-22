@@ -55,6 +55,13 @@ fn main() -> Result<()> {
     let addr = webui::spawn(cli.listen, status.clone(), store.clone())?;
     info!("webui listening on http://{addr}");
 
+    // Warm the model listing off the startup path: `opencode models` can
+    // take the better part of a minute on small hosts, and the first
+    // settings page load shouldn't stall for it.
+    std::thread::Builder::new()
+        .name("models".into())
+        .spawn(|| drop(config::models()))?;
+
     // Epochs of completed turns, for the UI's trailing-hour count.
     let mut completions: VecDeque<u64> = VecDeque::new();
     // Turns available to spend right now. The bucket refills at the
@@ -166,7 +173,14 @@ fn main() -> Result<()> {
                         );
                     }
                 }
-                sleep(&cli, report.backoff, &status)?;
+                match report.backoff {
+                    // A cancelled turn heads straight into the next one —
+                    // that is the button's promise — but a usage-limit
+                    // backoff still holds, since retrying early just burns
+                    // the next turn on the same limit.
+                    Backoff::Normal if report.canceled => {}
+                    backoff => sleep(&cli, backoff, &status)?,
+                }
             }
             // A failing turn (bad token, unreachable forge, ...) must not
             // kill the runner now that config is editable at runtime.

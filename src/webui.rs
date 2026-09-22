@@ -69,6 +69,7 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/api/events", get(api_events))
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/paused", axum::routing::put(api_put_paused))
+        .route("/api/cancel", axum::routing::post(api_post_cancel))
         .route("/api/options", get(api_options))
         .route("/api/repos/{forge}", get(api_repos))
         .with_state(state);
@@ -207,13 +208,14 @@ fn log_tail(status: &Shared) -> String {
 }
 
 /// The choices the settings form renders: the models opencode can actually
-/// resolve (a live `opencode models` listing, so a provider whose auth didn't
-/// load is visibly absent) and the task pool, which comes from the embedded
-/// sweep command so the checkboxes can't drift from the prompt.
+/// resolve (an `opencode models` listing fetched once and cached, so a
+/// provider whose auth didn't load is visibly absent) and the task pool,
+/// which comes from the embedded sweep command so the checkboxes can't drift
+/// from the prompt.
 async fn api_options() -> Json<serde_json::Value> {
-    // The listing shells out to opencode; keep it off the current-thread
+    // A cache miss shells out to opencode; keep it off the current-thread
     // runtime so status polling stays responsive meanwhile.
-    let models = tokio::task::spawn_blocking(crate::config::available_models)
+    let models = tokio::task::spawn_blocking(crate::config::models)
         .await
         .unwrap_or_default();
     Json(json!({
@@ -285,6 +287,23 @@ async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paus
         )
             .into_response(),
     }
+}
+
+/// Cancel the running turn and move on to the next: the flag is picked up at
+/// the turn runner's next wait hop (within seconds), which kills the agent's
+/// process tree, records the turn as canceled, and skips the between-turn
+/// sleep. A paused tree is killable too — the kill SIGCONTs it on the way.
+async fn api_post_cancel(State(state): State<AppState>) -> Response {
+    let mut status = state.status.lock();
+    if !matches!(status.activity, Activity::Running { .. }) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "no turn is running" })),
+        )
+            .into_response();
+    }
+    status.cancel_requested = true;
+    Json(json!({ "canceled": true })).into_response()
 }
 
 /// Live repository listing for one forge, merged with the disabled set so
@@ -488,6 +507,35 @@ mod tests {
 
         child.kill().ok();
         child.wait().ok();
+    }
+
+    #[test]
+    fn cancel_flags_the_running_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
+        let status = Shared::new();
+        let addr = spawn("127.0.0.1:0".parse().unwrap(), status.clone(), store).unwrap();
+
+        // Nothing running: nothing to cancel.
+        let response = request(addr, "POST", "/api/cancel", "");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(!status.lock().cancel_requested);
+
+        Status::update(&status, |s| {
+            s.activity = Activity::Running {
+                task: "simplify".into(),
+                repo: "o/r".into(),
+                forge: "github".into(),
+                workspace: "/w".into(),
+                log_path: dir.path().join("log"),
+                pgid: 1,
+                started: 0,
+                tokens: None,
+            }
+        });
+        let response = request(addr, "POST", "/api/cancel", "");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(status.lock().cancel_requested);
     }
 
     #[test]

@@ -37,13 +37,15 @@
   }
   @keyframes glow { 40% { opacity: 1; } 100% { opacity: 0; } }
   @media (prefers-reduced-motion: reduce) { #glow { display: none; } }
-  /* Above the glow layer, which shares the body's stacking context. Tall as
-     the screen, so the panels below can take what the tiles leave; the bottom
-     padding clears the floating buttons, which would otherwise sit on the
-     log's corner. dvh keeps that true under a phone's toolbars. */
+  /* Above the glow layer, which shares the body's stacking context. Exactly
+     as tall as the screen — a hard height, not a floor, so the turns and log
+     panels get what the tiles leave and scroll inside themselves instead of
+     growing the page past the fold. The bottom padding clears the floating
+     buttons, which would otherwise sit on the log's corner. dvh keeps the
+     fit true under a phone's toolbars. */
   .container {
     position: relative; max-width: 1100px; margin: 0 auto;
-    min-height: 100vh; min-height: 100dvh;
+    height: 100vh; height: 100dvh;
     padding: 24px 16px 72px;
     display: flex; flex-direction: column; gap: 16px;
   }
@@ -78,7 +80,8 @@
   #stat-failed { color: #e74c3c; }
   #stat-tokens { color: #61afef; }
   .columns {
-    display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr);
+    /* The log is the wide column: turn rows are short, log lines aren't. */
+    display: grid; grid-template-columns: 3fr 7fr; grid-template-rows: minmax(0, 1fr);
     gap: 16px; flex: 1; min-height: 0;
   }
   .columns > .panel { display: flex; flex-direction: column; min-height: 0; }
@@ -97,6 +100,7 @@
   .outcome.skipped { color: #9aa0a6; }
   .outcome.failed { color: #e74c3c; }
   .outcome.timeout { color: #e67e22; }
+  .outcome.canceled { color: #e67e22; }
   /* One hue per task type, handed out by `badge`, so a turn's kind reads
      before its text does. */
   .task {
@@ -119,6 +123,8 @@
      what they need and the page scrolls; each is still capped, so a long
      list can't bury the other one below the fold. */
   @media (max-width: 800px) {
+    /* Back to a growing page: stacked panels can't share one screen. */
+    .container { height: auto; min-height: 100vh; min-height: 100dvh; }
     .columns { grid-template-columns: 1fr; grid-template-rows: auto; flex: none; }
     #turns, #log { flex: none; max-height: 60vh; }
     .header .emblem { height: 84px; }
@@ -219,6 +225,7 @@
       <div class="panel-title log-head"><span id="log-title">Log</span>
         <span class="log-buttons">
           <button type="button" class="small" id="pause" hidden></button>
+          <button type="button" class="small" id="cancel" hidden>cancel turn</button>
           <button type="button" class="small" id="log-live" hidden>back to live</button>
         </span></div>
       <pre id="log" class="muted"></pre>
@@ -267,6 +274,9 @@
 <script>
   const $ = id => document.getElementById(id);
   let state = null;
+  // The turn (by its start epoch) a cancel was sent for, so the button stays
+  // dead until that turn is gone and can't fire twice or hit its successor.
+  let canceling = null;
 
   const tokenTotal = t => t.input + t.output + t.reasoning + t.cache_read + t.cache_write;
 
@@ -371,10 +381,12 @@
   function render() {
     const a = state.activity;
     markProblems(a.state === "unconfigured" ? a.problems : []);
-    // The pause button lives with the log because it freezes the running
-    // turn's process tree; without a turn there is nothing to signal.
+    // The pause and cancel buttons live with the log because they act on the
+    // running turn's process tree; without a turn there is nothing to signal.
     $("pause").hidden = a.state !== "running";
     $("pause").textContent = state.paused ? "resume" : "pause";
+    $("cancel").hidden = a.state !== "running";
+    $("cancel").disabled = a.state === "running" && a.started === canceling;
     renderClock();
 
     $("stat-hour").textContent =
@@ -936,6 +948,15 @@
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ paused: !state.paused }),
   }).catch(() => {});
+  // The turn's end comes back over the event stream; the button only asks.
+  // It goes dead for this turn on the click, and a failed request revives it.
+  $("cancel").onclick = () => {
+    canceling = state.activity.started;
+    render();
+    fetch("/api/cancel", { method: "POST" }).then(response => {
+      if (!response.ok) throw response;
+    }).catch(() => { canceling = null; render(); });
+  };
   loadSettings();
 
   setInterval(() => { if (state) renderClock(); }, 1000);

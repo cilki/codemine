@@ -26,6 +26,9 @@ pub struct Report {
     /// The turn died on revoked Claude OAuth credentials; the main loop
     /// gates further turns until a fresh login replaces them.
     pub oauth_revoked: bool,
+    /// The web UI cancelled the turn; the main loop skips the between-turn
+    /// sleep so the next one starts right away.
+    pub canceled: bool,
 }
 
 /// Run one opencode turn against the repository's persistent workspace clone
@@ -48,6 +51,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             backoff: Backoff::Normal,
             completed: false,
             oauth_revoked: false,
+            canceled: false,
         });
     }
     let (forge, repo) = &pool[fastrand::usize(..pool.len())];
@@ -74,6 +78,8 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
 
     Status::update(status, |s| {
         s.paused = false;
+        // A leftover request from between turns must not fell this one.
+        s.cancel_requested = false;
         s.activity = Activity::Running {
             task: task.clone(),
             repo: repo.clone(),
@@ -113,6 +119,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             backoff: Backoff::Normal,
             completed: false,
             oauth_revoked: false,
+            canceled: false,
         });
     }
 
@@ -180,7 +187,13 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     // the page can watch the cost climb instead of learning it at the end.
     let run_start = Instant::now();
     let mut sampled = None;
+    let mut canceled = false;
     let exit = loop {
+        // Checked first so a cancel clicked during preparation lands too.
+        if status.lock().cancel_requested {
+            canceled = true;
+            break None;
+        }
         let left = cfg.turn_timeout.saturating_sub(run_start.elapsed());
         if left.is_zero() {
             break None;
@@ -209,6 +222,10 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
     let completed = scan::reported_completed(last_lines(&tail, 50));
     let errored = scan::has_error_report(last_lines(&tail, 50));
     let outcome = match exit {
+        None if canceled => {
+            info!("canceled after {elapsed}s");
+            Outcome::Canceled
+        }
         None => {
             warn!("timed out after {elapsed}s");
             Outcome::Timeout
@@ -254,6 +271,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         },
         completed,
         oauth_revoked: scan::oauth_revoked(&tail),
+        canceled,
     })
 }
 

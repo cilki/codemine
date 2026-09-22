@@ -64,16 +64,22 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
     // opencode's config maps server names directly under `mcp`; an earlier
     // version nested them under `mcp.servers`, which opencode reads as a
     // server named "servers" and rejects the whole config over, so drop the
-    // leftover on the way through.
-    if let Some(servers) = config["mcp"]["servers"].as_object_mut() {
-        servers.remove("codegraph");
-        if servers.is_empty() {
-            config["mcp"]
-                .as_object_mut()
-                .expect("mcp.servers was an object, so mcp is one")
-                .remove("servers");
+    // leftover on the way through. Accessed via get_mut, not indexing:
+    // IndexMut on Value inserts null for missing keys, and a written-out
+    // `"servers": null` (which one buggy version did leave behind, hence the
+    // Null arm) fails opencode's schema just the same.
+    let drop_servers = match config.get_mut("mcp").and_then(|mcp| mcp.get_mut("servers")) {
+        Some(serde_json::Value::Object(servers)) => {
+            servers.remove("codegraph");
+            servers.is_empty()
         }
-    }
+        Some(serde_json::Value::Null) => true,
+        _ => false,
+    };
+    if drop_servers
+        && let Some(mcp) = config.get_mut("mcp").and_then(|mcp| mcp.as_object_mut()) {
+            mcp.remove("servers");
+        }
     config["mcp"]["codegraph"] = serde_json::json!({
         "type": "local",
         "command": ["codegraph", "serve", "--mcp"],
@@ -385,6 +391,10 @@ mod tests {
             serde_json::json!(["codegraph", "serve", "--mcp"])
         );
         assert_eq!(config["mcp"]["codegraph"]["type"], "local");
+        // A null `servers` key must not appear either: opencode rejects the
+        // whole config over `mcp.servers: null`, and is_null() can't tell a
+        // missing key from a literal null.
+        assert!(!config["mcp"].as_object().unwrap().contains_key("servers"));
 
         std::fs::write(
             &path,
@@ -417,8 +427,16 @@ mod tests {
         install_mcp(dir.path(), true).unwrap();
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(config["mcp"]["servers"].is_null());
+        assert!(!config["mcp"].as_object().unwrap().contains_key("servers"));
         assert_eq!(config["mcp"]["codegraph"]["type"], "local");
+
+        // A literal `"servers": null` (left behind by a buggy version that
+        // auto-vivified it while migrating) is dropped too.
+        std::fs::write(&path, r#"{"mcp":{"servers":null}}"#).unwrap();
+        install_mcp(dir.path(), true).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!config["mcp"].as_object().unwrap().contains_key("servers"));
 
         // Entries codemine didn't write stay put, even under mcp.servers.
         std::fs::write(&path, r#"{"mcp":{"servers":{"codegraph":{},"other":{}}}}"#).unwrap();

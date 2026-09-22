@@ -63,6 +63,8 @@ pub enum Outcome {
     Skipped,
     Failed,
     Timeout,
+    /// Cut short from the web UI; the runner went straight to the next turn.
+    Canceled,
 }
 
 #[derive(Serialize, Clone)]
@@ -127,6 +129,7 @@ pub struct Totals {
     pub skipped: u64,
     pub failed: u64,
     pub timeout: u64,
+    pub canceled: u64,
     pub tokens: TokenUsage,
 }
 
@@ -138,6 +141,11 @@ pub struct Status {
     /// Whether the running turn's process tree is currently SIGSTOPped
     /// through the web UI.
     pub paused: bool,
+    /// The web UI asked for the running turn to be cancelled; the turn
+    /// runner notices at its next wait hop, kills the agent's tree, and
+    /// clears the flag when the next turn starts.
+    #[serde(skip)]
+    pub cancel_requested: bool,
     /// Turns completed in the last hour, for display; the limit itself is
     /// enforced as a minimum spacing between turns.
     pub completed_last_hour: u32,
@@ -158,6 +166,7 @@ impl Shared {
                 started: epoch_now(),
                 activity: Activity::Starting,
                 paused: false,
+                cancel_requested: false,
                 completed_last_hour: 0,
                 hourly_limit: None,
                 totals: Totals::default(),
@@ -184,6 +193,7 @@ impl Status {
             Outcome::Skipped => self.totals.skipped += 1,
             Outcome::Failed => self.totals.failed += 1,
             Outcome::Timeout => self.totals.timeout += 1,
+            Outcome::Canceled => self.totals.canceled += 1,
         }
         if let Some(tokens) = &record.tokens {
             self.totals.tokens.add(tokens);
