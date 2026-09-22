@@ -171,7 +171,10 @@ fn cpu_temp() -> Option<f32> {
         };
         let temp = milli / 1000.0;
         let kind = read_trimmed(path.join("type")).to_lowercase();
-        if ["cpu", "pkg", "core", "soc"].iter().any(|k| kind.contains(k)) {
+        if ["cpu", "pkg", "core", "soc"]
+            .iter()
+            .any(|k| kind.contains(k))
+        {
             return Some(temp);
         }
         fallback.get_or_insert(temp);
@@ -191,7 +194,9 @@ mod tests {
         assert!(host.mem_total > 0);
         assert!(host.mem_available <= host.mem_total);
         assert!(host.uptime_secs > 0);
-        let usage = host.cpu_usage.expect("the first call measures its own window");
+        let usage = host
+            .cpu_usage
+            .expect("the first call measures its own window");
         assert!((0.0..=100.0).contains(&usage), "{usage}");
     }
 

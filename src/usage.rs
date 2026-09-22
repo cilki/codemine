@@ -193,7 +193,11 @@ mod tests {
         insert("new1", since_ms + 1_000, &first);
         let second = message(serde_json::json!({ "input": 10, "output": 5, "reasoning": 7 }));
         insert("new2", since_ms + 2_000, &second);
-        insert("tool", since_ms + 3_000, r#"{ "id": "msg", "role": "user" }"#);
+        insert(
+            "tool",
+            since_ms + 3_000,
+            r#"{ "id": "msg", "role": "user" }"#,
+        );
         drop(db);
 
         let since = UNIX_EPOCH + std::time::Duration::from_millis(since_ms as u64);

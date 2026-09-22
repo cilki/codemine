@@ -44,8 +44,8 @@ fn render(emblem: &Emblem) -> String {
 
     // The icon ships as a standalone SVG document drawn in black; drop its
     // XML declaration and nest it, recolored, beside the letters.
-    let icon = emblem.icon[emblem.icon.find("<svg").unwrap_or(0)..]
-        .replace("#000000", emblem.color);
+    let icon =
+        emblem.icon[emblem.icon.find("<svg").unwrap_or(0)..].replace("#000000", emblem.color);
     format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><g transform="translate({},{})">{icon}</g>{rects}</svg>"#,
         margin / 2,

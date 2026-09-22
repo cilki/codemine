@@ -603,9 +603,13 @@ mod tests {
         let value = body_json(&request(addr, "GET", "/api/options", ""));
         // The model list mirrors `opencode models`, so its content depends on
         // the machine; every entry is a provider/model ID either way.
-        assert!(value["models"].as_array().unwrap().iter().all(|m| {
-            m.as_str().is_some_and(|id| id.contains('/'))
-        }));
+        assert!(
+            value["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| { m.as_str().is_some_and(|id| id.contains('/')) })
+        );
         let tasks = value["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), crate::prompts::default_tasks().len());
         // Each task carries the instructions it selects, for the UI tooltip.

@@ -140,7 +140,10 @@ mod tests {
     fn ansi_stripping() {
         assert_eq!(strip_ansi("plain text"), "plain text");
         assert_eq!(strip_ansi("\x1b[38;5;208morange\x1b[0m"), "orange");
-        assert_eq!(strip_ansi("\x1b]0;title\x07left\x1b]2;t\x1b\\right"), "leftright");
+        assert_eq!(
+            strip_ansi("\x1b]0;title\x07left\x1b]2;t\x1b\\right"),
+            "leftright"
+        );
         assert_eq!(strip_ansi("a\x1b(Bb\x1b[2Kc\x1b"), "abc");
     }
 

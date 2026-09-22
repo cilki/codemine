@@ -61,12 +61,23 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
             .with_context(|| format!("{} is not valid JSON", path.display()))?,
         Err(_) => serde_json::json!({}),
     };
-    config["mcp"]["servers"]["codegraph"] = serde_json::json!({
-        "type": "stdio",
-        "command": "codegraph",
-        "args": ["serve", "--mcp"],
-        // Keep codegraph_explore on the native tool list.
-        "codemode": false,
+    // opencode's config maps server names directly under `mcp`; an earlier
+    // version nested them under `mcp.servers`, which opencode reads as a
+    // server named "servers" and rejects the whole config over, so drop the
+    // leftover on the way through.
+    if let Some(servers) = config["mcp"]["servers"].as_object_mut() {
+        servers.remove("codegraph");
+        if servers.is_empty() {
+            config["mcp"]
+                .as_object_mut()
+                .expect("mcp.servers was an object, so mcp is one")
+                .remove("servers");
+        }
+    }
+    config["mcp"]["codegraph"] = serde_json::json!({
+        "type": "local",
+        "command": ["codegraph", "serve", "--mcp"],
+        "enabled": true,
     });
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
@@ -86,6 +97,16 @@ pub fn install_plugin(dir: &Path) -> Result<()> {
     scrub_plugin_config(dir)?;
     match claude_auth_entrypoint() {
         Some(entrypoint) => link_plugin(dir, &entrypoint),
+        // The host may provision the plugin straight into opencode's plugin
+        // directory instead of a node_modules root (the NixOS module does);
+        // only warn when it's nowhere at all. metadata() follows symlinks,
+        // so a dangling link left by an uninstall doesn't count.
+        None if ["plugin", "plugins"].iter().any(|sub| {
+            std::fs::metadata(dir.join(sub).join("opencode-claude-auth.js")).is_ok()
+        }) =>
+        {
+            Ok(())
+        }
         None => {
             tracing::warn!(
                 "opencode-claude-auth is not installed; opencode will have no anthropic provider"
@@ -198,7 +219,10 @@ fn configures_codegraph(path: &Path) -> bool {
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|config| !config["mcp"]["servers"]["codegraph"].is_null())
+        .is_some_and(|config| {
+            !config["mcp"]["codegraph"].is_null()
+                || !config["mcp"]["servers"]["codegraph"].is_null()
+        })
 }
 
 /// One task the runner can draw: the slug passed to the sweep prompt, plus
@@ -357,24 +381,52 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
-            config["mcp"]["servers"]["codegraph"]["command"],
-            "codegraph"
+            config["mcp"]["codegraph"]["command"],
+            serde_json::json!(["codegraph", "serve", "--mcp"])
         );
+        assert_eq!(config["mcp"]["codegraph"]["type"], "local");
 
         std::fs::write(
             &path,
-            r#"{"theme":"dark","mcp":{"servers":{"other":{"type":"stdio"}}}}"#,
+            r#"{"theme":"dark","mcp":{"other":{"type":"remote","url":"http://x"}}}"#,
         )
         .unwrap();
         install_mcp(dir.path(), true).unwrap();
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(config["theme"], "dark");
-        assert_eq!(config["mcp"]["servers"]["other"]["type"], "stdio");
+        assert_eq!(config["mcp"]["other"]["type"], "remote");
         assert_eq!(
-            config["mcp"]["servers"]["codegraph"]["codemode"],
-            serde_json::json!(false)
+            config["mcp"]["codegraph"]["enabled"],
+            serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn install_mcp_drops_stale_servers_nesting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+
+        // A previous version nested the entry under mcp.servers, which
+        // opencode rejects wholesale; install_mcp migrates it away.
+        std::fs::write(
+            &path,
+            r#"{"mcp":{"servers":{"codegraph":{"type":"stdio","command":"codegraph"}}}}"#,
+        )
+        .unwrap();
+        install_mcp(dir.path(), true).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(config["mcp"]["servers"].is_null());
+        assert_eq!(config["mcp"]["codegraph"]["type"], "local");
+
+        // Entries codemine didn't write stay put, even under mcp.servers.
+        std::fs::write(&path, r#"{"mcp":{"servers":{"codegraph":{},"other":{}}}}"#).unwrap();
+        install_mcp(dir.path(), true).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!config["mcp"]["servers"]["other"].is_null());
+        assert!(config["mcp"]["servers"]["codegraph"].is_null());
     }
 
     #[test]

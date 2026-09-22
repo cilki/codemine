@@ -86,7 +86,10 @@ fn update(dir: &Path, log: &File) -> Result<()> {
     ])?;
     // Track upstream default-branch changes.
     git(&["remote", "set-head", "origin", "--auto"])?;
-    let head = git_stdout(dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])?;
+    let head = git_stdout(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )?;
     let branch = head
         .trim()
         .strip_prefix("origin/")
@@ -108,7 +111,12 @@ fn update(dir: &Path, log: &File) -> Result<()> {
 /// with no counterpart — never pushed, or merged and deleted upstream — are
 /// left alone rather than silently thrown away.
 fn fast_forward_branches(dir: &Path, current: &str, log: &File) -> Result<()> {
-    let refs = |namespace| git_stdout(dir, &["for-each-ref", "--format=%(refname:short)", namespace]);
+    let refs = |namespace| {
+        git_stdout(
+            dir,
+            &["for-each-ref", "--format=%(refname:short)", namespace],
+        )
+    };
     let remote: BTreeSet<String> = refs("refs/remotes/origin")?
         .lines()
         .filter_map(|name| name.strip_prefix("origin/"))
@@ -119,9 +127,12 @@ fn fast_forward_branches(dir: &Path, current: &str, log: &File) -> Result<()> {
             continue;
         }
         run_logged(
-            Command::new("git")
-                .current_dir(dir)
-                .args(["branch", "--force", local, &format!("origin/{local}")]),
+            Command::new("git").current_dir(dir).args([
+                "branch",
+                "--force",
+                local,
+                &format!("origin/{local}"),
+            ]),
             GIT_TIMEOUT,
             log,
         )?;
@@ -293,7 +304,10 @@ mod tests {
     }
 
     fn head_of(dir: &Path, branch: &str) -> String {
-        git_stdout(dir, &["rev-parse", branch]).unwrap().trim().to_owned()
+        git_stdout(dir, &["rev-parse", branch])
+            .unwrap()
+            .trim()
+            .to_owned()
     }
 
     /// Every branch the turn might touch starts at what origin has now, not
@@ -312,7 +326,11 @@ mod tests {
         let clone = root.path().join("clone");
         git(
             root.path(),
-            &["clone", &origin.display().to_string(), &clone.display().to_string()],
+            &[
+                "clone",
+                &origin.display().to_string(),
+                &clone.display().to_string(),
+            ],
         );
         // A branch an earlier turn checked out, pinned to the old commit.
         git(&clone, &["checkout", "-b", "feature", "origin/feature"]);
@@ -333,7 +351,10 @@ mod tests {
 
         assert_eq!(head_of(&clone, "main"), head_of(&origin, "main"));
         assert_eq!(head_of(&clone, "feature"), head_of(&origin, "feature"));
-        assert_eq!(head_of(&clone, "origin/feature"), head_of(&origin, "feature"));
+        assert_eq!(
+            head_of(&clone, "origin/feature"),
+            head_of(&origin, "feature")
+        );
         assert_eq!(head_of(&clone, "local-only"), local_only);
     }
 }
