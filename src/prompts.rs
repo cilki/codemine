@@ -76,10 +76,9 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
         Some(serde_json::Value::Null) => true,
         _ => false,
     };
-    if drop_servers
-        && let Some(mcp) = config.get_mut("mcp").and_then(|mcp| mcp.as_object_mut()) {
-            mcp.remove("servers");
-        }
+    if drop_servers && let Some(mcp) = config.get_mut("mcp").and_then(|mcp| mcp.as_object_mut()) {
+        mcp.remove("servers");
+    }
     config["mcp"]["codegraph"] = serde_json::json!({
         "type": "local",
         "command": ["codegraph", "serve", "--mcp"],
@@ -188,34 +187,6 @@ fn link_plugin(dir: &Path, entrypoint: &Path) -> Result<()> {
     }
     std::os::unix::fs::symlink(entrypoint, &link)
         .with_context(|| format!("failed to link {}", link.display()))
-}
-
-/// Where opencode stores provider credentials.
-pub fn opencode_auth_json() -> PathBuf {
-    crate::config::xdg_dir("XDG_DATA_HOME", ".local/share").join("opencode/auth.json")
-}
-
-/// Drop the anthropic entry from opencode's stored credentials so the plugin
-/// re-derives it from the Claude Code credentials file: a stale or hand-added
-/// entry makes opencode call Anthropic as a plain third-party app, which
-/// bills extra usage instead of the subscription. A missing or malformed
-/// file is left for opencode to sort out.
-pub fn scrub_anthropic_auth(path: &Path) -> Result<()> {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Ok(());
-    };
-    let Ok(mut auth) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        tracing::warn!("{} is not valid JSON; leaving it alone", path.display());
-        return Ok(());
-    };
-    if auth
-        .as_object_mut()
-        .is_some_and(|auth| auth.remove("anthropic").is_some())
-    {
-        std::fs::write(path, serde_json::to_vec_pretty(&auth)?)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-    }
-    Ok(())
 }
 
 /// Whether opencode's config already names the codegraph MCP server; an

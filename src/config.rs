@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -34,26 +34,43 @@ impl ForgeKind {
     }
 }
 
-/// The `opencode models` listing, cached for the life of the process: it
-/// shells out to opencode, which can take the better part of a minute on
-/// small hosts. Only a non-empty listing sticks — caching a failure (say,
-/// opencode misconfigured at startup) would pin an empty dropdown until the
-/// next restart, so an empty result is retried on the next call instead.
-static MODELS: OnceLock<Vec<String>> = OnceLock::new();
+/// The `opencode models` listing, cached until invalidated: it shells out
+/// to opencode, which can take the better part of a minute on small hosts.
+/// Only a non-empty listing sticks — caching a failure (say, opencode
+/// misconfigured at startup) would pin an empty dropdown until the next
+/// restart, so an empty result is retried on the next call instead.
+static MODELS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
 /// The models the web UI offers, from the cache, fetching on a miss;
-/// main warms it in a background thread at startup.
+/// main warms it in a background thread at startup. The cache is not held
+/// across the fetch, so concurrent callers may both fetch live — both
+/// results came from opencode, either is fine to keep.
 pub fn models() -> Vec<String> {
-    if let Some(models) = MODELS.get() {
+    if let Some(models) = &*lock(&MODELS) {
         return models.clone();
     }
     let models = available_models();
     if !models.is_empty() {
-        // A concurrent caller may have set it first; both fetched live, so
-        // either listing is fine to keep.
-        let _ = MODELS.set(models.clone());
+        *lock(&MODELS) = Some(models.clone());
     }
     models
+}
+
+/// Forget the cached listing so the next call re-asks opencode. Called after
+/// a Claude login lands, which typically turns an empty or anthropic-less
+/// listing into a full one.
+pub fn invalidate_models() {
+    *lock(&MODELS) = None;
+}
+
+/// A poison-tolerant lock: the cache is a plain value, so a panicking holder
+/// can't leave it inconsistent.
+fn lock(
+    models: &'static Mutex<Option<Vec<String>>>,
+) -> std::sync::MutexGuard<'static, Option<Vec<String>>> {
+    models
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The models straight from `opencode models`: the exact provider/model IDs

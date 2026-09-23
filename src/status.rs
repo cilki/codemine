@@ -156,6 +156,9 @@ pub struct Status {
     pub turns: VecDeque<TurnRecord>,
     /// Tail of the last finished turn's log.
     pub log_tail: String,
+    /// When set, turns are held after one died on Claude OAuth: the epoch at
+    /// which the main loop will try again even without a fresh login.
+    pub oauth_gated_until: Option<u64>,
 }
 
 impl Shared {
@@ -172,6 +175,7 @@ impl Shared {
                 totals: Totals::default(),
                 turns: VecDeque::new(),
                 log_tail: String::new(),
+                oauth_gated_until: None,
             })),
             changes: watch::channel(0).0,
         }

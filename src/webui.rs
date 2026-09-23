@@ -1,11 +1,17 @@
 //! The always-on web UI: one background thread running axum on a
 //! current-thread tokio runtime. Serves the status page, the event stream it
 //! updates from, and the settings API the runner is configured through.
+//!
+//! The UI is unauthenticated and binds 0.0.0.0 by default, so everything
+//! here — settings, forge tokens, the Claude login flow — is writable by
+//! anyone who can reach the port. Tokens never travel back to the browser,
+//! but the bind address should still be a loopback or trusted network.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::Json;
@@ -28,10 +34,29 @@ const LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 static INDEX_HTML: &str = include_str!("webui.html");
 
+/// A Claude login the page has started but not finished: the PKCE verifier
+/// the eventual code exchange must present. One at a time — starting a new
+/// login abandons the old one — and expiring, so a forgotten attempt can't
+/// be completed days later.
+struct PendingLogin {
+    verifier: String,
+    created: Instant,
+}
+
+const LOGIN_TTL: Duration = Duration::from_secs(600);
+
 #[derive(Clone)]
 struct AppState {
     status: Shared,
     settings: SharedSettings,
+    login: Arc<Mutex<Option<PendingLogin>>>,
+}
+
+/// The pending login, poison-tolerant like every other lock in the runner.
+fn pending(login: &Mutex<Option<PendingLogin>>) -> std::sync::MutexGuard<'_, Option<PendingLogin>> {
+    login
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Bind and serve on a background thread. Binding happens synchronously so a
@@ -52,7 +77,14 @@ pub fn spawn(addr: SocketAddr, status: Shared, settings: SharedSettings) -> Resu
                 .build()
                 .expect("failed to build webui runtime");
             runtime
-                .block_on(serve(listener, AppState { status, settings }))
+                .block_on(serve(
+                    listener,
+                    AppState {
+                        status,
+                        settings,
+                        login: Arc::new(Mutex::new(None)),
+                    },
+                ))
                 .expect("webui server failed");
         })?;
     Ok(local)
@@ -70,6 +102,8 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/paused", axum::routing::put(api_put_paused))
         .route("/api/cancel", axum::routing::post(api_post_cancel))
+        .route("/api/claude/login", axum::routing::post(api_claude_login))
+        .route("/api/claude/code", axum::routing::post(api_claude_code))
         .route("/api/options", get(api_options))
         .route("/api/repos/{forge}", get(api_repos))
         .with_state(state);
@@ -133,11 +167,12 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         let mut changes = state.status.subscribe();
         // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
-        let (mut sent_status, mut sent_log, mut sent_host) = (None, None, None);
+        let (mut sent_status, mut sent_log, mut sent_host, mut sent_claude) =
+            (None, None, None, None);
         loop {
             // Status is compared without the server timestamp, which moves on
             // its own and would make every state look new, but sent with it;
-            // the log and host events compare and send the same JSON.
+            // the log, host, and claude events compare and send the same JSON.
             let snapshot = serde_json::to_string(&*state.status.lock()).unwrap_or_default();
             let status =
                 serde_json::to_string(&status_value(&state.status)).unwrap_or_else(|_| "{}".into());
@@ -145,10 +180,16 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                 serde_json::to_string(&log_tail(&state.status)).unwrap_or_else(|_| "\"\"".into());
             let host =
                 serde_json::to_string(&crate::host::snapshot()).unwrap_or_else(|_| "{}".into());
+            // Re-derived from two small files each tick, like the host
+            // snapshot: the main loop is inside a turn for hours at a time,
+            // so auth health can't ride the status it owns.
+            let claude =
+                serde_json::to_string(&crate::claude::health()).unwrap_or_else(|_| "{}".into());
             for (name, key, payload, sent) in [
                 ("status", &snapshot, &status, &mut sent_status),
                 ("log", &log, &log, &mut sent_log),
                 ("host", &host, &host, &mut sent_host),
+                ("claude", &claude, &claude, &mut sent_claude),
             ] {
                 if sent.as_ref() == Some(key) {
                     continue;
@@ -251,6 +292,89 @@ async fn api_put_settings(
         Err(err) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "error": format!("{err:#}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Start (or restart) a Claude login: mint a PKCE verifier, park it as the
+/// one pending login, and hand the page the authorize URL for the user's
+/// browser. The verifier itself never leaves the server.
+async fn api_claude_login(State(state): State<AppState>) -> Response {
+    match crate::claude::begin_login() {
+        Ok(login) => {
+            *pending(&state.login) = Some(PendingLogin {
+                verifier: login.verifier,
+                created: Instant::now(),
+            });
+            Json(json!({ "url": login.url })).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{err:#}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Code {
+    code: String,
+}
+
+/// Finish a Claude login: exchange the pasted `code#state` against the
+/// pending verifier and install the tokens as the credentials file. The
+/// verifier is only consumed on success, so a mistyped paste is retryable
+/// without restarting the flow.
+async fn api_claude_code(State(state): State<AppState>, Json(incoming): Json<Code>) -> Response {
+    let verifier = match &*pending(&state.login) {
+        Some(login) if login.created.elapsed() < LOGIN_TTL => login.verifier.clone(),
+        Some(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "the login attempt expired; start over" })),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "no login in progress" })),
+            )
+                .into_response();
+        }
+    };
+    // The exchange shells out to curl and the write hits the disk; keep both
+    // off the current-thread runtime so status polling stays responsive.
+    let exchanged = tokio::task::spawn_blocking(move || {
+        let tokens = crate::claude::exchange(&incoming.code, &verifier)?;
+        crate::claude::write_credentials(&crate::claude::credentials_path(), &tokens)
+    })
+    .await;
+    match exchanged {
+        Ok(Ok(())) => {
+            *pending(&state.login) = None;
+            // The fresh login typically turns an anthropic-less model listing
+            // into a full one; refetch it off the request path, mirroring the
+            // startup warmup.
+            crate::config::invalidate_models();
+            std::thread::Builder::new()
+                .name("models".into())
+                .spawn(|| drop(crate::config::models()))
+                .ok();
+            // Nudge the event stream so the page's account card repaints
+            // without waiting out the log timer.
+            Status::update(&state.status, |_| {});
+            Json(serde_json::to_value(crate::claude::health()).unwrap_or_default()).into_response()
+        }
+        Ok(Err(err)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("{err:#}") })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{err}") })),
         )
             .into_response(),
     }
@@ -667,6 +791,39 @@ mod tests {
                     .as_str()
                     .is_some_and(|d| d.starts_with("- "))
         }));
+    }
+
+    #[test]
+    fn claude_login_mints_a_fresh_flow_each_time() {
+        let (addr, _dir) = serve_in_tempdir();
+
+        let response = request(addr, "POST", "/api/claude/login", "");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let first = body_json(&response)["url"].as_str().unwrap().to_owned();
+        assert!(first.starts_with("https://claude.ai/oauth/authorize?"));
+        assert!(first.contains("code_challenge="));
+
+        // A second login replaces the first: new verifier, new URL.
+        let second = body_json(&request(addr, "POST", "/api/claude/login", ""));
+        assert_ne!(second["url"].as_str().unwrap(), first);
+    }
+
+    #[test]
+    fn claude_code_requires_a_pending_login() {
+        let (addr, _dir) = serve_in_tempdir();
+        let response = request(addr, "POST", "/api/claude/code", r#"{"code":"x#y"}"#);
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("no login in progress"), "{response}");
+    }
+
+    #[test]
+    fn events_stream_pushes_auth_health() {
+        let (addr, _dir) = serve_in_tempdir();
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
+        let seen = read_until(&mut stream, "event: claude");
+        assert!(seen.contains("event: claude"), "{seen}");
+        assert!(seen.contains(r#""connected":"#), "{seen}");
     }
 
     #[test]

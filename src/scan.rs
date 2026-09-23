@@ -30,10 +30,16 @@ pub fn reported_completed(tail: &str) -> bool {
         .any(|line| line.trim_start().starts_with("TASK COMPLETED"))
 }
 
-/// Whether the turn died on revoked Claude OAuth credentials. Retrying is
-/// pointless until they're replaced by a fresh login.
+/// Whether the turn died on unusable Claude OAuth credentials: the API
+/// rejected the token as revoked, or the opencode-claude-auth plugin found
+/// them expired and couldn't refresh them (a dead refresh token prints the
+/// same message as a transient refresh outage, so the main loop's gate must
+/// eventually retry rather than hold for a new login forever).
 pub fn oauth_revoked(tail: &str) -> bool {
-    strip_ansi(tail).contains("token has been revoked")
+    let tail = strip_ansi(tail);
+    tail.contains("token has been revoked")
+        || tail.contains("credentials are expired and could not be refreshed")
+        || tail.contains("credentials are unavailable or expired")
 }
 
 /// The epoch at which an exhausted usage window reopens, parsed from a
@@ -145,6 +151,18 @@ mod tests {
             "leftright"
         );
         assert_eq!(strip_ansi("a\x1b(Bb\x1b[2Kc\x1b"), "abc");
+    }
+
+    #[test]
+    fn oauth_failures() {
+        assert!(oauth_revoked("OAuth token has been revoked"));
+        assert!(oauth_revoked(
+            "opencode-claude-auth: Claude credentials are expired and could not be refreshed. Run `claude` to re-authenticate."
+        ));
+        assert!(oauth_revoked(
+            "Error: Claude Code credentials are unavailable or expired. Run `claude` to refresh them."
+        ));
+        assert!(!oauth_revoked("all quiet"));
     }
 
     #[test]

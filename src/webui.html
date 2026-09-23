@@ -192,6 +192,18 @@
   #settings-status.saving { color: #9aa0a6; }
   #settings-status.ok { color: #2ecc71; }
   #settings-status.err { color: #e74c3c; }
+  #claude-card { margin-bottom: 16px; }
+  #claude-card.invalid { outline: 1px solid #e74c3c; outline-offset: 4px; }
+  #claude-status { font-size: 0.85em; }
+  #claude-status.err { color: #e74c3c; }
+  #claude-status.warn { color: #f39c12; }
+  /* The whole authorize URL, visible and selectable: the clipboard API needs
+     a secure context this plain-http page doesn't have. */
+  #claude-url { word-break: break-all; font-size: 0.8em; color: var(--accent); }
+  #claude-connect { align-self: flex-start; }
+  #claude-login { display: flex; flex-direction: column; gap: 10px; }
+  #claude-submit { align-self: flex-start; }
+  #claude-note { font-size: 0.85em; min-height: 1.2em; }
 </style>
 </head>
 <body>
@@ -265,6 +277,21 @@
     </div>
     <div class="field tasks"><label>Tasks</label>
       <div class="checks-grid" id="s-tasks"></div>
+    </div>
+    <div class="forge" id="claude-card">
+      <div class="forge-head">
+        <span class="name">Claude account</span>
+        <span class="muted" id="claude-status">checking…</span>
+      </div>
+      <div id="claude-login" hidden>
+        <div class="field"><label>1. Authorize in your browser, then copy the code it shows</label>
+          <a id="claude-url" target="_blank" rel="noopener"></a></div>
+        <div class="field"><label for="claude-code">2. Paste the code</label>
+          <input id="claude-code" autocomplete="off" placeholder="code#state"></div>
+        <button type="button" class="small" id="claude-submit">connect account</button>
+      </div>
+      <button type="button" class="small" id="claude-connect">connect</button>
+      <div class="muted" id="claude-note"></div>
     </div>
     <div class="forges" id="forges"></div>
     <div id="settings-status"></div>
@@ -381,6 +408,9 @@
   function render() {
     const a = state.activity;
     markProblems(a.state === "unconfigured" ? a.problems : []);
+    // The account card's notes read the gate and the running turn off the
+    // status, so a status change repaints it too.
+    if (claudeHealth) renderClaude(claudeHealth);
     // The pause and cancel buttons live with the log because they act on the
     // running turn's process tree; without a turn there is nothing to signal.
     $("pause").hidden = a.state !== "running";
@@ -648,6 +678,7 @@
     });
     events.addEventListener("log", event => setLog(JSON.parse(event.data)));
     events.addEventListener("host", event => renderHost(JSON.parse(event.data)));
+    events.addEventListener("claude", event => renderClaude(JSON.parse(event.data)));
     events.onopen = () => $("disconnected").hidden = true;
     events.onerror = () => $("disconnected").hidden = false;
   }
@@ -919,14 +950,99 @@
     }
   }
 
+  // ---- Claude account ----
+  // The account card lives in the settings dialog but is not part of the
+  // settings document: the login flow has its own endpoints, and the pasted
+  // code never enters the autosaved settings JSON.
+
+  let claudeHealth = null;
+
+  function renderClaude(h) {
+    claudeHealth = h;
+    const status = $("claude-status");
+    status.title = "";
+    let text, cls = "muted";
+    if (!h.connected) {
+      text = "not connected";
+      cls = "err";
+    } else if (h.refresh.state === "terminal") {
+      text = "refresh failing" + (h.refresh.reason ? ` (${h.refresh.reason})` : "") + " — reconnect";
+      cls = "err";
+    } else if (h.refresh.state === "transient" || h.refresh.state === "unavailable") {
+      text = "refresh hiccup — retrying";
+      cls = "warn";
+    } else {
+      text = "connected";
+      status.title = h.expires_at
+        ? "access token renews around " + new Date(h.expires_at).toLocaleString() : "";
+    }
+    status.textContent = text;
+    status.className = cls;
+    $("claude-connect").textContent = h.connected ? "reconnect" : "connect";
+    const notes = [];
+    if (state?.oauth_gated_until)
+      notes.push("turns held until " + new Date(state.oauth_gated_until * 1000).toLocaleString()
+        + " or a reconnect");
+    if (!$("claude-login").hidden && state?.activity?.state === "running")
+      notes.push("a running turn may refresh tokens concurrently; prefer connecting between turns");
+    $("claude-note").textContent = notes.join(" · ");
+  }
+
+  $("claude-connect").onclick = async () => {
+    const note = $("claude-note");
+    try {
+      const res = await fetch("/api/claude/login", { method: "POST" });
+      const returned = await res.json();
+      if (!res.ok) throw new Error(returned.error || res.status);
+      const link = $("claude-url");
+      link.href = returned.url;
+      link.textContent = returned.url;
+      $("claude-code").value = "";
+      $("claude-login").hidden = false;
+      note.textContent = "";
+    } catch (err) {
+      note.textContent = String(err.message || err);
+    }
+  };
+
+  $("claude-submit").onclick = async () => {
+    const code = $("claude-code").value.trim();
+    if (!code) return;
+    const note = $("claude-note");
+    note.textContent = "connecting…";
+    try {
+      const res = await fetch("/api/claude/code", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      const returned = await res.json();
+      if (!res.ok) throw new Error(returned.error || res.status);
+      $("claude-login").hidden = true;
+      $("claude-code").value = "";
+      note.textContent = "";
+      renderClaude(returned);
+      // The fresh login can turn an empty model dropdown into a full one.
+      loadSettings();
+    } catch (err) {
+      // The paste is retryable against the same login; the form stays up.
+      note.textContent = String(err.message || err);
+    }
+  };
+
   $("forges").append(...FORGES.map(forgeCard));
   // Delegated, so the repo and task checkboxes built later are covered too.
   // Typing debounces; committed choices save at once. Token fields are left
-  // to `change` alone, so a partial secret is never stored.
+  // to `change` alone, so a partial secret is never stored. The Claude card
+  // is excluded outright — its input is a login code, not a setting.
   $("settings").addEventListener("input", event => {
+    if (event.target.closest("#claude-card")) return;
     if (event.target.type !== "password") scheduleSave(600);
   });
-  $("settings").addEventListener("change", () => scheduleSave(0));
+  $("settings").addEventListener("change", event => {
+    if (event.target.closest("#claude-card")) return;
+    scheduleSave(0);
+  });
   // The octocat is already inlined for the forge cards; reuse it.
   $("github-link").querySelector("path").setAttribute("d", FORGE_ICONS.github.path);
   $("settings-open").onclick = () => $("settings").showModal();

@@ -27,6 +27,9 @@ pub struct Report {
     /// The turn died on revoked Claude OAuth credentials; the main loop
     /// gates further turns until a fresh login replaces them.
     pub oauth_revoked: bool,
+    /// The plugin's own verdict on its last refresh attempt, distilled from
+    /// its debug log; refines `oauth_revoked` into terminal vs transient.
+    pub refresh: crate::claude::Refresh,
     /// The web UI cancelled the turn; the main loop skips the between-turn
     /// sleep so the next one starts right away.
     pub canceled: bool,
@@ -51,6 +54,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             backoff: Backoff::Normal,
             completed: false,
             oauth_revoked: false,
+            refresh: crate::claude::Refresh::NoData,
             canceled: false,
         });
     }
@@ -60,6 +64,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             backoff: Backoff::Normal,
             completed: false,
             oauth_revoked: false,
+            refresh: crate::claude::Refresh::NoData,
             canceled: false,
         });
     };
@@ -127,6 +132,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             backoff: Backoff::Normal,
             completed: false,
             oauth_revoked: false,
+            refresh: crate::claude::Refresh::NoData,
             canceled: false,
         });
     }
@@ -161,6 +167,12 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         // would resolve the runner's own launch directory instead.
         .env("PWD", &dir)
         .env("NO_COLOR", "1")
+        // The opencode-claude-auth plugin records each OAuth refresh
+        // attempt's outcome (tokens redacted) at this path, truncated at
+        // every opencode start that carries the variable. The digest of it
+        // is how the main loop tells a dead refresh token from a transient
+        // outage; the explicit path keeps writer and reader agreed.
+        .env("CLAUDE_AUTH_DEBUG", crate::claude::debug_log_path())
         // Headless runs auto-reject permission prompts, so every tool the
         // agent needs has to be pre-approved. The Landlock sandbox is the
         // real boundary, and legitimate work (cargo's registry, tool caches)
@@ -279,6 +291,7 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         },
         completed,
         oauth_revoked: scan::oauth_revoked(&tail),
+        refresh: crate::claude::refresh_digest(&crate::claude::debug_log_path()),
         canceled,
     })
 }
