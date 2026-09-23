@@ -23,8 +23,28 @@ fn opencode_data_dir() -> PathBuf {
 /// Sum the token counts recorded since `since`, or None if none were found.
 pub fn collect_since(since: SystemTime) -> Option<TokenUsage> {
     let data = opencode_data_dir();
-    from_database(&data.join("opencode.db"), since)
+    databases(&data)
+        .into_iter()
+        .find_map(|db| from_database(&db, since))
         .or_else(|| from_files(&data.join("storage"), since))
+}
+
+/// The database files opencode may be writing: `opencode.db` historically,
+/// `opencode-<channel>.db` (`opencode-stable.db` and friends) since 1.15.
+fn databases(data: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(data)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("opencode") && name.ends_with(".db"))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// Sum the `tokens` objects of the messages recorded in opencode's database
@@ -73,14 +93,11 @@ fn from_files(storage: &Path, since: SystemTime) -> Option<TokenUsage> {
             budget -= 1;
             let path = entry.path();
             if path.is_dir() {
-                // A directory untouched since the turn started gained no
-                // entries during it; skipping it keeps the scan proportional
-                // to the turn instead of the whole history.
-                let touched = entry
-                    .metadata()
-                    .and_then(|meta| meta.modified())
-                    .is_ok_and(|modified| modified >= since);
-                if touched && depth < MAX_DEPTH {
+                // A fresh file only touches its immediate parent's mtime, so
+                // intermediate directories (storage/session/, say) look stale
+                // even when new messages landed below them; descend
+                // unconditionally and let the file budget bound the scan.
+                if depth < MAX_DEPTH {
                     dirs.push((path, depth + 1));
                 }
                 continue;
@@ -215,10 +232,31 @@ mod tests {
     }
 
     #[test]
+    fn databases_finds_channel_named_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["opencode-stable.db", "opencode.db", "other.db", "notes"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        assert_eq!(
+            databases(dir.path()),
+            vec![
+                dir.path().join("opencode-stable.db"),
+                dir.path().join("opencode.db"),
+            ]
+        );
+        assert!(databases(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
     fn file_scan_sums_only_recent_files() {
         let dir = tempfile::tempdir().unwrap();
-        let old_session = dir.path().join("message/ses_old");
+        // Both session directories predate the turn, so every directory
+        // mtime on the way to the new message is stale; only the message
+        // file itself is recent.
+        let old_session = dir.path().join("session/message/ses_old");
+        let live_session = dir.path().join("session/message/ses_live");
         std::fs::create_dir_all(&old_session).unwrap();
+        std::fs::create_dir_all(&live_session).unwrap();
         std::fs::write(
             old_session.join("msg.json"),
             r#"{ "tokens": { "input": 999, "output": 999 } }"#,
@@ -228,10 +266,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let since = SystemTime::now();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let new_session = dir.path().join("message/ses_new");
-        std::fs::create_dir_all(&new_session).unwrap();
         std::fs::write(
-            new_session.join("msg.json"),
+            live_session.join("msg.json"),
             r#"{ "tokens": { "input": 40, "output": 2 } }"#,
         )
         .unwrap();
