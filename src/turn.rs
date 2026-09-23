@@ -8,6 +8,7 @@ use tracing::{info, warn};
 use wait_timeout::ChildExt;
 
 use crate::config::{Config, Forge, ForgeKind};
+use crate::precheck;
 use crate::scan;
 use crate::status::{Activity, Outcome, Status, TurnRecord, epoch_now};
 use crate::workspace;
@@ -35,7 +36,6 @@ pub struct Report {
 /// and report how it went. The workspace survives across turns, and so does
 /// the turn's log under `<workspace>/logs`, for as long as the process runs.
 pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
-    let task = &cfg.tasks[fastrand::usize(..cfg.tasks.len())];
     let mut pool = Vec::new();
     for forge in &cfg.forges {
         pool.extend(
@@ -54,7 +54,15 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             canceled: false,
         });
     }
-    let (forge, repo) = &pool[fastrand::usize(..pool.len())];
+    let Some((task, forge, repo)) = precheck::draw(&cfg.tasks, &pool, precheck::actionable) else {
+        warn!("every enabled task is precondition-gated and has nothing to do");
+        return Ok(Report {
+            backoff: Backoff::Normal,
+            completed: false,
+            oauth_revoked: false,
+            canceled: false,
+        });
+    };
 
     let dir = workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo);
     let started_epoch = epoch_now();
@@ -81,8 +89,8 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         // A leftover request from between turns must not fell this one.
         s.cancel_requested = false;
         s.activity = Activity::Running {
-            task: task.clone(),
-            repo: repo.clone(),
+            task: task.to_owned(),
+            repo: repo.to_owned(),
             forge: forge.kind.name().into(),
             workspace: dir.display().to_string(),
             log_path: log_path.clone(),
@@ -105,8 +113,8 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         Status::update(status, |s| {
             s.log_tail = last_lines(&tail, 100).to_owned();
             s.record_turn(TurnRecord {
-                task: task.clone(),
-                repo: repo.clone(),
+                task: task.to_owned(),
+                repo: repo.to_owned(),
                 forge: forge.kind.name().into(),
                 started: started_epoch,
                 duration_secs: elapsed,
@@ -253,8 +261,8 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         s.paused = false;
         s.log_tail = last_lines(&tail, 100).to_owned();
         s.record_turn(TurnRecord {
-            task: task.clone(),
-            repo: repo.clone(),
+            task: task.to_owned(),
+            repo: repo.to_owned(),
             forge: forge.kind.name().into(),
             started: started_epoch,
             duration_secs: elapsed,

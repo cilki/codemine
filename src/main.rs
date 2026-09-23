@@ -7,6 +7,7 @@
 mod config;
 mod emblem;
 mod host;
+mod precheck;
 mod prompts;
 mod sandbox;
 mod scan;
