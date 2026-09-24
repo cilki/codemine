@@ -45,6 +45,15 @@ spawning it through `nice`/`ionice`; the whole process tree (cargo, rustc, test
 runs, ...) inherits the reduced priorities. I/O priorities only take effect on
 schedulers that honor them (e.g. bfq); CPU niceness works everywhere.
 
+#### Scheduling
+
+Off by default. When enabled in the settings, turns only *start* inside a
+daily window — 22:00 to 06:00 keeps the agent to the small hours, and a window
+that runs past midnight is one window rather than two. A turn already under
+way is left to finish, so pair a narrow window with a turn timeout that fits
+inside it. Times are read in the container's timezone, so set `TZ` if it isn't
+already yours.
+
 #### Multiple forge support
 
 **codemine** works with Gitea, GitHub, and GitLab. Just add an access token and

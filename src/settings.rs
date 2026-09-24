@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Cli, Config, Forge, ForgeKind, IoClass};
+use crate::schedule::Schedule;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -38,6 +39,8 @@ pub struct Settings {
     pub nice: Option<u8>,
     /// I/O scheduling class for the agent process tree.
     pub ionice: Option<IoClass>,
+    /// The daily window turns may start in; off by default.
+    pub schedule: Schedule,
 }
 
 impl Default for Settings {
@@ -54,6 +57,7 @@ impl Default for Settings {
             turn_timeout_secs: 21600,
             nice: None,
             ionice: None,
+            schedule: Schedule::default(),
         }
     }
 }
@@ -223,6 +227,7 @@ impl Settings {
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             nice: self.nice,
             ionice: self.ionice,
+            schedule: self.schedule,
             workspace: cli.workspace.clone(),
         })
     }
@@ -280,6 +285,7 @@ impl Settings {
         if self.tasks.iter().all(|task| task.trim().is_empty()) {
             bail!("task pool must not be empty");
         }
+        self.schedule.validate()?;
         for kind in FORGE_KINDS {
             let url = &self.forge(kind).url;
             if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
@@ -398,6 +404,21 @@ mod tests {
     }
 
     #[test]
+    fn the_schedule_is_off_until_it_is_turned_on() {
+        let settings = configured();
+        assert!(!settings.schedule.enabled);
+        assert_eq!(settings.to_config(&cli()).unwrap().schedule.hold(0), None);
+
+        let mut scheduled = configured();
+        scheduled.schedule.enabled = true;
+        scheduled.schedule.start_minute = 22 * 60;
+        scheduled.schedule.end_minute = 6 * 60;
+        let config = scheduled.to_config(&cli()).unwrap();
+        assert_eq!(config.schedule.hold(23 * 3600), None);
+        assert_eq!(config.schedule.hold(12 * 3600), Some(10 * 3600));
+    }
+
+    #[test]
     fn configured_settings_build_a_config() {
         let settings = configured();
         assert!(settings.problems().is_empty());
@@ -462,6 +483,10 @@ mod tests {
         assert!(settings.apply_update(bad).is_err());
         let mut bad = configured();
         bad.github.url = "github.example.com".into();
+        assert!(settings.apply_update(bad).is_err());
+        let mut bad = configured();
+        bad.schedule.enabled = true;
+        bad.schedule.end_minute = bad.schedule.start_minute;
         assert!(settings.apply_update(bad).is_err());
         // The failed updates changed nothing.
         assert_eq!(settings.nice, None);

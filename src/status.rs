@@ -120,6 +120,11 @@ pub enum Activity {
     RateLimited {
         until: u64,
     },
+    /// The clock is outside the configured daily window; the next turn may
+    /// start at this epoch.
+    OffHours {
+        until: u64,
+    },
 }
 
 #[derive(Serialize, Clone, Default)]

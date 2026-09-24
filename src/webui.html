@@ -73,15 +73,19 @@
   .stat-value { font-family: "Courier New", monospace; font-size: 1.4em; margin-top: 4px; }
   /* The runner tile's label is the state, so the value can be the clock. */
   #stat-state.running { color: #61afef; }
-  #stat-state.paused, #stat-state.rate_limited,
+  #stat-state.paused, #stat-state.rate_limited, #stat-state.off_hours,
   #stat-state.usage_limit, #stat-state.unconfigured { color: #e67e22; }
   #stat-completed { color: #2ecc71; }
   #stat-skipped { color: #9aa0a6; }
   #stat-failed { color: #e74c3c; }
   #stat-tokens { color: #61afef; }
   .columns {
-    /* The log is the wide column: turn rows are short, log lines aren't. */
-    display: grid; grid-template-columns: 3fr 7fr; grid-template-rows: minmax(0, 1fr);
+    /* The log is the wide column: turn rows are short, log lines aren't. The
+       turns column is exactly as wide as the runner and past-hour tiles plus
+       the gap between them: with the six tiles on one row each is
+       (100% - 5*12px)/6, so two of them and their gap come to 100%/3 - 8px. */
+    display: grid; grid-template-columns: calc(100% / 3 - 8px) 1fr;
+    grid-template-rows: minmax(0, 1fr);
     gap: 16px; flex: 1; min-height: 0;
   }
   .columns > .panel { display: flex; flex-direction: column; min-height: 0; }
@@ -143,6 +147,10 @@
   }
   .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
   .general-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  /* The window's two ends sit on one row under their own checkbox label. */
+  .times { display: flex; align-items: center; gap: 8px; }
+  .times input { flex: 1; min-width: 0; }
+  .times input:disabled { opacity: 0.4; }
   .forges { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
   .forge { border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
   .forge-head { display: flex; align-items: center; justify-content: space-between; }
@@ -274,6 +282,15 @@
           <option value="idle">idle</option>
         </select>
       </div>
+      <div class="field">
+        <label class="check" for="s-schedule-enabled"><input type="checkbox" id="s-schedule-enabled">
+          Only start turns between</label>
+        <div class="times">
+          <input id="s-schedule-start" type="time" aria-label="window opens">
+          <span class="muted">to</span>
+          <input id="s-schedule-end" type="time" aria-label="window closes">
+        </div>
+      </div>
     </div>
     <div class="field tasks"><label>Tasks</label>
       <div class="checks-grid" id="s-tasks"></div>
@@ -375,7 +392,7 @@
   const STATES = {
     starting: "starting", running: "running", sleeping: "sleeping",
     usage_limit: "usage limit", rate_limited: "rate limit",
-    unconfigured: "unconfigured",
+    off_hours: "off hours", unconfigured: "unconfigured",
   };
 
   // What the runner is doing, and for how much longer: the state names the
@@ -446,6 +463,9 @@
     if (a.state === "running") {
       const row = turnRow(a.task, a.repo, a.forge, state.paused ? "paused" : "running",
         new Date(a.started * 1000).toLocaleString(), "");
+      // The live log is this turn's log, so the row reads as selected while
+      // nothing older is being viewed.
+      if (viewing === null) row.className = "turn selected";
       row.querySelector(".turn-meta").lastChild.id = "running-elapsed";
       if (a.tokens) row.title = tokenBreakdown(a.tokens);
       row.onclick = viewLive;
@@ -758,6 +778,31 @@
   const nicePriority = nice =>
     nice == null ? "high" : nice <= 14 ? "normal" : "low";
 
+  // The schedule is stored as minutes past local midnight, which is what a
+  // time input reads and writes once the two are spelled the same way. A
+  // cleared input has no minute to offer, so it stands for midnight.
+  const pad = n => String(n).padStart(2, "0");
+  const toClock = minutes => pad(Math.floor(minutes / 60)) + ":" + pad(minutes % 60);
+  function toMinutes(clock) {
+    const [hour, minute] = clock.split(":").map(Number);
+    return (hour > 0 ? hour * 60 : 0) + (minute > 0 ? minute : 0);
+  }
+
+  // A window nobody is keeping to shouldn't read as one: the ends grey out
+  // until the box is ticked.
+  function renderSchedule(schedule) {
+    $("s-schedule-enabled").checked = schedule.enabled;
+    $("s-schedule-start").value = toClock(schedule.start_minute);
+    $("s-schedule-end").value = toClock(schedule.end_minute);
+    paintSchedule();
+  }
+
+  function paintSchedule() {
+    const off = !$("s-schedule-enabled").checked;
+    $("s-schedule-start").disabled = off;
+    $("s-schedule-end").disabled = off;
+  }
+
   function forgeCard(name) {
     const card = document.createElement("div");
     card.className = "forge";
@@ -839,6 +884,7 @@
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     $("s-nice").value = nicePriority(s.nice);
     $("s-ionice").value = s.ionice ?? "";
+    renderSchedule(s.schedule);
     for (const forge of FORGES) {
       const f = s[forge];
       disabledRepos[forge] = new Set(f.disabled_repos);
@@ -883,6 +929,11 @@
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
       nice: NICE[$("s-nice").value] ?? null,
       ionice: $("s-ionice").value || null,
+      schedule: {
+        enabled: $("s-schedule-enabled").checked,
+        start_minute: toMinutes($("s-schedule-start").value),
+        end_minute: toMinutes($("s-schedule-end").value),
+      },
     };
     for (const forge of FORGES) {
       body[forge] = {
@@ -1041,6 +1092,7 @@
   });
   $("settings").addEventListener("change", event => {
     if (event.target.closest("#claude-card")) return;
+    if (event.target.id === "s-schedule-enabled") paintSchedule();
     scheduleSave(0);
   });
   // The octocat is already inlined for the forge cards; reuse it.

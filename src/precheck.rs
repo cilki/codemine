@@ -1,5 +1,7 @@
 //! Cheap preconditions for tasks that often have nothing to act on, so the
-//! runner redraws instead of burning an agent session discovering that.
+//! runner can tell before burning an agent session discovering it. The same
+//! probes decide priority: a gated task with work waiting outranks whatever a
+//! blind draw would have picked.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -14,30 +16,35 @@ pub fn gated(task: &str) -> bool {
     matches!(task, "feedback" | "rebase")
 }
 
-/// How many redraws before settling for an ungated task.
-const ATTEMPTS: usize = 5;
-
 /// Open PRs examined per repository; a repo with more open PRs than one page
 /// almost certainly has one behind its base anyway.
 const PR_LIMIT: usize = 20;
 
-/// Draw a (task, forge, repo) triple worth an agent turn: up to `ATTEMPTS`
-/// uniform draws, redrawing whenever a gated task's probe finds nothing, then
-/// one final draw restricted to ungated tasks. None only when every enabled
+/// Draw a (task, forge, repo) triple worth an agent turn. The gated tasks are
+/// probed first — every enabled one against every repository, in a shuffled
+/// order — and the first pair with work wins, so responsive work (a stale PR,
+/// a review comment) is never waiting on a lucky draw. Only once nothing is
+/// pending does an ungated task get drawn uniformly. None when every enabled
 /// task is gated and none has work.
 pub fn draw<'a>(
     tasks: &'a [String],
     pool: &'a [(&'a Forge, String)],
     check: impl Fn(&str, &Forge, &str) -> bool,
 ) -> Option<(&'a str, &'a Forge, &'a str)> {
-    for _ in 0..ATTEMPTS {
-        let task = tasks[fastrand::usize(..tasks.len())].as_str();
-        let (forge, repo) = &pool[fastrand::usize(..pool.len())];
-        if gated(task) && !check(task, forge, repo) {
-            info!("nothing for {task} on {repo}; redrawing");
-            continue;
+    let mut probes: Vec<(&'a str, &'a Forge, &'a str)> = tasks
+        .iter()
+        .filter(|task| gated(task))
+        .flat_map(|task| {
+            pool.iter()
+                .map(move |(forge, repo)| (task.as_str(), *forge, repo.as_str()))
+        })
+        .collect();
+    fastrand::shuffle(&mut probes);
+    for (task, forge, repo) in probes {
+        if check(task, forge, repo) {
+            return Some((task, forge, repo));
         }
-        return Some((task, forge, repo));
+        info!("nothing for {task} on {repo}");
     }
     let open: Vec<&String> = tasks.iter().filter(|task| !gated(task)).collect();
     if open.is_empty() {
@@ -309,6 +316,38 @@ mod tests {
             url: "https://github.com".into(),
             disabled_repos: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn draw_prefers_a_gated_task_that_has_work() {
+        let tasks = ["bump".to_owned(), "rebase".to_owned()];
+        let forge = forge();
+        let pool = [(&forge, "me/repo".to_owned())];
+        for _ in 0..16 {
+            let (task, ..) = draw(&tasks, &pool, |task, _, _| task == "rebase").unwrap();
+            assert_eq!(task, "rebase");
+        }
+    }
+
+    /// Every (gated task, repo) pair is probed before giving up on them.
+    #[test]
+    fn draw_probes_every_repository() {
+        let tasks = ["feedback".to_owned(), "rebase".to_owned()];
+        let forge = forge();
+        let pool = [
+            (&forge, "me/one".to_owned()),
+            (&forge, "me/two".to_owned()),
+            (&forge, "me/three".to_owned()),
+        ];
+        let seen = std::cell::RefCell::new(BTreeSet::new());
+        assert!(
+            draw(&tasks, &pool, |task, _, repo| {
+                seen.borrow_mut().insert(format!("{task} {repo}"));
+                false
+            })
+            .is_none()
+        );
+        assert_eq!(seen.borrow().len(), tasks.len() * pool.len());
     }
 
     #[test]

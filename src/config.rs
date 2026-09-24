@@ -190,6 +190,8 @@ pub struct Config {
     pub nice: Option<u8>,
     /// I/O scheduling class applied to the agent process tree.
     pub ionice: Option<IoClass>,
+    /// The daily window turns may start in.
+    pub schedule: crate::schedule::Schedule,
     /// Root of the persistent workspace where repositories stay cloned across
     /// turns.
     pub workspace: PathBuf,

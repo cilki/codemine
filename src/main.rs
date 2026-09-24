@@ -12,6 +12,7 @@ mod precheck;
 mod prompts;
 mod sandbox;
 mod scan;
+mod schedule;
 mod settings;
 mod status;
 mod turn;
@@ -136,6 +137,19 @@ fn main() -> Result<()> {
                 continue;
             }
             applied_generation = Some(generation);
+        }
+
+        // Off-hours holds come before the bucket so the allowance keeps
+        // growing across the closed stretch, the same as any idle time; a
+        // turn already under way is left to finish, since the window gates
+        // when turns start, not how long they may run.
+        if let Some(wait) = cfg.schedule.hold(schedule::local_second_of_day()) {
+            let until = status::epoch_now() + wait;
+            Status::update(&status, |s| s.activity = Activity::OffHours { until });
+            // Sliced like the rate-limit wait, so a widened window applies
+            // within a minute instead of at the end of the hold.
+            std::thread::sleep(Duration::from_secs(wait.min(60)));
+            continue;
         }
 
         let now = status::epoch_now();
