@@ -8,7 +8,7 @@
 //! from the turn output.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
@@ -58,6 +58,25 @@ pub fn credentials_stamp() -> SystemTime {
 /// access token with a live refresh token is the plugin's normal case.
 pub fn oauth_usable() -> bool {
     usable_at(&credentials_path())
+}
+
+/// How long ago the stored access token expired, in seconds — None when no
+/// expiry is stored or the token is still live. The expiry only moves
+/// forward on a successful refresh or a fresh login, so a large value while
+/// refreshes keep failing means the refresh token is dead no matter what
+/// the endpoint claims: Anthropic answers burned refresh tokens with 429
+/// rate limits rather than invalid_grant.
+pub fn token_expired_for() -> Option<u64> {
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    expired_for_at(&credentials_path(), now_ms)
+}
+
+fn expired_for_at(path: &Path, now_ms: u64) -> Option<u64> {
+    let expires_ms = read_json(path)?["claudeAiOauth"]["expiresAt"].as_u64()?;
+    (now_ms > expires_ms).then(|| (now_ms - expires_ms) / 1000)
 }
 
 fn usable_at(path: &Path) -> bool {
@@ -115,21 +134,42 @@ pub fn write_credentials(path: &Path, tokens: &Tokens) -> Result<()> {
     write_json_600(path, &blob)
 }
 
-/// Atomically replace `path` with `value` serialized, private to the owner.
-/// Readers (the plugin at turn start, the main loop every pass) only ever
-/// see the old or the new file, never a torn one.
+/// Replace `path` with `value` serialized, private to the owner. Atomic via
+/// rename when the filesystem allows it, so readers (the plugin at turn
+/// start, the main loop every pass) see the old or the new file, never a
+/// torn one. When `path` is itself a mountpoint — docker's single-file bind
+/// mount pins the inode and rename fails with EBUSY — the file is rewritten
+/// in place instead: a rare torn read beats losing a token rotation that
+/// can never be replayed.
 fn write_json_600(path: &Path, value: &serde_json::Value) -> Result<()> {
     let dir = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let bytes = serde_json::to_vec(value)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("failed to stage a file in {}", dir.display()))?;
-    file.write_all(&serde_json::to_vec(value)?)?;
+    file.write_all(&bytes)?;
     file.as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.persist(path)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
+    if let Err(persist) = file.persist(path) {
+        tracing::warn!(
+            "rewriting {} in place; it couldn't be replaced: {}",
+            path.display(),
+            persist.error
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to rewrite {}", path.display()))?;
+        file.write_all(&bytes)?;
+        // create's mode only applies to new files; existing ones keep
+        // whatever they had.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -771,5 +811,24 @@ mod tests {
         let connected = health_at(&creds, &log);
         assert!(connected.connected);
         assert_eq!(connected.expires_at, Some(123));
+    }
+
+    #[test]
+    fn expired_for_measures_past_expiry_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = dir.path().join(".credentials.json");
+        // No file, no expiry to measure against.
+        assert_eq!(expired_for_at(&creds, 5_000), None);
+
+        std::fs::write(
+            &creds,
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":10000}}"#,
+        )
+        .unwrap();
+        // Still live, and exactly-at-expiry counts as live.
+        assert_eq!(expired_for_at(&creds, 5_000), None);
+        assert_eq!(expired_for_at(&creds, 10_000), None);
+        // Expired: reported in whole seconds.
+        assert_eq!(expired_for_at(&creds, 13_000), Some(3));
     }
 }

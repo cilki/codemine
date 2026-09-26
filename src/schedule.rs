@@ -89,9 +89,8 @@ pub fn local_second_of_day() -> u32 {
         // Only a broken zone database gets here; UTC beats no schedule.
         return (now % SECONDS_PER_DAY as u64) as u32;
     }
-    let second = tm.tm_hour.max(0) as u32 * 3600
-        + tm.tm_min.max(0) as u32 * 60
-        + tm.tm_sec.max(0) as u32;
+    let second =
+        tm.tm_hour.max(0) as u32 * 3600 + tm.tm_min.max(0) as u32 * 60 + tm.tm_sec.max(0) as u32;
     // A leap second lands on 60, which belongs to the day that is ending.
     second.min(SECONDS_PER_DAY - 1)
 }

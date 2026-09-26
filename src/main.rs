@@ -20,7 +20,6 @@ mod usage;
 mod webui;
 mod workspace;
 
-use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -35,7 +34,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Cli, Config, ForgeKind, USAGE};
 use crate::settings::{Problem, SettingsStore};
-use crate::status::{Activity, Shared, Status};
+use crate::status::{Activity, Allowance, Shared, Status};
 use crate::turn::Backoff;
 
 fn main() -> Result<()> {
@@ -55,7 +54,12 @@ fn main() -> Result<()> {
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
     let status = Shared::new();
-    let addr = webui::spawn(cli.listen, status.clone(), store.clone())?;
+    let addr = webui::spawn(
+        cli.listen,
+        status.clone(),
+        store.clone(),
+        cli.workspace.clone(),
+    )?;
     info!("webui listening on http://{addr}");
 
     // Warm the model listing off the startup path: `opencode models` can
@@ -65,8 +69,6 @@ fn main() -> Result<()> {
         .name("models".into())
         .spawn(|| drop(config::models()))?;
 
-    // Epochs of completed turns, for the UI's trailing-hour count.
-    let mut completions: VecDeque<u64> = VecDeque::new();
     // Turns available to spend right now. The bucket refills at the
     // configured rate and holds at most an hour's worth, so a limit of 2
     // runs two turns back to back and then one every half hour. It starts
@@ -156,13 +158,9 @@ fn main() -> Result<()> {
         // The bucket's clock advances every pass, so the time it grew for is
         // counted once whether or not this pass gets to run a turn.
         let since = std::mem::replace(&mut refilled, now);
-        let recent = prune_completions(&mut completions, now);
-        Status::update(&status, |s| {
-            s.completed_last_hour = recent;
-            s.hourly_limit = cfg.hourly_limit;
-        });
         if let Some(limit) = cfg.hourly_limit {
             allowance = refill(allowance, since, now, limit);
+            Status::update(&status, |s| s.allowance = Some(spendable(allowance, limit)));
             if allowance < 1.0 {
                 // Whole seconds rounded up, so the wait can't expire a hair
                 // early and spin the loop.
@@ -176,6 +174,8 @@ fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_secs(wait.min(60)));
                 continue;
             }
+        } else {
+            Status::update(&status, |s| s.allowance = None);
         }
 
         match turn::run(&cfg, &status) {
@@ -189,7 +189,11 @@ fn main() -> Result<()> {
                 {
                     error!("failed to reconcile Claude credentials: {err:#}");
                 }
-                if let Some(wait) = gate_retry(&report.refresh, report.oauth_revoked) {
+                if let Some(wait) = gate_retry(
+                    &report.refresh,
+                    report.oauth_revoked,
+                    claude::token_expired_for(),
+                ) {
                     let until = status::epoch_now() + wait;
                     error!(
                         "the turn died on Claude OAuth ({:?}); holding turns until {} \
@@ -202,15 +206,13 @@ fn main() -> Result<()> {
                     Status::update(&status, |s| s.oauth_gated_until = Some(until));
                 }
                 if report.completed {
-                    let at = status::epoch_now();
-                    completions.push_back(at);
-                    let recent = prune_completions(&mut completions, at);
-                    Status::update(&status, |s| s.completed_last_hour = recent);
                     allowance -= 1.0;
                     if let Some(limit) = cfg.hourly_limit {
+                        let left = spendable(allowance, limit);
+                        Status::update(&status, |s| s.allowance = Some(left));
                         info!(
-                            "completed {recent} tasks in the last hour; {allowance:.1} of {} turns left at {limit}/hour",
-                            capacity(limit)
+                            "{:.1} of {} turns left at {limit}/hour",
+                            left.available, left.capacity
                         );
                     }
                 }
@@ -245,14 +247,24 @@ const HOUR: f64 = 3600.0;
 /// during an otherwise-working turn isn't worth pausing for — and the
 /// verdict then picks the duration. Every gate also clears the moment the
 /// credentials file is rewritten by a new login.
-fn gate_retry(refresh: &claude::Refresh, scan_hit: bool) -> Option<u64> {
+fn gate_retry(refresh: &claude::Refresh, scan_hit: bool, expired_for: Option<u64>) -> Option<u64> {
     if !scan_hit {
         return None;
     }
+    // Anthropic's token endpoint reports a dead refresh token as a 429 rate
+    // limit rather than invalid_grant, so a "transient" failure that has
+    // outlived the access token by hours is terminal in all but name. Real
+    // rate limits and outages clear well within the grace period, and a
+    // fresh login clears the long gate instantly through the file watch.
+    const DEAD_TOKEN_GRACE: u64 = 2 * 60 * 60;
+    let long_dead = expired_for.is_some_and(|dead| dead > DEAD_TOKEN_GRACE);
     Some(match refresh {
         // A rejected refresh token only a new login can fix: the deadline is
         // a rare just-in-case retry, the file watch is the real exit.
         claude::Refresh::Terminal { .. } => 6 * 60 * 60,
+        claude::Refresh::Transient { .. } | claude::Refresh::Unavailable if long_dead => {
+            6 * 60 * 60
+        }
         // A rate limit or outage passes on its own.
         claude::Refresh::Transient { .. } | claude::Refresh::Unavailable => 5 * 60,
         // No verdict (plugin too old to log one, or an API-side revocation
@@ -269,23 +281,21 @@ fn capacity(limit: f64) -> f64 {
     limit.floor().max(1.0)
 }
 
+/// The bucket as the page shows it. The allowance is clamped at zero: a turn
+/// that just spent the last of it leaves a hair less than none behind, and
+/// "-0.0 of 2" reads as a bug.
+fn spendable(allowance: f64, limit: f64) -> Allowance {
+    Allowance {
+        available: allowance.max(0.0),
+        capacity: capacity(limit),
+    }
+}
+
 /// The allowance grown for the time since it was last topped up, capped at
 /// the bucket's capacity so an idle runner banks at most one hour.
 fn refill(allowance: f64, since: u64, now: u64, limit: f64) -> f64 {
     let earned = now.saturating_sub(since) as f64 * limit / HOUR;
     (allowance + earned).min(capacity(limit))
-}
-
-/// Drop completions older than an hour and report how many are left, for the
-/// UI's counter.
-fn prune_completions(completions: &mut VecDeque<u64>, now: u64) -> u32 {
-    while completions
-        .front()
-        .is_some_and(|&at| now.saturating_sub(at) >= HOUR as u64)
-    {
-        completions.pop_front();
-    }
-    completions.len() as u32
 }
 
 /// Send logs to stderr at info and above, overridable per-module with
@@ -516,30 +526,62 @@ mod tests {
     fn oauth_gate_follows_the_refresh_verdict() {
         use crate::claude::Refresh;
         // No auth failure in the turn log: never gate, whatever the verdict.
-        assert_eq!(gate_retry(&Refresh::Terminal { reason: None }, false), None);
-        assert_eq!(gate_retry(&Refresh::Ok, false), None);
+        assert_eq!(
+            gate_retry(&Refresh::Terminal { reason: None }, false, None),
+            None
+        );
+        assert_eq!(gate_retry(&Refresh::Ok, false, None), None);
         // A flagged turn gates for as long as the verdict warrants.
         assert_eq!(
-            gate_retry(&Refresh::Terminal { reason: None }, true),
+            gate_retry(&Refresh::Terminal { reason: None }, true, None),
             Some(6 * 60 * 60)
         );
         assert_eq!(
-            gate_retry(&Refresh::Transient { reason: None }, true),
+            gate_retry(&Refresh::Transient { reason: None }, true, None),
             Some(5 * 60)
         );
-        assert_eq!(gate_retry(&Refresh::Unavailable, true), Some(5 * 60));
-        assert_eq!(gate_retry(&Refresh::NoData, true), Some(30 * 60));
-        assert_eq!(gate_retry(&Refresh::Ok, true), Some(30 * 60));
+        assert_eq!(gate_retry(&Refresh::Unavailable, true, None), Some(5 * 60));
+        assert_eq!(gate_retry(&Refresh::NoData, true, None), Some(30 * 60));
+        assert_eq!(gate_retry(&Refresh::Ok, true, None), Some(30 * 60));
     }
 
     #[test]
-    fn only_the_last_hour_of_completions_counts() {
-        let mut completions: VecDeque<u64> = VecDeque::from([1_000, 4_000, 4_500]);
-        // 1_000 is still inside the hour here, and an hour old at 4_600.
-        assert_eq!(prune_completions(&mut completions, 4_500), 3);
-        assert_eq!(prune_completions(&mut completions, 4_600), 2);
-        assert_eq!(prune_completions(&mut completions, 7_000), 2);
+    fn oauth_gate_treats_a_long_expired_transient_as_terminal() {
+        use crate::claude::Refresh;
+        let transient = Refresh::Transient {
+            reason: Some("rate_limit_error".into()),
+        };
+        // Freshly expired: still a plausible rate limit, keep the quick retry.
+        assert_eq!(gate_retry(&transient, true, Some(60)), Some(5 * 60));
+        assert_eq!(
+            gate_retry(&transient, true, Some(2 * 60 * 60)),
+            Some(5 * 60)
+        );
+        // Hours past expiry with refreshes still failing: the endpoint is
+        // tarpitting a dead refresh token, so gate like a terminal verdict.
+        assert_eq!(
+            gate_retry(&transient, true, Some(2 * 60 * 60 + 1)),
+            Some(6 * 60 * 60)
+        );
+        assert_eq!(
+            gate_retry(&Refresh::Unavailable, true, Some(3 * 60 * 60)),
+            Some(6 * 60 * 60)
+        );
+        // The no-verdict fallbacks are left alone: without a failing refresh
+        // on record, a stale expiry proves nothing.
+        assert_eq!(
+            gate_retry(&Refresh::NoData, true, Some(3 * 60 * 60)),
+            Some(30 * 60)
+        );
+    }
 
-        assert_eq!(prune_completions(&mut completions, 100_000), 0);
+    #[test]
+    fn the_bucket_never_shows_a_negative_allowance() {
+        // The turn that spends the last whole turn leaves a sliver behind.
+        let left = spendable(-0.000_001, 2.0);
+        assert_eq!(left.available, 0.0);
+        assert_eq!(left.capacity, 2.0);
+        // A fractional limit still holds one turn, so the page reads "1 / 1".
+        assert_eq!(spendable(1.0, 0.25).capacity, 1.0);
     }
 }

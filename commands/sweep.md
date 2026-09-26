@@ -34,6 +34,14 @@ Execute only the assigned task, described below. If there is nothing to do for
 it on the assigned repository, skip the turn — do not switch to a different
 task or repository.
 
+Only open a pull request for a change worth a reviewer's time. Trivial changes
+are worse than no change at all: dropping an unused import, tweaking a comment,
+reformatting or reordering code, renaming a local, or moving code around
+without changing what it does. None of those justify a PR on their own — they
+are welcome only as incidental parts of a change that stands by itself. When
+the only thing you can find on the assigned repository is that kind of
+housekeeping, skip the turn.
+
 Always end your final message with exactly one of these two marker lines:
 a line starting with exactly `TASK COMPLETED` if you changed anything on the
 forge (pushed commits, opened or updated a PR or issue), or a line starting
@@ -66,6 +74,9 @@ the user decide what to do.
 - Search for dead code and remove it
 - Search for implementations that could be simplified
 - Remove useless or trivial tests
+- Look for real complexity to remove — a shorter, clearer implementation, a
+  redundant abstraction collapsed, a duplicated code path unified. Cosmetic
+  tidying is not simplification; skip the turn if that is all you find
 
 ## "todo"
 

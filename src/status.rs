@@ -127,6 +127,14 @@ pub enum Activity {
     },
 }
 
+/// The turn budget the hourly limit hands out: how many turns may start
+/// right now, out of how many the bucket holds when full.
+#[derive(Serialize, Clone, Copy)]
+pub struct Allowance {
+    pub available: f64,
+    pub capacity: f64,
+}
+
 #[derive(Serialize, Clone, Default)]
 pub struct Totals {
     pub turns: u64,
@@ -151,10 +159,9 @@ pub struct Status {
     /// clears the flag when the next turn starts.
     #[serde(skip)]
     pub cancel_requested: bool,
-    /// Turns completed in the last hour, for display; the limit itself is
-    /// enforced as a minimum spacing between turns.
-    pub completed_last_hour: u32,
-    pub hourly_limit: Option<f64>,
+    /// The hourly limit's bucket, as the page shows it; None when no limit
+    /// is configured and turns run back to back.
+    pub allowance: Option<Allowance>,
     pub totals: Totals,
     /// Every turn finished since startup, newest first; the process owns no
     /// history across restarts, so this is the whole list the UI shows.
@@ -175,8 +182,7 @@ impl Shared {
                 activity: Activity::Starting,
                 paused: false,
                 cancel_requested: false,
-                completed_last_hour: 0,
-                hourly_limit: None,
+                allowance: None,
                 totals: Totals::default(),
                 turns: VecDeque::new(),
                 log_tail: String::new(),

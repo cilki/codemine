@@ -2,6 +2,8 @@
 //! Everything is best-effort: a field that can't be read just comes back
 //! empty or zero and the page shows a dash.
 
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -22,11 +24,18 @@ pub struct Host {
     pub mem_available: u64,
     /// Degrees Celsius; None when no sensor is exposed.
     pub temp_c: Option<f32>,
+    /// Bytes on the filesystem holding the workspace, where the clones and
+    /// turn logs pile up. Both zero when it can't be measured.
+    pub disk_total: u64,
+    pub disk_available: u64,
     pub uptime_secs: u64,
 }
 
-pub fn snapshot() -> Host {
+/// `workspace` picks the filesystem the disk figures describe; everything
+/// else is the host as a whole.
+pub fn snapshot(workspace: &Path) -> Host {
     let (mem_total, mem_available) = mem_info();
+    let (disk_total, disk_available) = disk_info(workspace);
     Host {
         hostname: read_trimmed("/proc/sys/kernel/hostname"),
         ip: local_ip(),
@@ -35,6 +44,8 @@ pub fn snapshot() -> Host {
         mem_total,
         mem_available,
         temp_c: cpu_temp(),
+        disk_total,
+        disk_available,
         uptime_secs: read_trimmed("/proc/uptime")
             .split_whitespace()
             .next()
@@ -158,6 +169,28 @@ fn mem_info() -> (u64, u64) {
     (field("MemTotal:"), field("MemAvailable:"))
 }
 
+/// Size and free space of the filesystem `path` lives on, in bytes. The
+/// free figure is what an unprivileged writer may actually use, so it leaves
+/// out the root reserve.
+fn disk_info(path: &Path) -> (u64, u64) {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return (0, 0);
+    };
+    // SAFETY: the path is a valid C string and statvfs only writes the
+    // zeroed struct it is handed.
+    let stat = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(path.as_ptr(), &mut stat) != 0 {
+            return (0, 0);
+        }
+        stat
+    };
+    // f_frsize is the fragment size the block counts are in; f_bsize is only
+    // the preferred IO size and the two can differ.
+    let block = stat.f_frsize as u64;
+    (stat.f_blocks as u64 * block, stat.f_bavail as u64 * block)
+}
+
 /// The CPU's thermal zone if one is labeled as such, else any zone at all.
 fn cpu_temp() -> Option<f32> {
     let mut fallback = None;
@@ -188,12 +221,14 @@ mod tests {
 
     #[test]
     fn snapshot_reads_the_linux_procfs() {
-        let host = snapshot();
+        let host = snapshot(Path::new("/"));
         assert!(!host.hostname.is_empty());
         assert!(host.cpus > 0);
         assert!(host.mem_total > 0);
         assert!(host.mem_available <= host.mem_total);
         assert!(host.uptime_secs > 0);
+        assert!(host.disk_total > 0);
+        assert!(host.disk_available <= host.disk_total);
         let usage = host
             .cpu_usage
             .expect("the first call measures its own window");

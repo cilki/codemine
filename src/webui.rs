@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::ForgeKind;
 use crate::settings::{Settings, SharedSettings};
-use crate::status::{Activity, Shared, Status, epoch_now};
+use crate::status::{Activity, Allowance, Shared, Status, epoch_now};
 
 /// How often the live log tail is re-read and the host details refreshed.
 /// Status updates are pushed the moment they happen; a log file growing or a
@@ -50,6 +51,9 @@ struct AppState {
     status: Shared,
     settings: SharedSettings,
     login: Arc<Mutex<Option<PendingLogin>>>,
+    /// The workspace root, which is all the page wants of it: the disk
+    /// figures in the host details describe the filesystem it sits on.
+    workspace: PathBuf,
 }
 
 /// The pending login, poison-tolerant like every other lock in the runner.
@@ -62,7 +66,12 @@ fn pending(login: &Mutex<Option<PendingLogin>>) -> std::sync::MutexGuard<'_, Opt
 /// Bind and serve on a background thread. Binding happens synchronously so a
 /// bad address fails startup instead of silently serving nothing; the bound
 /// address is returned for logging.
-pub fn spawn(addr: SocketAddr, status: Shared, settings: SharedSettings) -> Result<SocketAddr> {
+pub fn spawn(
+    addr: SocketAddr,
+    status: Shared,
+    settings: SharedSettings,
+    workspace: PathBuf,
+) -> Result<SocketAddr> {
     let listener = std::net::TcpListener::bind(addr)
         .with_context(|| format!("failed to bind webui on {addr}"))?;
     let local = listener.local_addr()?;
@@ -83,6 +92,7 @@ pub fn spawn(addr: SocketAddr, status: Shared, settings: SharedSettings) -> Resu
                         status,
                         settings,
                         login: Arc::new(Mutex::new(None)),
+                        workspace,
                     },
                 ))
                 .expect("webui server failed");
@@ -129,8 +139,8 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 /// A fresh host-details snapshot; the event stream pushes the same shape.
-async fn api_host() -> Json<crate::host::Host> {
-    Json(crate::host::snapshot())
+async fn api_host(State(state): State<AppState>) -> Json<crate::host::Host> {
+    Json(crate::host::snapshot(&state.workspace))
 }
 
 /// The live log tail while a turn is running, else the last finished turn's.
@@ -178,8 +188,8 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                 serde_json::to_string(&status_value(&state.status)).unwrap_or_else(|_| "{}".into());
             let log =
                 serde_json::to_string(&log_tail(&state.status)).unwrap_or_else(|_| "\"\"".into());
-            let host =
-                serde_json::to_string(&crate::host::snapshot()).unwrap_or_else(|_| "{}".into());
+            let host = serde_json::to_string(&crate::host::snapshot(&state.workspace))
+                .unwrap_or_else(|_| "{}".into());
             // Re-derived from two small files each tick, like the host
             // snapshot: the main loop is inside a turn for hours at a time,
             // so auth health can't ride the status it owns.
@@ -283,10 +293,19 @@ async fn api_put_settings(
     {
         Ok(()) => {
             let (settings, _) = state.settings.snapshot();
-            // The main loop only mirrors the limit into the status at the
-            // next turn boundary; reflect it now so the page's counter
-            // doesn't lag a running turn.
-            Status::update(&state.status, |s| s.hourly_limit = settings.hourly_limit);
+            // The main loop only mirrors the bucket into the status at the
+            // next turn boundary; reflect the new ceiling now so the page's
+            // counter doesn't lag a running turn. What the bucket already
+            // holds is kept, trimmed to a capacity that just shrank.
+            let capacity = settings.hourly_limit.map(crate::capacity);
+            Status::update(&state.status, |s| {
+                s.allowance = capacity.map(|capacity| Allowance {
+                    available: s
+                        .allowance
+                        .map_or(capacity, |held| held.available.min(capacity)),
+                    capacity,
+                })
+            });
             Json(settings.redacted()).into_response()
         }
         Err(err) => (
@@ -506,7 +525,13 @@ mod tests {
     fn serve_in_tempdir() -> (SocketAddr, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
-        let addr = spawn("127.0.0.1:0".parse().unwrap(), Shared::new(), store).unwrap();
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            Shared::new(),
+            store,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
         (addr, dir)
     }
 
@@ -548,9 +573,10 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
         // The hourly limit lands in the status right away, not at the next
-        // turn boundary.
+        // turn boundary; half a turn an hour still buys a bucket of one.
         let status = body_json(&request(addr, "GET", "/api/status", ""));
-        assert_eq!(status["hourly_limit"], 0.5);
+        assert_eq!(status["allowance"]["capacity"], 1.0);
+        assert_eq!(status["allowance"]["available"], 1.0);
         let value = body_json(&response);
         assert_eq!(value["github"]["token_set"], true);
         assert!(value["github"].get("token").is_none());
@@ -589,7 +615,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
         let status = Shared::new();
-        let addr = spawn("127.0.0.1:0".parse().unwrap(), status.clone(), store).unwrap();
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            status.clone(),
+            store,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
 
         // Nothing running: the toggle has nothing to signal.
         let response = request(addr, "PUT", "/api/paused", r#"{"paused":true}"#);
@@ -638,7 +670,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
         let status = Shared::new();
-        let addr = spawn("127.0.0.1:0".parse().unwrap(), status.clone(), store).unwrap();
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            status.clone(),
+            store,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
 
         // Nothing running: nothing to cancel.
         let response = request(addr, "POST", "/api/cancel", "");
@@ -728,7 +766,13 @@ mod tests {
             })
         });
         let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
-        let addr = spawn("127.0.0.1:0".parse().unwrap(), status, store).unwrap();
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            status,
+            store,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
 
         // The full log comes back raw, ANSI escapes included.
         let response = request(addr, "GET", "/api/turns/100/log", "");

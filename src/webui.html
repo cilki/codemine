@@ -229,7 +229,7 @@
 
   <div class="stats">
     <div class="stat"><div class="stat-label" id="stat-state-label">Runner</div><div class="stat-value" id="stat-state">–</div></div>
-    <div class="stat"><div class="stat-label">Past hour</div><div class="stat-value" id="stat-hour">–</div></div>
+    <div class="stat"><div class="stat-label">Hourly limit</div><div class="stat-value" id="stat-allowance">–</div></div>
     <div class="stat"><div class="stat-label">Completed</div><div class="stat-value" id="stat-completed">–</div></div>
     <div class="stat"><div class="stat-label">Skipped</div><div class="stat-value" id="stat-skipped">–</div></div>
     <div class="stat"><div class="stat-label">Failed</div><div class="stat-value" id="stat-failed">–</div></div>
@@ -324,6 +324,19 @@
 
   const tokenTotal = t => t.input + t.output + t.reasoning + t.cache_read + t.cache_write;
 
+  // The running turn's newest token sample, by the turn it belongs to.
+  // Sampling can come up empty — opencode's session store is mid-write, say —
+  // and a figure that blinks out and back reads as a glitch, so the last
+  // value seen stands in until a fresher one lands. A new turn starts over
+  // rather than inheriting its predecessor's total.
+  let lastTokens = null;
+
+  function liveTokens(a) {
+    if (a.state !== "running") return null;
+    if (a.tokens) lastTokens = { started: a.started, tokens: a.tokens };
+    return lastTokens && lastTokens.started === a.started ? lastTokens.tokens : null;
+  }
+
   const tokenBreakdown = t =>
     "input " + fmtTokens(t.input) + " · output " + fmtTokens(t.output)
       + " · reasoning " + fmtTokens(t.reasoning)
@@ -344,9 +357,18 @@
     return (u ? n.toFixed(1) : n) + " " + units[u];
   }
 
+  // The bucket refills continuously, so its figures are fractional; one
+  // decimal shows it climbing without the tile jittering on a last digit
+  // nobody reads. A whole number stays whole.
+  const fmtTurns = n => (Math.round(n * 10) / 10).toFixed(1).replace(/\.0$/, "");
+
+  // The two largest units that carry information, so a week of uptime reads
+  // as "7d 3h" rather than 171 hours.
   function fmtDuration(secs) {
     secs = Math.max(0, Math.round(secs));
-    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+    const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60), s = secs % 60;
+    if (d) return d + "d " + h + "h";
     if (h) return h + "h " + m + "m";
     if (m) return m + "m " + s + "s";
     return s + "s";
@@ -356,6 +378,7 @@
   // small box with the state and a second figure only adds noise.
   function fmtCoarse(secs) {
     secs = Math.max(0, Math.round(secs));
+    if (secs >= 86400) return Math.floor(secs / 86400) + "d";
     if (secs >= 3600) return Math.floor(secs / 3600) + "h";
     if (secs >= 60) return Math.floor(secs / 60) + "m";
     return secs + "s";
@@ -417,8 +440,9 @@
     if (elapsed && a.state === "running") {
       // Tokens sit beside the clock because the row's other slot is the
       // turn's identity; they only move when a new sample lands.
+      const tokens = liveTokens(a);
       elapsed.textContent = fmtDuration(serverNow() - a.started)
-        + (a.tokens ? " · " + fmtTokens(tokenTotal(a.tokens)) + " tokens" : "");
+        + (tokens ? " · " + fmtTokens(tokenTotal(tokens)) + " tokens" : "");
     }
   }
 
@@ -436,15 +460,19 @@
     $("cancel").disabled = a.state === "running" && a.started === canceling;
     renderClock();
 
-    $("stat-hour").textContent =
-      state.completed_last_hour + " / " + (state.hourly_limit ?? "∞");
+    // Turns the rate limiter will let through right now, out of what its
+    // bucket holds when full; no limit configured means no bucket.
+    const bucket = state.allowance;
+    $("stat-allowance").textContent = bucket
+      ? fmtTurns(bucket.available) + " / " + fmtTurns(bucket.capacity) : "∞";
     $("stat-completed").textContent = state.totals.completed;
     $("stat-skipped").textContent = state.totals.skipped;
     $("stat-failed").textContent = state.totals.failed + state.totals.timeout;
     // The in-flight turn's tally is not in the totals yet, so it is added
     // here; the stat then climbs during a turn instead of jumping at its end.
+    const running = liveTokens(a);
     const spent = (state.totals.tokens ? tokenTotal(state.totals.tokens) : 0)
-      + (a.state === "running" && a.tokens ? tokenTotal(a.tokens) : 0);
+      + (running ? tokenTotal(running) : 0);
     $("stat-tokens").textContent = spent ? fmtTokens(spent) : "–";
 
     const rows = state.turns.map(turn => {
@@ -467,7 +495,7 @@
       // nothing older is being viewed.
       if (viewing === null) row.className = "turn selected";
       row.querySelector(".turn-meta").lastChild.id = "running-elapsed";
-      if (a.tokens) row.title = tokenBreakdown(a.tokens);
+      if (running) row.title = tokenBreakdown(running);
       row.onclick = viewLive;
       rows.unshift(row);
     }
@@ -667,11 +695,17 @@
   function renderHost(h) {
     const memory = h.mem_total
       ? fmtBytes(h.mem_total - h.mem_available) + " / " + fmtBytes(h.mem_total) : "–";
+    // The workspace's filesystem: used against its size, like memory. Free
+    // space is what an unprivileged writer may take, so the used figure
+    // carries the root reserve with it.
+    const storage = h.disk_total
+      ? fmtBytes(h.disk_total - h.disk_available) + " / " + fmtBytes(h.disk_total) : "–";
     const temp = h.temp_c == null ? "" : " (" + Math.round(h.temp_c) + " °C)";
     const items = [
       ["ip", h.ip || "–"],
       ["cpu", (h.cpu_usage == null ? "–" : Math.round(h.cpu_usage) + "%") + temp],
       ["memory", memory],
+      ["storage", storage],
       ["uptime", fmtDuration(h.uptime_secs)],
     ];
     $("host-name").textContent = h.hostname || "–";
@@ -1020,8 +1054,16 @@
       text = "refresh failing" + (h.refresh.reason ? ` (${h.refresh.reason})` : "") + " — reconnect";
       cls = "err";
     } else if (h.refresh.state === "transient" || h.refresh.state === "unavailable") {
-      text = "refresh hiccup — retrying";
-      cls = "warn";
+      // Anthropic reports dead refresh tokens as 429 rate limits, so a
+      // "transient" failure hours past the access token's expiry is really
+      // a dead login (mirrors gate_retry's grace period).
+      if (h.expires_at && Date.now() - h.expires_at > 2 * 3600 * 1000) {
+        text = "refresh failing" + (h.refresh.reason ? ` (${h.refresh.reason})` : "") + " — reconnect";
+        cls = "err";
+      } else {
+        text = "refresh hiccup — retrying";
+        cls = "warn";
+      }
     } else {
       text = "connected";
       status.title = h.expires_at

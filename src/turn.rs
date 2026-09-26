@@ -268,7 +268,10 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
         }
     };
 
-    let tokens = crate::usage::collect_since(started_wall);
+    // The last reading can fail like any other (opencode mid-write, or its
+    // database gone with the session); the samples taken while the turn ran
+    // are the next best figure, and better than a row with no cost on it.
+    let tokens = crate::usage::collect_since(started_wall).or(sampled);
     Status::update(status, |s| {
         s.paused = false;
         s.log_tail = last_lines(&tail, 100).to_owned();
