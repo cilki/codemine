@@ -10,6 +10,11 @@ use cilki::emblem::{CODEMINE, Emblem};
 /// The emblem SVG, rendered once on first use.
 pub static SVG: LazyLock<String> = LazyLock::new(|| render(&CODEMINE));
 
+/// Just the icon, recolored, for the favicon.
+pub static ICON: LazyLock<String> = LazyLock::new(|| {
+    CODEMINE.icon[CODEMINE.icon.find("<svg").unwrap_or(0)..].replace("#000000", CODEMINE.color)
+});
+
 fn render(emblem: &Emblem) -> String {
     let side = emblem.rect_side_px;
     let step = side + emblem.rect_gap_px;

@@ -38,7 +38,11 @@ pub struct Report {
 /// Run one opencode turn against the repository's persistent workspace clone
 /// and report how it went. The workspace survives across turns, and so does
 /// the turn's log under `<workspace>/logs`, for as long as the process runs.
-pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
+pub fn run(
+    cfg: &Config,
+    status: &crate::status::Shared,
+    pending: &crate::events::Pending,
+) -> Result<Report> {
     let mut pool = Vec::new();
     for forge in &cfg.forges {
         pool.extend(
@@ -58,7 +62,33 @@ pub fn run(cfg: &Config, status: &crate::status::Shared) -> Result<Report> {
             canceled: false,
         });
     }
-    let Some((task, forge, repo)) = precheck::draw(&cfg.tasks, &pool, precheck::actionable) else {
+    // Fresh forge activity jumps the queue: the watcher saw a comment land,
+    // so that repository gets a feedback turn ahead of the random draw.
+    // Entries that no longer check out (repository disabled or gone, the
+    // feedback already handled, the task since disabled) are dropped rather
+    // than requeued — the ordinary draw probes feedback anyway.
+    let feedback = cfg.tasks.iter().any(|task| task == "feedback");
+    let mut urgent = None;
+    while let Some((kind, repo)) = pending.pop() {
+        if !feedback {
+            continue;
+        }
+        let Some((forge, repo)) = pool
+            .iter()
+            .find(|(forge, name)| forge.kind == kind && *name == repo)
+            .map(|(forge, name)| (*forge, name.as_str()))
+        else {
+            continue;
+        };
+        if precheck::actionable("feedback", forge, repo) {
+            info!("fresh activity on {repo}; drawing it first");
+            urgent = Some(("feedback", forge, repo));
+            break;
+        }
+    }
+    let Some((task, forge, repo)) =
+        urgent.or_else(|| precheck::draw(&cfg.tasks, &pool, precheck::actionable))
+    else {
         warn!("every enabled task is precondition-gated and has nothing to do");
         return Ok(Report {
             backoff: Backoff::Normal,

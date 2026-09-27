@@ -7,6 +7,7 @@
 mod claude;
 mod config;
 mod emblem;
+mod events;
 mod host;
 mod precheck;
 mod prompts;
@@ -26,7 +27,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use tracing::{error, info};
@@ -69,6 +70,12 @@ fn main() -> Result<()> {
         .name("models".into())
         .spawn(|| drop(config::models()))?;
 
+    // Watch the forges for activity: a comment on a PR or issue queues that
+    // repository for a feedback turn ahead of the draw, and ends the
+    // between-turn sleep early.
+    let pending = events::Pending::new();
+    events::spawn(store.clone(), pending.clone())?;
+
     // Turns available to spend right now. The bucket refills at the
     // configured rate and holds at most an hour's worth, so a limit of 2
     // runs two turns back to back and then one every half hour. It starts
@@ -85,7 +92,9 @@ fn main() -> Result<()> {
     loop {
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
-        if let Some((stamp, retry_at)) = revoked {
+        // With the Claude section disabled nothing runs anyway (problems()
+        // says so), so the credentials file is left entirely unchecked.
+        if let Some((stamp, retry_at)) = revoked.filter(|_| settings.claude.enabled) {
             if claude::credentials_stamp() != stamp {
                 info!("Claude credentials were replaced; resuming turns");
                 // Whatever wrote the file — the web UI login, an external
@@ -107,7 +116,7 @@ fn main() -> Result<()> {
                 Status::update(&status, |s| s.oauth_gated_until = None);
             }
         }
-        if !claude::oauth_usable() {
+        if settings.claude.enabled && !claude::oauth_usable() {
             problems.push(Problem::new(
                 "claude-card",
                 "no Claude account is connected; connect one in settings",
@@ -178,7 +187,7 @@ fn main() -> Result<()> {
             Status::update(&status, |s| s.allowance = None);
         }
 
-        match turn::run(&cfg, &status) {
+        match turn::run(&cfg, &status, &pending) {
             Ok(report) => {
                 // The plugin may have rotated the token mid-turn and only
                 // managed to park the new pair in opencode's auth.json;
@@ -222,7 +231,7 @@ fn main() -> Result<()> {
                     // backoff still holds, since retrying early just burns
                     // the next turn on the same limit.
                     Backoff::Normal if report.canceled => {}
-                    backoff => sleep(&cli, backoff, &status)?,
+                    backoff => sleep(&cli, backoff, &status, &pending)?,
                 }
             }
             // A failing turn (bad token, unreachable forge, ...) must not
@@ -230,7 +239,7 @@ fn main() -> Result<()> {
             Err(err) => {
                 error!("turn failed: {err:#}");
                 Status::update(&status, |s| s.log_tail = format!("turn failed: {err:#}"));
-                sleep(&cli, Backoff::Normal, &status)?;
+                sleep(&cli, Backoff::Normal, &status, &pending)?;
             }
         }
         if cli.once {
@@ -457,7 +466,12 @@ fn run(command: &mut Command) -> Result<()> {
 /// When the usage window is exhausted, Anthropic reports the epoch at which it
 /// reopens; wait for that instead of burning turns until then. Otherwise pause
 /// just long enough to keep a failing run from spinning the loop.
-fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared) -> Result<()> {
+fn sleep(
+    cli: &Cli,
+    backoff: Backoff,
+    status: &status::Shared,
+    pending: &events::Pending,
+) -> Result<()> {
     if cli.once {
         return Ok(());
     }
@@ -482,7 +496,21 @@ fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared) -> Result<()> {
             },
         };
     });
-    std::thread::sleep(Duration::from_secs(seconds));
+    // Sliced, so fresh forge activity starts the next turn right away
+    // instead of waiting out the pause. The usage-limit hold is slept out in
+    // full: nothing can run before the window reopens.
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        if !limited && !pending.is_empty() {
+            info!("forge activity; ending the sleep early");
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left.min(Duration::from_secs(5)));
+    }
     Ok(())
 }
 

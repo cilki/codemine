@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>codemine</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   /* Copper, following the cilki emblem palette's #c8__37 family. */
   :root {
@@ -178,13 +179,16 @@
      collapsed panel has to advertise that there is something to fix. */
   .field input.invalid, .field select.invalid { border-color: #e74c3c; }
   .forges.invalid { outline: 1px solid #e74c3c; outline-offset: 8px; }
-  /* The settings live in a modal so they never overlap the main content. */
+  /* The settings live in a modal so they never overlap the main content.
+     Dialogs don't inherit the body's color (the UA default is black), so
+     the light text is restated here. */
+  dialog { color: #e8eaed; }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
   #settings {
     width: min(920px, calc(100vw - 32px));
     max-height: 85vh; overflow-y: auto;
     margin: auto;
   }
-  #settings::backdrop { background: rgba(0, 0, 0, 0.6); }
   .fabs { position: fixed; right: 16px; bottom: 16px; display: flex; gap: 8px; }
   .fabs > * { box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5); }
   #settings-open.has-problems { border-color: #e74c3c; color: #e74c3c; }
@@ -205,13 +209,14 @@
   #claude-status { font-size: 0.85em; }
   #claude-status.err { color: #e74c3c; }
   #claude-status.warn { color: #f39c12; }
+  .claude-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   /* The whole authorize URL, visible and selectable: the clipboard API needs
      a secure context this plain-http page doesn't have. */
   #claude-url { word-break: break-all; font-size: 0.8em; color: var(--accent); }
-  #claude-connect { align-self: flex-start; }
+  #claude-dialog { width: min(560px, calc(100vw - 32px)); margin: auto; }
   #claude-login { display: flex; flex-direction: column; gap: 10px; }
   #claude-submit { align-self: flex-start; }
-  #claude-note { font-size: 0.85em; min-height: 1.2em; }
+  #claude-note, #claude-dialog-note { font-size: 0.85em; min-height: 1.2em; }
 </style>
 </head>
 <body>
@@ -261,11 +266,7 @@
     <div class="panel-title log-head"><span>Settings</span>
       <button type="button" class="small" id="settings-close">close</button></div>
     <div class="general-grid">
-      <div class="field"><label for="s-model">Model</label>
-        <select id="s-model"></select>
-      </div>
       <div class="field"><label for="s-hourly-limit">Hourly task limit (blank = unlimited)</label><input id="s-hourly-limit" type="number" min="0" step="any"></div>
-      <div class="field"><label for="s-author-name">Git author name</label><input id="s-author-name"></div>
       <div class="field"><label for="s-author-email">Git author email</label><input id="s-author-email"></div>
       <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
       <div class="field"><label for="s-nice">CPU priority</label>
@@ -298,20 +299,31 @@
     <div class="forge" id="claude-card">
       <div class="forge-head">
         <span class="name">Claude account</span>
+        <label class="check"><input type="checkbox" id="claude-enabled" checked> enabled</label>
+      </div>
+      <div class="field"><label for="s-model">Model</label>
+        <select id="s-model"></select>
+      </div>
+      <div class="claude-row">
         <span class="muted" id="claude-status">checking…</span>
+        <button type="button" class="small" id="claude-reconnect" hidden>reconnect</button>
       </div>
-      <div id="claude-login" hidden>
-        <div class="field"><label>1. Authorize in your browser, then copy the code it shows</label>
-          <a id="claude-url" target="_blank" rel="noopener"></a></div>
-        <div class="field"><label for="claude-code">2. Paste the code</label>
-          <input id="claude-code" autocomplete="off" placeholder="code#state"></div>
-        <button type="button" class="small" id="claude-submit">connect account</button>
-      </div>
-      <button type="button" class="small" id="claude-connect">connect</button>
       <div class="muted" id="claude-note"></div>
     </div>
     <div class="forges" id="forges"></div>
     <div id="settings-status"></div>
+  </dialog>
+  <dialog class="panel" id="claude-dialog">
+    <div class="panel-title log-head"><span>Connect Claude</span>
+      <button type="button" class="small" id="claude-close">close</button></div>
+    <div id="claude-login">
+      <div class="field"><label>1. Authorize in the tab that just opened (or via this link), then copy the code it shows</label>
+        <a id="claude-url" target="_blank" rel="noopener"></a></div>
+      <div class="field"><label for="claude-code">2. Paste the code</label>
+        <input id="claude-code" autocomplete="off" placeholder="code#state"></div>
+      <button type="button" class="small" id="claude-submit">connect account</button>
+      <div class="muted" id="claude-dialog-note"></div>
+    </div>
   </dialog>
 </div>
 
@@ -709,6 +721,7 @@
       ["uptime", fmtDuration(h.uptime_secs)],
     ];
     $("host-name").textContent = h.hostname || "–";
+    if (h.hostname) document.title = "codemine - " + h.hostname;
     $("host").replaceChildren(...items.map(([label, value]) => {
       const item = document.createElement("div");
       item.append(
@@ -766,13 +779,16 @@
 
   // A stored value that is no longer on offer (auth that stopped loading, a
   // task slug an older sweep.md defined) is kept as an extra choice rather
-  // than silently rewritten to something else.
+  // than silently rewritten to something else. Only Anthropic models are
+  // offered: the selector lives in the Claude account card, and whatever
+  // else opencode can resolve isn't backed by a configured provider.
   function renderModels(selected) {
-    const choices = options.models.map(id => ({ value: id, textContent: id }));
-    if (selected && !options.models.includes(selected))
+    const offered = options.models.filter(id => id.startsWith("anthropic/"));
+    const choices = offered.map(id => ({ value: id, textContent: id }));
+    if (selected && !offered.includes(selected))
       choices.push({ value: selected, textContent: `${selected} (not offered)` });
     if (!choices.length)
-      choices.push({ value: "", textContent: "none — is opencode authenticated?", disabled: true });
+      choices.push({ value: "", textContent: "none — is the Claude account connected?", disabled: true });
     $("s-model").replaceChildren(...choices.map(choice =>
       Object.assign(document.createElement("option"), choice)));
     $("s-model").value = selected;
@@ -912,8 +928,8 @@
   function renderSettings(s) {
     renderModels(s.model);
     renderTasks(s.tasks);
+    $("claude-enabled").checked = s.claude.enabled;
     $("s-hourly-limit").value = s.hourly_limit ?? "";
-    $("s-author-name").value = s.author_name;
     $("s-author-email").value = s.author_email;
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     $("s-nice").value = nicePriority(s.nice);
@@ -955,10 +971,10 @@
     const num = value => value === "" ? null : Number(value);
     const minutes = num($("s-timeout").value);
     const body = {
+      claude: { enabled: $("claude-enabled").checked },
       model: $("s-model").value,
       tasks: [...enabledTasks],
       hourly_limit: num($("s-hourly-limit").value),
-      author_name: $("s-author-name").value,
       author_email: $("s-author-email").value,
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
       nice: NICE[$("s-nice").value] ?? null,
@@ -1036,9 +1052,9 @@
   }
 
   // ---- Claude account ----
-  // The account card lives in the settings dialog but is not part of the
-  // settings document: the login flow has its own endpoints, and the pasted
-  // code never enters the autosaved settings JSON.
+  // The account card carries real settings (the enabled checkbox, the model)
+  // but the login flow is not one of them: it has its own endpoints and its
+  // own dialog, so the pasted code never enters the autosaved settings JSON.
 
   let claudeHealth = null;
 
@@ -1046,13 +1062,21 @@
     claudeHealth = h;
     const status = $("claude-status");
     status.title = "";
-    let text, cls = "muted";
-    if (!h.connected) {
+    // `broken` means only a new login helps, which is what the reconnect
+    // button is for; a healthy or self-healing login shows no buttons.
+    let text, cls = "muted", broken = false;
+    if (!h) {
+      // The server stops checking the credentials file while the section is
+      // disabled and sends null instead of a health digest.
+      text = "disabled";
+    } else if (!h.connected) {
       text = "not connected";
       cls = "err";
+      broken = true;
     } else if (h.refresh.state === "terminal") {
       text = "refresh failing" + (h.refresh.reason ? ` (${h.refresh.reason})` : "") + " — reconnect";
       cls = "err";
+      broken = true;
     } else if (h.refresh.state === "transient" || h.refresh.state === "unavailable") {
       // Anthropic reports dead refresh tokens as 429 rate limits, so a
       // "transient" failure hours past the access token's expiry is really
@@ -1060,6 +1084,7 @@
       if (h.expires_at && Date.now() - h.expires_at > 2 * 3600 * 1000) {
         text = "refresh failing" + (h.refresh.reason ? ` (${h.refresh.reason})` : "") + " — reconnect";
         cls = "err";
+        broken = true;
       } else {
         text = "refresh hiccup — retrying";
         cls = "warn";
@@ -1071,17 +1096,20 @@
     }
     status.textContent = text;
     status.className = cls;
-    $("claude-connect").textContent = h.connected ? "reconnect" : "connect";
-    const notes = [];
-    if (state?.oauth_gated_until)
-      notes.push("turns held until " + new Date(state.oauth_gated_until * 1000).toLocaleString()
-        + " or a reconnect");
-    if (!$("claude-login").hidden && state?.activity?.state === "running")
-      notes.push("a running turn may refresh tokens concurrently; prefer connecting between turns");
-    $("claude-note").textContent = notes.join(" · ");
+    $("claude-reconnect").hidden = !broken;
+    $("claude-note").textContent = h && state?.oauth_gated_until
+      ? "turns held until " + new Date(state.oauth_gated_until * 1000).toLocaleString()
+        + " or a reconnect" : "";
+    $("claude-dialog-note").textContent =
+      $("claude-dialog").open && state?.activity?.state === "running"
+        ? "a running turn may refresh tokens concurrently; prefer connecting between turns" : "";
   }
 
-  $("claude-connect").onclick = async () => {
+  $("claude-reconnect").onclick = async () => {
+    // The tab is opened synchronously so the click still counts as its user
+    // gesture; the authorize URL lands in it once the server mints one. A
+    // blocked popup isn't fatal — the dialog shows the same URL as a link.
+    const tab = window.open("about:blank", "_blank");
     const note = $("claude-note");
     try {
       const res = await fetch("/api/claude/login", { method: "POST" });
@@ -1090,18 +1118,23 @@
       const link = $("claude-url");
       link.href = returned.url;
       link.textContent = returned.url;
+      if (tab) tab.location = returned.url;
       $("claude-code").value = "";
-      $("claude-login").hidden = false;
       note.textContent = "";
+      $("claude-dialog").showModal();
+      renderClaude(claudeHealth);
     } catch (err) {
+      if (tab) tab.close();
       note.textContent = String(err.message || err);
     }
   };
 
+  $("claude-close").onclick = () => $("claude-dialog").close();
+
   $("claude-submit").onclick = async () => {
     const code = $("claude-code").value.trim();
     if (!code) return;
-    const note = $("claude-note");
+    const note = $("claude-dialog-note");
     note.textContent = "connecting…";
     try {
       const res = await fetch("/api/claude/code", {
@@ -1111,14 +1144,13 @@
       });
       const returned = await res.json();
       if (!res.ok) throw new Error(returned.error || res.status);
-      $("claude-login").hidden = true;
+      $("claude-dialog").close();
       $("claude-code").value = "";
-      note.textContent = "";
       renderClaude(returned);
       // The fresh login can turn an empty model dropdown into a full one.
       loadSettings();
     } catch (err) {
-      // The paste is retryable against the same login; the form stays up.
+      // The paste is retryable against the same login; the dialog stays up.
       note.textContent = String(err.message || err);
     }
   };
@@ -1126,14 +1158,13 @@
   $("forges").append(...FORGES.map(forgeCard));
   // Delegated, so the repo and task checkboxes built later are covered too.
   // Typing debounces; committed choices save at once. Token fields are left
-  // to `change` alone, so a partial secret is never stored. The Claude card
-  // is excluded outright — its input is a login code, not a setting.
+  // to `change` alone, so a partial secret is never stored. The login code
+  // input lives in its own dialog outside this one, so it can't reach these
+  // listeners.
   $("settings").addEventListener("input", event => {
-    if (event.target.closest("#claude-card")) return;
     if (event.target.type !== "password") scheduleSave(600);
   });
   $("settings").addEventListener("change", event => {
-    if (event.target.closest("#claude-card")) return;
     if (event.target.id === "s-schedule-enabled") paintSchedule();
     scheduleSave(0);
   });

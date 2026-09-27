@@ -17,6 +17,7 @@ use crate::schedule::Schedule;
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
+    pub claude: ClaudeSettings,
     pub gitea: ForgeSettings,
     pub github: ForgeSettings,
     pub gitlab: ForgeSettings,
@@ -29,9 +30,8 @@ pub struct Settings {
     /// two hours. The runner spends them from a bucket, so a whole hour's
     /// worth can run back to back.
     pub hourly_limit: Option<f64>,
-    /// The name and email commits are authored (and committed) as; empty
-    /// means unconfigured.
-    pub author_name: String,
+    /// The email commits are authored (and committed) as; empty means
+    /// unconfigured. The author name is always the model's name.
     pub author_email: String,
     /// Seconds before a turn is cut off.
     pub turn_timeout_secs: u64,
@@ -46,19 +46,35 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            claude: ClaudeSettings::default(),
             gitea: ForgeSettings::default(),
             github: ForgeSettings::default(),
             gitlab: ForgeSettings::default(),
             model: String::new(),
             tasks: crate::prompts::default_tasks(),
             hourly_limit: None,
-            author_name: String::new(),
             author_email: String::new(),
             turn_timeout_secs: 21600,
             nice: None,
             ionice: None,
             schedule: Schedule::default(),
         }
+    }
+}
+
+/// The Claude account section. Model providers each get a section like the
+/// forges do; Claude is the only one so far, and it starts enabled so a
+/// pre-section config keeps running. Disabled, the runner stops checking the
+/// credentials file entirely.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct ClaudeSettings {
+    pub enabled: bool,
+}
+
+impl Default for ClaudeSettings {
+    fn default() -> Self {
+        ClaudeSettings { enabled: true }
     }
 }
 
@@ -194,11 +210,14 @@ impl Settings {
         {
             problems.push(Problem::new("forges", "no forge is enabled with a token"));
         }
+        if !self.claude.enabled {
+            problems.push(Problem::new(
+                "claude-card",
+                "no model provider is enabled; enable the Claude account",
+            ));
+        }
         if self.model.is_empty() {
             problems.push(Problem::new("s-model", "model is not set"));
-        }
-        if self.author_name.is_empty() {
-            problems.push(Problem::new("s-author-name", "git author name is not set"));
         }
         if self.author_email.is_empty() {
             problems.push(Problem::new(
@@ -222,7 +241,8 @@ impl Settings {
             model: self.model.clone(),
             tasks: self.tasks.clone(),
             hourly_limit: self.hourly_limit,
-            author_name: self.author_name.clone(),
+            // Commits are attributed to the model that authored them.
+            author_name: model_author_name(&self.model),
             author_email: self.author_email.clone(),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             nice: self.nice,
@@ -254,7 +274,6 @@ impl Settings {
     /// one overwrites it.
     pub fn apply_update(&mut self, mut incoming: Settings) -> Result<()> {
         incoming.model = incoming.model.trim().to_owned();
-        incoming.author_name = incoming.author_name.trim().to_owned();
         incoming.author_email = incoming.author_email.trim().to_owned();
         for kind in FORGE_KINDS {
             let forge = incoming.forge_mut(kind);
@@ -294,6 +313,32 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// The git author a model ID reads as: "anthropic/claude-sonnet-5" becomes
+/// "Claude Sonnet 5". The provider prefix goes, words are capitalized,
+/// adjacent version numbers join with dots ("4-8" → "4.8"), and a snapshot
+/// date stamp (8+ digits) is dropped — it pins a build, it isn't a name.
+pub fn model_author_name(model: &str) -> String {
+    let id = model.rsplit('/').next().unwrap_or(model);
+    let mut words: Vec<String> = Vec::new();
+    for part in id.split('-').filter(|part| !part.is_empty()) {
+        let numeric = part.bytes().all(|b| b.is_ascii_digit());
+        match words.last_mut() {
+            _ if numeric && part.len() >= 8 => {}
+            Some(last) if numeric && last.bytes().all(|b| b.is_ascii_digit() || b == b'.') => {
+                last.push('.');
+                last.push_str(part);
+            }
+            _ if numeric => words.push(part.to_owned()),
+            _ => {
+                let mut chars = part.chars();
+                let first = chars.next().expect("empty parts are filtered out");
+                words.push(format!("{}{}", first.to_uppercase(), chars.as_str()));
+            }
+        }
+    }
+    words.join(" ")
 }
 
 /// The settings plus their persistence, shared between the main loop and the
@@ -378,7 +423,6 @@ mod tests {
                 ..Default::default()
             },
             model: "anthropic/claude".into(),
-            author_name: "Bot".into(),
             author_email: "bot@example.com".into(),
             ..Default::default()
         }
@@ -426,7 +470,33 @@ mod tests {
         assert_eq!(config.forges.len(), 1);
         assert_eq!(config.forges[0].url, "https://github.com");
         assert_eq!(config.forges[0].user, "x-access-token");
+        // Commits are authored as the model, prettified.
+        assert_eq!(config.author_name, "Claude");
         assert_eq!(config.workspace, PathBuf::from("/tmp/ws"));
+    }
+
+    #[test]
+    fn the_author_is_the_prettified_model_name() {
+        for (model, name) in [
+            ("anthropic/claude-sonnet-5", "Claude Sonnet 5"),
+            ("anthropic/claude-opus-4-8", "Claude Opus 4.8"),
+            ("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+            ("anthropic/claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
+            ("anthropic/claude-fable-5", "Claude Fable 5"),
+            ("claude", "Claude"),
+        ] {
+            assert_eq!(model_author_name(model), name, "{model}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_claude_account_is_a_problem() {
+        let mut settings = configured();
+        assert!(settings.claude.enabled, "claude starts enabled");
+        settings.claude.enabled = false;
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert!(fields.iter().any(|f| f == "claude-card"), "{fields:?}");
+        assert!(settings.to_config(&cli()).is_none());
     }
 
     #[test]

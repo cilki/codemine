@@ -157,7 +157,7 @@ fn has_stale_pr(forge: &Forge, repo: &str) -> Result<bool> {
 
 /// One GET via the gh/glab `api` subcommand, parsed as JSON. Unlike
 /// `turn::list_api_repos` there is no pagination: one page decides the answer.
-fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Value> {
+pub fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Value> {
     let output = Command::new(program)
         .args(["api", path])
         .envs(forge.env())
@@ -178,7 +178,7 @@ fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Valu
 /// One GET against the Gitea API via curl; `tea` has no generic api
 /// subcommand. The auth header goes through `--config -` on stdin so the
 /// token never lands in argv.
-fn gitea_json(forge: &Forge, path: &str) -> Result<serde_json::Value> {
+pub fn gitea_json(forge: &Forge, path: &str) -> Result<serde_json::Value> {
     let url = format!("{}/api/v1/{path}", forge.url.trim_end_matches('/'));
     let mut child = Command::new("curl")
         .args(["-sf", "--config", "-", &url])

@@ -104,6 +104,7 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
     let app = axum::Router::new()
         .route("/", get(index))
         .route("/emblem.svg", get(emblem))
+        .route("/favicon.svg", get(favicon))
         .route("/api/status", get(api_status))
         .route("/api/log", get(api_log))
         .route("/api/host", get(api_host))
@@ -131,6 +132,14 @@ async fn emblem() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
         crate::emblem::SVG.as_str(),
+    )
+}
+
+/// The emblem's icon alone, as the tab favicon.
+async fn favicon() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+        crate::emblem::ICON.as_str(),
     )
 }
 
@@ -192,9 +201,14 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                 .unwrap_or_else(|_| "{}".into());
             // Re-derived from two small files each tick, like the host
             // snapshot: the main loop is inside a turn for hours at a time,
-            // so auth health can't ride the status it owns.
-            let claude =
-                serde_json::to_string(&crate::claude::health()).unwrap_or_else(|_| "{}".into());
+            // so auth health can't ride the status it owns. A disabled
+            // Claude section stops the file checks; the page reads the null
+            // as "disabled".
+            let claude = if state.settings.snapshot().0.claude.enabled {
+                serde_json::to_string(&crate::claude::health()).unwrap_or_else(|_| "null".into())
+            } else {
+                "null".into()
+            };
             for (name, key, payload, sent) in [
                 ("status", &snapshot, &status, &mut sent_status),
                 ("log", &log, &log, &mut sent_log),
@@ -550,6 +564,11 @@ mod tests {
         let response = request(addr, "GET", "/emblem.svg", "");
         assert!(response.contains("image/svg+xml"), "{response}");
         assert!(response.contains("<svg"), "{response}");
+
+        let response = request(addr, "GET", "/favicon.svg", "");
+        assert!(response.contains("image/svg+xml"), "{response}");
+        assert!(response.contains("<svg"), "{response}");
+        assert!(!response.contains("<?xml"), "{response}");
     }
 
     #[test]
@@ -565,7 +584,6 @@ mod tests {
         let update = json!({
             "github": { "enabled": true, "token": "secret" },
             "model": "anthropic/claude",
-            "author_name": "Bot",
             "author_email": "bot@example.com",
             "hourly_limit": 0.5,
         });
@@ -868,6 +886,29 @@ mod tests {
         let seen = read_until(&mut stream, "event: claude");
         assert!(seen.contains("event: claude"), "{seen}");
         assert!(seen.contains(r#""connected":"#), "{seen}");
+    }
+
+    #[test]
+    fn events_stream_reports_disabled_claude_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
+        store
+            .update(|s| {
+                s.claude.enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            Shared::new(),
+            store,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
+        let seen = read_until(&mut stream, "event: claude\ndata: null");
+        assert!(seen.contains("event: claude\ndata: null"), "{seen}");
     }
 
     #[test]

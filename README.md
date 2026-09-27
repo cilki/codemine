@@ -7,8 +7,8 @@
 
 <hr>
 
-**codemine** runs AI agents on git repos while you sleep, delivering tested PRs
-and useful issues.
+**codemine** runs AI agents on git repos while you're away, delivering tested
+PRs and useful issues.
 
 Each "turn" does one of the following on a repo:
 
@@ -28,8 +28,6 @@ Each "turn" does one of the following on a repo:
 - `mutation`: mutate load-bearing code to find gaps the test suite misses.
 - `feature`: implement new features.
 
-> I run **codemine** on a cluster of physically isolated Raspberry PIs.
-
 ### Features
 
 #### Codegraph
@@ -47,12 +45,12 @@ schedulers that honor them (e.g. bfq); CPU niceness works everywhere.
 
 #### Scheduling
 
-Off by default. When enabled in the settings, turns only *start* inside a
-daily window — 22:00 to 06:00 keeps the agent to the small hours, and a window
-that runs past midnight is one window rather than two. A turn already under
-way is left to finish, so pair a narrow window with a turn timeout that fits
-inside it. Times are read in the container's timezone, so set `TZ` if it isn't
-already yours.
+Off by default. When enabled in the settings, turns only _start_ inside a daily
+window — 22:00 to 06:00 keeps the agent to the small hours, and a window that
+runs past midnight is one window rather than two. A turn already under way is
+left to finish, so pair a narrow window with a turn timeout that fits inside it.
+Times are read in the container's timezone, so set `TZ` if it isn't already
+yours.
 
 #### Multiple forge support
 
