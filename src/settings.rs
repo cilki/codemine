@@ -374,6 +374,12 @@ impl SettingsStore {
         (inner.0.clone(), inner.1)
     }
 
+    /// The generation alone, for polling a wait against an edit without
+    /// cloning the settings to find out.
+    pub fn generation(&self) -> u64 {
+        self.lock().1
+    }
+
     /// Mutate the settings, persisting on success; nothing changes in memory
     /// when the mutation or the write fails.
     pub fn update(&self, f: impl FnOnce(&mut Settings) -> Result<()>) -> Result<()> {

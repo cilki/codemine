@@ -440,9 +440,13 @@
     const value = $("stat-state");
     $("stat-state-label").textContent = paused ? "paused" : STATES[a.state] || a.state;
     value.className = "stat-value " + (paused ? "paused" : a.state);
+    // A rate limit counts down to the next turn, so its wait reads as
+    // negative time: "-5m" means five minutes until the runner goes again.
     value.textContent = a.state === "running"
       ? fmtCoarse(serverNow() - a.started)
-      : a.until ? fmtCoarse(a.until - serverNow()) : "–";
+      : a.until
+        ? (a.state === "rate_limited" ? "-" : "") + fmtCoarse(a.until - serverNow())
+        : "–";
   }
 
   function renderClock() {

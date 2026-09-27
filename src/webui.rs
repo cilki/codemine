@@ -309,14 +309,15 @@ async fn api_put_settings(
             let (settings, _) = state.settings.snapshot();
             // The main loop only mirrors the bucket into the status at the
             // next turn boundary; reflect the new ceiling now so the page's
-            // counter doesn't lag a running turn. What the bucket already
-            // holds is kept, trimmed to a capacity that just shrank.
+            // counter doesn't lag a running turn. The bucket is resized the
+            // same way the loop resizes it — a raised limit is spendable
+            // immediately, a lowered one spills what no longer fits.
             let capacity = settings.hourly_limit.map(crate::capacity);
             Status::update(&state.status, |s| {
                 s.allowance = capacity.map(|capacity| Allowance {
-                    available: s
-                        .allowance
-                        .map_or(capacity, |held| held.available.min(capacity)),
+                    available: s.allowance.map_or(capacity, |held| {
+                        crate::resized(held.available, held.capacity, capacity)
+                    }),
                     capacity,
                 })
             });
@@ -599,6 +600,25 @@ mod tests {
         assert_eq!(value["github"]["token_set"], true);
         assert!(value["github"].get("token").is_none());
         assert!(!response.contains("secret"));
+
+        // Raising the limit hands over the extra turns at once rather than
+        // trickling them in, and lowering it spills what no longer fits.
+        let mut raised = update.clone();
+        raised["hourly_limit"] = json!(4);
+        assert!(
+            request(addr, "PUT", "/api/settings", &raised.to_string()).starts_with("HTTP/1.1 200")
+        );
+        let status = body_json(&request(addr, "GET", "/api/status", ""));
+        assert_eq!(status["allowance"]["capacity"], 4.0);
+        assert_eq!(status["allowance"]["available"], 4.0);
+        let mut lowered = update.clone();
+        lowered["hourly_limit"] = json!(2);
+        assert!(
+            request(addr, "PUT", "/api/settings", &lowered.to_string()).starts_with("HTTP/1.1 200")
+        );
+        let status = body_json(&request(addr, "GET", "/api/status", ""));
+        assert_eq!(status["allowance"]["capacity"], 2.0);
+        assert_eq!(status["allowance"]["available"], 2.0);
 
         // Persisted to the workspace, and the token survives a token-less PUT.
         assert!(dir.path().join("config.json").exists());

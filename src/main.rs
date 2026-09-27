@@ -79,8 +79,10 @@ fn main() -> Result<()> {
     // Turns available to spend right now. The bucket refills at the
     // configured rate and holds at most an hour's worth, so a limit of 2
     // runs two turns back to back and then one every half hour. It starts
-    // full, whatever limit is configured later.
+    // full, whatever limit is configured later, and is resized in step with
+    // the limit it was last sized against.
     let mut allowance = f64::INFINITY;
+    let mut sized_for: Option<f64> = None;
     let mut refilled = status::epoch_now();
     let mut applied_generation = None;
     // The credentials file's mtime when a turn last died on unusable OAuth,
@@ -157,10 +159,25 @@ fn main() -> Result<()> {
         if let Some(wait) = cfg.schedule.hold(schedule::local_second_of_day()) {
             let until = status::epoch_now() + wait;
             Status::update(&status, |s| s.activity = Activity::OffHours { until });
-            // Sliced like the rate-limit wait, so a widened window applies
-            // within a minute instead of at the end of the hold.
-            std::thread::sleep(Duration::from_secs(wait.min(60)));
+            // Sliced like the rate-limit wait, and cut short by an edit, so
+            // a widened window applies at once instead of at the end of the
+            // hold.
+            hold(&store, generation, wait.min(60));
             continue;
+        }
+
+        // An edited limit resizes the bucket instead of waiting for the old
+        // one to run out: raising it hands the extra turns over now, and
+        // lowering it spills what no longer fits. An unlimited stretch isn't
+        // accounted for at all — the allowance only drains over one — so a
+        // limit set afterwards starts from a full bucket.
+        if cfg.hourly_limit != sized_for {
+            allowance = match (sized_for, cfg.hourly_limit) {
+                (Some(old), Some(new)) => resized(allowance, capacity(old), capacity(new)),
+                (None, Some(new)) => capacity(new),
+                (_, None) => allowance,
+            };
+            sized_for = cfg.hourly_limit;
         }
 
         let now = status::epoch_now();
@@ -177,10 +194,10 @@ fn main() -> Result<()> {
                 Status::update(&status, |s| {
                     s.activity = Activity::RateLimited { until: now + wait }
                 });
-                // Sleep in slices and fall back into the loop, so a raised
-                // limit applies within a minute instead of at the end of
-                // the wait.
-                std::thread::sleep(Duration::from_secs(wait.min(60)));
+                // Sleep in slices and fall back into the loop, cut short by
+                // an edit, so a limit raised in the web UI applies at once
+                // instead of at the end of the wait.
+                hold(&store, generation, wait.min(60));
                 continue;
             }
         } else {
@@ -305,6 +322,28 @@ fn spendable(allowance: f64, limit: f64) -> Allowance {
 fn refill(allowance: f64, since: u64, now: u64, limit: f64) -> f64 {
     let earned = now.saturating_sub(since) as f64 * limit / HOUR;
     (allowance + earned).min(capacity(limit))
+}
+
+/// What the bucket holds after its capacity changes from `was` to `now`:
+/// the growth is handed over at once, so a raised limit buys turns now
+/// rather than an hour from now, and whatever a shrunken bucket can't hold
+/// spills.
+pub fn resized(allowance: f64, was: f64, now: f64) -> f64 {
+    (allowance + (now - was).max(0.0)).min(now)
+}
+
+/// Sleep for `seconds`, returning early once the settings change: the wait
+/// was computed from a limit or a window that no longer applies, so the loop
+/// goes back around and works the hold out again.
+fn hold(store: &SettingsStore, generation: u64, seconds: u64) {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || store.generation() != generation {
+            break;
+        }
+        std::thread::sleep(left.min(Duration::from_secs(1)));
+    }
 }
 
 /// Send logs to stderr at info and above, overridable per-module with
@@ -548,6 +587,22 @@ mod tests {
         assert_eq!(refill(0.0, 0, 3600, 0.5), 0.5);
         assert_eq!(refill(0.0, 0, 7200, 0.5), 1.0);
         assert_eq!(refill(0.0, 0, 86_400, 0.5), 1.0);
+    }
+
+    #[test]
+    fn a_changed_limit_resizes_the_bucket() {
+        // Spent out at one an hour, then raised to four: the three turns the
+        // new limit adds are in hand right away, not an hour from now.
+        assert_eq!(resized(0.0, capacity(1.0), capacity(4.0)), 3.0);
+        // A full bucket grows with the limit and stops at the new ceiling.
+        assert_eq!(resized(1.0, capacity(1.0), capacity(4.0)), 4.0);
+        // A raise too small to fit another turn hands over nothing; the wait
+        // still shortens, since the bucket refills faster.
+        assert_eq!(resized(0.0, capacity(1.0), capacity(1.5)), 0.0);
+        // Lowered: what the bucket can no longer hold spills, and what fits
+        // stays — slowing down mid-hour doesn't bank a debt.
+        assert_eq!(resized(4.0, capacity(4.0), capacity(1.0)), 1.0);
+        assert_eq!(resized(0.5, capacity(4.0), capacity(1.0)), 0.5);
     }
 
     #[test]
