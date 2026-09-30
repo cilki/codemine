@@ -90,9 +90,10 @@ pub struct ForgeSettings {
     pub user: String,
     /// Base URL; empty means the forge's default (github.com / gitlab.com).
     pub url: String,
-    /// Repositories excluded from sweeping. Everything else is enabled, so
-    /// new repositories join the pool automatically.
-    pub disabled_repos: BTreeSet<String>,
+    /// Repositories included in sweeping. Everything starts disabled — a
+    /// fresh login sweeps nothing, and new repositories stay out of the pool
+    /// until they're enabled by hand.
+    pub enabled_repos: BTreeSet<String>,
 }
 
 impl ForgeSettings {
@@ -175,7 +176,7 @@ impl Settings {
                 ForgeKind::Gitlab => "oauth2".into(),
             },
             url: forge.url(kind),
-            disabled_repos: forge.disabled_repos.clone(),
+            enabled_repos: forge.enabled_repos.clone(),
         })
     }
 

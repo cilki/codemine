@@ -134,9 +134,10 @@ pub struct Forge {
     /// token-bearing pseudo-user over HTTPS.
     pub user: String,
     pub url: String,
-    /// Repositories excluded from sweeping; everything else the account can
-    /// reach is fair game, so new repositories join the pool automatically.
-    pub disabled_repos: BTreeSet<String>,
+    /// Repositories included in sweeping; everything else the account can
+    /// reach is left alone, so a fresh login starts with nothing swept until
+    /// repositories are enabled by hand.
+    pub enabled_repos: BTreeSet<String>,
 }
 
 impl Forge {
@@ -326,7 +327,7 @@ mod tests {
             token: "tok".into(),
             user: String::new(),
             url: url.into(),
-            disabled_repos: BTreeSet::new(),
+            enabled_repos: BTreeSet::new(),
         };
         assert!(
             forge(ForgeKind::Gitea, "https://git.example.com")

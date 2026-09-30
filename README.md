@@ -36,6 +36,16 @@ With [codegraph](https://github.com/colbymchenry/codegraph) installed, the agent
 avoids rereading the tree every turn, which cuts token usage substantially on
 large projects.
 
+#### Skip caching
+
+The tasks that answer out of the code alone — `simplify`, `benchmark`, `docs`,
+`coverage`, and `mutation` — remember the commit they last found nothing at.
+Until that repository's default branch moves (or the task's own instructions
+change in a **codemine** upgrade), they aren't drawn for it again, so a quiet
+repo stops costing a session per task to rediscover it has nothing to do. The
+memory lives in `skips.json` in the workspace and survives restarts; the other
+tasks can become actionable without a commit landing and are never cached.
+
 #### Prioritization
 
 On low-resource machines, the nice and I/O class settings throttle the agent by

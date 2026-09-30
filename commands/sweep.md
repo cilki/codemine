@@ -77,6 +77,7 @@ the user decide what to do.
 - Look for real complexity to remove — a shorter, clearer implementation, a
   redundant abstraction collapsed, a duplicated code path unified. Cosmetic
   tidying is not simplification; skip the turn if that is all you find
+- Start search at recently changed code
 
 ## "todo"
 

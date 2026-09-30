@@ -464,8 +464,8 @@ async fn api_post_cancel(State(state): State<AppState>) -> Response {
     Json(json!({ "canceled": true })).into_response()
 }
 
-/// Live repository listing for one forge, merged with the disabled set so
-/// the UI can render checkboxes. Disabled repositories missing from the
+/// Live repository listing for one forge, merged with the enabled set so
+/// the UI can render checkboxes. Enabled repositories missing from the
 /// listing still appear, so an unreachable forge can't silently drop them.
 async fn api_repos(State(state): State<AppState>, Path(slug): Path<String>) -> Response {
     let Some(kind) = ForgeKind::from_slug(&slug) else {
@@ -483,17 +483,17 @@ async fn api_repos(State(state): State<AppState>, Path(slug): Path<String>) -> R
         )
             .into_response();
     };
-    let disabled = forge.disabled_repos.clone();
+    let enabled = forge.enabled_repos.clone();
     // The listing shells out to the forge CLI; keep it off the current-thread
     // runtime so status polling stays responsive meanwhile.
     let listed = tokio::task::spawn_blocking(move || crate::turn::list_repos(&forge)).await;
     match listed {
         Ok(Ok(repos)) => {
             let names: BTreeSet<String> =
-                repos.into_iter().chain(disabled.iter().cloned()).collect();
+                repos.into_iter().chain(enabled.iter().cloned()).collect();
             let repos: Vec<_> = names
                 .into_iter()
-                .map(|name| json!({ "enabled": !disabled.contains(&name), "name": name }))
+                .map(|name| json!({ "enabled": enabled.contains(&name), "name": name }))
                 .collect();
             Json(json!({ "repos": repos })).into_response()
         }

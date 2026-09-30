@@ -772,8 +772,10 @@
     github: "https://github.com (default)",
     gitlab: "https://gitlab.com (default)",
   };
-  // Per forge: Set of disabled repo names, edited by the checkboxes.
-  const disabledRepos = {};
+  // Per forge: Set of enabled repo names, edited by the checkboxes. Repos
+  // start out unchecked, so a fresh login sweeps nothing until repositories
+  // are picked by hand.
+  const enabledRepos = {};
 
   // The choices from /api/options: the model IDs opencode can resolve right
   // now, and the task pool parsed out of the sweep command.
@@ -872,24 +874,39 @@
       ${name === "gitea" ? `
       <div class="field"><label for="f-gitea-user">User</label><input id="f-gitea-user"></div>` : ""}
       <div class="field"><label>Repositories</label>
+        <input id="f-${name}-repos-filter" type="search" placeholder="search repositories" hidden>
         <div class="repos" id="f-${name}-repos"><span class="muted">Not loaded.</span></div>
         <span class="muted" id="f-${name}-repos-note"></span>
       </div>`;
+    // The search box narrows the list client-side; it is not a setting, so
+    // its typing must not bubble up to the dialog's autosave listeners.
+    const filter = card.querySelector(`#f-${name}-repos-filter`);
+    for (const type of ["input", "change"])
+      filter.addEventListener(type, event => event.stopPropagation());
+    filter.addEventListener("input", () => applyRepoFilter(name));
     return card;
   }
 
   function repoRow(name, forge) {
     const label = document.createElement("label");
-    label.className = "check" + (disabledRepos[forge].has(name) ? " off" : "");
+    label.className = "check" + (enabledRepos[forge].has(name) ? "" : " off");
     const box = document.createElement("input");
     box.type = "checkbox";
-    box.checked = !disabledRepos[forge].has(name);
+    box.checked = enabledRepos[forge].has(name);
     box.onchange = () => {
-      box.checked ? disabledRepos[forge].delete(name) : disabledRepos[forge].add(name);
+      box.checked ? enabledRepos[forge].add(name) : enabledRepos[forge].delete(name);
       label.className = "check" + (box.checked ? "" : " off");
     };
     label.append(box, document.createTextNode(name));
     return label;
+  }
+
+  // Hide the rows the search box's text doesn't match. Unchecking a hidden
+  // row is impossible, so a filtered save can't silently drop repos.
+  function applyRepoFilter(forge) {
+    const needle = $(`f-${forge}-repos-filter`).value.trim().toLowerCase();
+    for (const row of $(`f-${forge}-repos`).children)
+      row.hidden = !row.textContent.toLowerCase().includes(needle);
   }
 
   function renderRepos(forge, names) {
@@ -897,6 +914,11 @@
     $(`f-${forge}-repos`).replaceChildren(
       ...(rows.length ? rows : [Object.assign(document.createElement("span"),
         { className: "muted", textContent: "No repositories." })]));
+    // The search box only appears once the list outgrows its scrollbox.
+    const filter = $(`f-${forge}-repos-filter`);
+    filter.hidden = rows.length <= 10;
+    if (filter.hidden) filter.value = "";
+    applyRepoFilter(forge);
   }
 
   // Forges whose live listing already came in, so edits and saves don't
@@ -941,16 +963,16 @@
     renderSchedule(s.schedule);
     for (const forge of FORGES) {
       const f = s[forge];
-      disabledRepos[forge] = new Set(f.disabled_repos);
+      enabledRepos[forge] = new Set(f.enabled_repos);
       $(`f-${forge}-enabled`).checked = f.enabled;
       const token = $(`f-${forge}-token`);
       token.value = "";
       token.placeholder = f.token_set ? "token set — leave blank to keep" : "no token";
       $(`f-${forge}-url`).value = f.url;
       if (forge === "gitea") $("f-gitea-user").value = f.user;
-      // Show the stored disables even before a live listing is loaded, so an
+      // Show the stored enables even before a live listing is loaded, so an
       // unreachable forge can't silently drop them.
-      renderRepos(forge, [...disabledRepos[forge]].sort());
+      renderRepos(forge, [...enabledRepos[forge]].sort());
     }
     autoLoadRepos(s);
   }
@@ -996,7 +1018,7 @@
         token: $(`f-${forge}-token`).value,
         url: $(`f-${forge}-url`).value,
         user: forge === "gitea" ? $("f-gitea-user").value : "",
-        disabled_repos: [...disabledRepos[forge]].sort(),
+        enabled_repos: [...enabledRepos[forge]].sort(),
       };
     }
     return body;

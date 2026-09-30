@@ -4,6 +4,7 @@
 //! back-to-back with the previous one. Everything except the CLI flags is
 //! configured through the always-on web UI and persisted in the workspace.
 
+mod cache;
 mod claude;
 mod config;
 mod emblem;
@@ -54,6 +55,9 @@ fn main() -> Result<()> {
     setup(&mut cli)?;
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
+    // The tasks that only read the tree remember the commit they last came up
+    // empty on, so they aren't drawn again until it moves.
+    let cache = cache::Cache::load(cli.workspace.join("skips.json"));
     let status = Shared::new();
     let addr = webui::spawn(
         cli.listen,
@@ -204,7 +208,7 @@ fn main() -> Result<()> {
             Status::update(&status, |s| s.allowance = None);
         }
 
-        match turn::run(&cfg, &status, &pending) {
+        match turn::run(&cfg, &status, &pending, &cache) {
             Ok(report) => {
                 // The plugin may have rotated the token mid-turn and only
                 // managed to park the new pair in opencode's auth.json;

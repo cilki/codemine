@@ -140,6 +140,12 @@ fn fast_forward_branches(dir: &Path, current: &str, log: &File) -> Result<()> {
     Ok(())
 }
 
+/// The commit the clone is checked out at, which the skip cache remembers a
+/// task's empty turn against.
+pub fn head_sha(dir: &Path) -> Result<String> {
+    Ok(git_stdout(dir, &["rev-parse", "HEAD"])?.trim().to_owned())
+}
+
 /// Stdout of a git command that is run for its answer rather than its
 /// effect; anything but a clean exit is an error.
 fn git_stdout(dir: &Path, args: &[&str]) -> Result<String> {

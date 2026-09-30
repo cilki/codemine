@@ -101,7 +101,7 @@ fn watch(store: SharedSettings, pending: SharedPending) -> ! {
                     current.extend(
                         repos
                             .into_iter()
-                            .filter(|(repo, _)| !forge.disabled_repos.contains(repo))
+                            .filter(|(repo, _)| forge.enabled_repos.contains(repo))
                             .map(|(repo, stamp)| ((kind, repo), stamp)),
                     );
                 }

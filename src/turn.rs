@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 use wait_timeout::ChildExt;
 
+use crate::cache;
 use crate::config::{Config, Forge, ForgeKind};
 use crate::precheck;
 use crate::scan;
@@ -42,13 +43,14 @@ pub fn run(
     cfg: &Config,
     status: &crate::status::Shared,
     pending: &crate::events::Pending,
+    cache: &cache::Cache,
 ) -> Result<Report> {
     let mut pool = Vec::new();
     for forge in &cfg.forges {
         pool.extend(
             list_repos(forge)?
                 .into_iter()
-                .filter(|repo| !forge.disabled_repos.contains(repo))
+                .filter(|repo| forge.enabled_repos.contains(repo))
                 .map(|repo| (forge, repo)),
         );
     }
@@ -68,6 +70,9 @@ pub fn run(
     // feedback already handled, the task since disabled) are dropped rather
     // than requeued — the ordinary draw probes feedback anyway.
     let feedback = cfg.tasks.iter().any(|task| task == "feedback");
+    // The precondition probes plus the skip cache, sharing one set of forge
+    // lookups across everything this draw asks about.
+    let probe = cache::Probe::new(cache);
     let mut urgent = None;
     while let Some((kind, repo)) = pending.pop() {
         if !feedback {
@@ -80,16 +85,18 @@ pub fn run(
         else {
             continue;
         };
-        if precheck::actionable("feedback", forge, repo) {
+        if probe.actionable("feedback", forge, repo) {
             info!("fresh activity on {repo}; drawing it first");
             urgent = Some(("feedback", forge, repo));
             break;
         }
     }
-    let Some((task, forge, repo)) =
-        urgent.or_else(|| precheck::draw(&cfg.tasks, &pool, precheck::actionable))
-    else {
-        warn!("every enabled task is precondition-gated and has nothing to do");
+    let Some((task, forge, repo)) = urgent.or_else(|| {
+        precheck::draw(&cfg.tasks, &pool, |task, forge, repo| {
+            probe.actionable(task, forge, repo)
+        })
+    }) else {
+        warn!("every enabled task has nothing to do on any enabled repository");
         return Ok(Report {
             backoff: Backoff::Normal,
             completed: false,
@@ -166,6 +173,19 @@ pub fn run(
             canceled: false,
         });
     }
+
+    // The commit the agent is about to read, taken while the clone is still
+    // on a clean default branch — after the turn it could be sitting on
+    // whatever branch the agent left behind. A cachable task that skips is
+    // remembered against it. Best-effort: without it the task is simply
+    // drawn again next time.
+    let head = match workspace::head_sha(&dir) {
+        Ok(head) => Some(head),
+        Err(err) => {
+            warn!("failed to read {}'s head commit: {err:#}", dir.display());
+            None
+        }
+    };
 
     // The agent runs inside the Landlock write sandbox, so it cannot work
     // from any checkout other than the assigned clone.
@@ -297,6 +317,17 @@ pub fn run(
             Outcome::Skipped
         }
     };
+
+    // A cachable task that came up empty is held back until the repository
+    // moves off this commit; any other outcome retires whatever was
+    // remembered, since a completed turn changed something and a turn that
+    // failed, timed out, or was cancelled never got to answer.
+    if cache::cachable(task) {
+        match (outcome, &head) {
+            (Outcome::Skipped, Some(head)) => cache.remember(task, forge.kind, repo, head),
+            _ => cache.forget(task, forge.kind, repo),
+        }
+    }
 
     // The last reading can fail like any other (opencode mid-write, or its
     // database gone with the session); the samples taken while the turn ran

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{Forge, ForgeKind};
 
@@ -24,35 +24,41 @@ const PR_LIMIT: usize = 20;
 /// probed first — every enabled one against every repository, in a shuffled
 /// order — and the first pair with work wins, so responsive work (a stale PR,
 /// a review comment) is never waiting on a lucky draw. Only once nothing is
-/// pending does an ungated task get drawn uniformly. None when every enabled
-/// task is gated and none has work.
+/// pending do the rest get their turn, as one shuffled pass over every (task,
+/// repository) pair: `check` waves most of them straight through, so this is
+/// the uniform draw it used to be, but a pair the skip cache has already
+/// answered for is passed over instead of drawn. None when nothing at all is
+/// worth a turn.
 pub fn draw<'a>(
     tasks: &'a [String],
     pool: &'a [(&'a Forge, String)],
     check: impl Fn(&str, &Forge, &str) -> bool,
 ) -> Option<(&'a str, &'a Forge, &'a str)> {
-    let mut probes: Vec<(&'a str, &'a Forge, &'a str)> = tasks
-        .iter()
-        .filter(|task| gated(task))
-        .flat_map(|task| {
-            pool.iter()
-                .map(move |(forge, repo)| (task.as_str(), *forge, repo.as_str()))
-        })
-        .collect();
-    fastrand::shuffle(&mut probes);
-    for (task, forge, repo) in probes {
+    let candidates = |want_gated: bool| {
+        let mut candidates: Vec<(&'a str, &'a Forge, &'a str)> = tasks
+            .iter()
+            .filter(|task| gated(task) == want_gated)
+            .flat_map(|task| {
+                pool.iter()
+                    .map(move |(forge, repo)| (task.as_str(), *forge, repo.as_str()))
+            })
+            .collect();
+        fastrand::shuffle(&mut candidates);
+        candidates
+    };
+    for (task, forge, repo) in candidates(true).into_iter().chain(candidates(false)) {
         if check(task, forge, repo) {
             return Some((task, forge, repo));
         }
-        info!("nothing for {task} on {repo}");
+        // A gated miss is worth a line of its own: there are few of them and
+        // each cost a forge round trip. The ungated pass can cover every task
+        // on every repository, so its misses stay at debug.
+        match gated(task) {
+            true => info!("nothing for {task} on {repo}"),
+            false => debug!("nothing for {task} on {repo}"),
+        }
     }
-    let open: Vec<&String> = tasks.iter().filter(|task| !gated(task)).collect();
-    if open.is_empty() {
-        return None;
-    }
-    let task = open[fastrand::usize(..open.len())].as_str();
-    let (forge, repo) = &pool[fastrand::usize(..pool.len())];
-    Some((task, forge, repo))
+    None
 }
 
 /// Whether the drawn task has anything to act on in this repository.
@@ -69,6 +75,36 @@ pub fn actionable(task: &str, forge: &Forge, repo: &str) -> bool {
         warn!("{task} precheck failed for {repo}: {err:#}");
         true
     })
+}
+
+/// The commit the repository's default branch points at. Every forge's
+/// commit listing defaults to that branch, so one page of one commit answers
+/// it; GitHub and Gitea name the field `sha`, GitLab `id`.
+pub fn head_sha(forge: &Forge, repo: &str) -> Result<String> {
+    let commits = match forge.kind {
+        ForgeKind::Gitea => gitea_json(forge, &format!("repos/{repo}/commits?limit=1&stat=false"))?,
+        ForgeKind::Github => api_json(forge, "gh", &format!("repos/{repo}/commits?per_page=1"))?,
+        ForgeKind::Gitlab => api_json(
+            forge,
+            "glab",
+            &format!(
+                "projects/{}/repository/commits?per_page=1",
+                repo.replace('/', "%2F")
+            ),
+        )?,
+    };
+    first_sha(&commits).context("the commit listing named no commit")
+}
+
+/// The first commit's SHA in a listing, under either forge spelling of the
+/// field; None for an empty listing (a repository with no commits yet) or any
+/// other shape.
+fn first_sha(commits: &serde_json::Value) -> Option<String> {
+    let first = commits.as_array()?.first()?;
+    first["sha"]
+        .as_str()
+        .or_else(|| first["id"].as_str())
+        .map(str::to_owned)
 }
 
 /// Whether the repository has an unread notification (a pending todo on
@@ -314,7 +350,7 @@ mod tests {
             token: "tok".into(),
             user: String::new(),
             url: "https://github.com".into(),
-            disabled_repos: BTreeSet::new(),
+            enabled_repos: BTreeSet::new(),
         }
     }
 
@@ -369,8 +405,22 @@ mod tests {
         ];
         let forge = forge();
         let pool = [(&forge, "me/repo".to_owned())];
-        let (task, ..) = draw(&tasks, &pool, |_, _, _| false).unwrap();
+        let (task, ..) = draw(&tasks, &pool, |task, _, _| !gated(task)).unwrap();
         assert_eq!(task, "bump");
+    }
+
+    /// The ungated pass is checked too, so the skip cache can hold a task
+    /// back; only once nothing is left does the draw come up empty.
+    #[test]
+    fn draw_skips_an_ungated_task_the_check_rejects() {
+        let tasks = ["docs".to_owned(), "bump".to_owned()];
+        let forge = forge();
+        let pool = [(&forge, "me/repo".to_owned())];
+        for _ in 0..16 {
+            let (task, ..) = draw(&tasks, &pool, |task, _, _| task != "docs").unwrap();
+            assert_eq!(task, "bump");
+        }
+        assert!(draw(&tasks, &pool, |_, _, _| false).is_none());
     }
 
     #[test]
@@ -381,12 +431,35 @@ mod tests {
         assert!(draw(&tasks, &pool, |_, _, _| false).is_none());
     }
 
+    /// Every gated pair is probed before an ungated task is considered, so a
+    /// cheap cached task can never outrank a review comment.
     #[test]
-    fn draw_never_probes_ungated_tasks() {
-        let tasks = ["bump".to_owned()];
+    fn draw_probes_every_gated_pair_first() {
+        let tasks = ["docs".to_owned(), "rebase".to_owned()];
         let forge = forge();
-        let pool = [(&forge, "me/repo".to_owned())];
-        let (task, ..) = draw(&tasks, &pool, |task, _, _| panic!("probed {task}")).unwrap();
-        assert_eq!(task, "bump");
+        let pool = [(&forge, "me/one".to_owned()), (&forge, "me/two".to_owned())];
+        for _ in 0..16 {
+            let probed = std::cell::RefCell::new(Vec::new());
+            let (task, ..) = draw(&tasks, &pool, |task, _, repo| {
+                probed.borrow_mut().push(format!("{task} {repo}"));
+                task == "docs"
+            })
+            .unwrap();
+            assert_eq!(task, "docs");
+            let probed = probed.borrow();
+            assert_eq!(probed.len(), 3, "{probed:?}");
+            assert!(probed[..2].iter().all(|entry| entry.starts_with("rebase")));
+        }
+    }
+
+    #[test]
+    fn first_sha_reads_either_field() {
+        assert_eq!(
+            first_sha(&json!([{"sha": "abc"}, {"sha": "old"}])),
+            Some("abc".to_owned())
+        );
+        assert_eq!(first_sha(&json!([{"id": "abc"}])), Some("abc".to_owned()));
+        assert_eq!(first_sha(&json!([])), None);
+        assert_eq!(first_sha(&json!({"message": "empty repository"})), None);
     }
 }
