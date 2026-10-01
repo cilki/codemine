@@ -943,11 +943,17 @@
     renderTasks(s.tasks);
     $("claude-enabled").checked = s.claude.enabled;
     $("claude-base-url").value = s.claude.base_url;
+    // Both keys are optional, and each is useless for a different reason
+    // when unset, so the empty placeholder says which.
+    const UNSET = {
+      "api-key": "none — a keyless proxy takes any key",
+      "management-key": "none — no account status",
+    };
     for (const key of ["api-key", "management-key"]) {
       const input = $(`claude-${key}`);
       input.value = "";
       input.placeholder = s.claude[key.replace("-", "_") + "_set"]
-        ? "key set — leave blank to keep" : "no key";
+        ? "key set — leave blank to keep" : UNSET[key];
     }
     $("s-hourly-limit").value = s.hourly_limit ?? "";
     $("s-author-email").value = s.author_email;

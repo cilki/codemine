@@ -91,16 +91,18 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
     Ok(())
 }
 
+/// Stands in for the client key when none is configured. A CLIProxyAPI with
+/// an empty `api-keys` list — the default — accepts any key, but the
+/// anthropic provider refuses to send a request without one, so the field
+/// can't just be left out.
+const UNUSED_API_KEY: &str = "cliproxyapi";
+
 /// Point opencode's anthropic provider at CLIProxyAPI: base URL and client
 /// key merged into `opencode.json`, everything else preserved. The proxy
 /// speaks Anthropic's own API shape, so the stock provider works against it
-/// with no auth.json entry and no plugin. With no client key configured yet
-/// the file is left alone — an empty key would just break the provider. The
-/// file is made owner-only since it now carries the key.
+/// with no auth.json entry and no plugin. The file is made owner-only since
+/// it may carry the key.
 pub fn install_provider(dir: &Path, claude: &crate::settings::ClaudeSettings) -> Result<()> {
-    if claude.api_key.is_empty() {
-        return Ok(());
-    }
     let path = dir.join("opencode.json");
     let mut config: serde_json::Value = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -111,7 +113,11 @@ pub fn install_provider(dir: &Path, claude: &crate::settings::ClaudeSettings) ->
         // The provider's default is https://api.anthropic.com/v1, so the
         // version segment belongs to the base URL.
         "baseURL": format!("{}/v1", claude.base_url),
-        "apiKey": claude.api_key,
+        "apiKey": if claude.api_key.is_empty() {
+            UNUSED_API_KEY
+        } else {
+            &claude.api_key
+        },
     });
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
@@ -426,7 +432,8 @@ mod tests {
             ..Default::default()
         };
 
-        // No key yet: nothing written, nothing created.
+        // No key configured: the provider is still wired to the proxy, with
+        // the placeholder key a keyless proxy ignores.
         install_provider(
             dir.path(),
             &crate::settings::ClaudeSettings {
@@ -435,7 +442,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!path.exists());
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["apiKey"],
+            UNUSED_API_KEY
+        );
 
         install_provider(dir.path(), &claude).unwrap();
         let config: serde_json::Value =

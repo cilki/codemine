@@ -76,8 +76,10 @@ pub struct ClaudeSettings {
     /// management API share the port.
     pub base_url: String,
     /// A client key from the proxy's `api-keys` list; opencode presents it
-    /// in place of a real Anthropic credential. Write-only in the UI, like
-    /// forge tokens.
+    /// in place of a real Anthropic credential. Optional, since a proxy with
+    /// no `api-keys` configured takes any key — see
+    /// [`crate::prompts::install_provider`]. Write-only in the UI, like forge
+    /// tokens.
     pub api_key: String,
     /// The proxy's management key; optional. With it the account card shows
     /// live login and refresh state, without it only reachability.
@@ -232,11 +234,6 @@ impl Settings {
             problems.push(Problem::new(
                 "claude-card",
                 "no model provider is enabled; enable the Claude account",
-            ));
-        } else if self.claude.api_key.is_empty() {
-            problems.push(Problem::new(
-                "claude-api-key",
-                "the CLIProxyAPI client key is not set",
             ));
         }
         if self.model.is_empty() {
@@ -558,17 +555,21 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_proxy_key_is_a_problem() {
+    fn claude_keys_are_optional_but_the_section_must_be_enabled() {
+        // Neither key is required: a stock CLIProxyAPI needs no client key,
+        // and the management key only buys account status.
         let mut settings = configured();
         settings.claude.api_key = String::new();
+        settings.claude.management_key = String::new();
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert!(fields.iter().any(|f| f == "claude-api-key"), "{fields:?}");
-        assert!(settings.to_config(&cli()).is_none());
-        // Disabled entirely, the missing key stops mattering; the disabled
-        // section is the reported problem instead.
+        assert!(fields.is_empty(), "{fields:?}");
+        assert!(settings.to_config(&cli()).is_some());
+
+        // With no provider enabled there is nothing to run turns on.
         settings.claude.enabled = false;
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert!(!fields.iter().any(|f| f == "claude-api-key"), "{fields:?}");
+        assert!(fields.iter().any(|f| f == "claude-card"), "{fields:?}");
+        assert!(settings.to_config(&cli()).is_none());
     }
 
     #[test]
