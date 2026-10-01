@@ -55,6 +55,9 @@ fn main() -> Result<()> {
     setup(&mut cli)?;
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
+    // Point opencode at the Claude proxy before anything lists models; the
+    // web UI re-runs this whenever the proxy settings change.
+    prompts::install_provider(&prompts::opencode_config_dir(), &store.snapshot().0.claude)?;
     // The tasks that only read the tree remember the commit they last came up
     // empty on, so they aren't drawn again until it moves.
     let cache = cache::Cache::load(cli.workspace.join("skips.json"));
@@ -89,44 +92,34 @@ fn main() -> Result<()> {
     let mut sized_for: Option<f64> = None;
     let mut refilled = status::epoch_now();
     let mut applied_generation = None;
-    // The credentials file's mtime when a turn last died on unusable OAuth,
-    // and the epoch at which to try again regardless. Turns stay gated until
-    // a fresh login rewrites the file — or the deadline passes, since even a
-    // terminal verdict deserves a rare retry in case the file watch missed
-    // something.
-    let mut revoked: Option<(SystemTime, u64)> = None;
+    // The epoch until which turns are held after one died on Claude auth: a
+    // short flat pause, since refreshing is CLIProxyAPI's continuous job and
+    // anything it can't fix on its own needs a human either way — which the
+    // health problem below surfaces independently.
+    let mut auth_gated: Option<u64> = None;
     loop {
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
         // With the Claude section disabled nothing runs anyway (problems()
-        // says so), so the credentials file is left entirely unchecked.
-        if let Some((stamp, retry_at)) = revoked.filter(|_| settings.claude.enabled) {
-            if claude::credentials_stamp() != stamp {
-                info!("Claude credentials were replaced; resuming turns");
-                // Whatever wrote the file — the web UI login, an external
-                // `claude login` — may have just made the anthropic models
-                // listable again.
-                config::invalidate_models();
-                revoked = None;
-            } else if status::epoch_now() >= retry_at {
-                info!("retrying the Claude OAuth login after the gate expired");
-                revoked = None;
+        // says so), so the proxy is left entirely unchecked.
+        if let Some(retry_at) = auth_gated.filter(|_| settings.claude.enabled) {
+            if status::epoch_now() >= retry_at {
+                info!("retrying after the Claude auth gate expired");
+                auth_gated = None;
+                Status::update(&status, |s| s.oauth_gated_until = None);
             } else {
                 problems.push(Problem::new(
                     "claude-card",
-                    "the Claude OAuth login was revoked or could not be refreshed; \
-                     reconnect the Claude account",
+                    "the last turn failed to authenticate with the Claude proxy; \
+                     retrying shortly",
                 ));
             }
-            if revoked.is_none() {
-                Status::update(&status, |s| s.oauth_gated_until = None);
-            }
         }
-        if settings.claude.enabled && !claude::oauth_usable() {
-            problems.push(Problem::new(
-                "claude-card",
-                "no Claude account is connected; connect one in settings",
-            ));
+        if settings.claude.enabled
+            && problems.is_empty()
+            && let Some(message) = claude::problem(&settings.claude)
+        {
+            problems.push(Problem::new("claude-card", message));
         }
         if !problems.is_empty() {
             Status::update(&status, |s| {
@@ -210,29 +203,13 @@ fn main() -> Result<()> {
 
         match turn::run(&cfg, &status, &pending, &cache) {
             Ok(report) => {
-                // The plugin may have rotated the token mid-turn and only
-                // managed to park the new pair in opencode's auth.json;
-                // fold it back into the credentials file while no opencode
-                // process is alive to race with.
-                if let Err(err) =
-                    claude::reconcile(&claude::auth_json_path(), &claude::credentials_path())
-                {
-                    error!("failed to reconcile Claude credentials: {err:#}");
-                }
-                if let Some(wait) = gate_retry(
-                    &report.refresh,
-                    report.oauth_revoked,
-                    claude::token_expired_for(),
-                ) {
-                    let until = status::epoch_now() + wait;
+                if report.auth_error {
+                    let until = status::epoch_now() + AUTH_RETRY;
                     error!(
-                        "the turn died on Claude OAuth ({:?}); holding turns until {} \
-                         changes, retrying anyway in {} minutes",
-                        report.refresh,
-                        claude::credentials_path().display(),
-                        wait / 60,
+                        "the turn died on Claude auth; holding turns for {} minutes",
+                        AUTH_RETRY / 60
                     );
-                    revoked = Some((claude::credentials_stamp(), until));
+                    auth_gated = Some(until);
                     Status::update(&status, |s| s.oauth_gated_until = Some(until));
                 }
                 if report.completed {
@@ -271,38 +248,10 @@ fn main() -> Result<()> {
 
 const HOUR: f64 = 3600.0;
 
-/// How long to hold turns after one died on Claude OAuth, in seconds, or
-/// None when the turn didn't die on auth at all. Only a turn the log scan
-/// flagged gates — the refresh verdict alone doesn't, since a transient blip
-/// during an otherwise-working turn isn't worth pausing for — and the
-/// verdict then picks the duration. Every gate also clears the moment the
-/// credentials file is rewritten by a new login.
-fn gate_retry(refresh: &claude::Refresh, scan_hit: bool, expired_for: Option<u64>) -> Option<u64> {
-    if !scan_hit {
-        return None;
-    }
-    // Anthropic's token endpoint reports a dead refresh token as a 429 rate
-    // limit rather than invalid_grant, so a "transient" failure that has
-    // outlived the access token by hours is terminal in all but name. Real
-    // rate limits and outages clear well within the grace period, and a
-    // fresh login clears the long gate instantly through the file watch.
-    const DEAD_TOKEN_GRACE: u64 = 2 * 60 * 60;
-    let long_dead = expired_for.is_some_and(|dead| dead > DEAD_TOKEN_GRACE);
-    Some(match refresh {
-        // A rejected refresh token only a new login can fix: the deadline is
-        // a rare just-in-case retry, the file watch is the real exit.
-        claude::Refresh::Terminal { .. } => 6 * 60 * 60,
-        claude::Refresh::Transient { .. } | claude::Refresh::Unavailable if long_dead => {
-            6 * 60 * 60
-        }
-        // A rate limit or outage passes on its own.
-        claude::Refresh::Transient { .. } | claude::Refresh::Unavailable => 5 * 60,
-        // No verdict (plugin too old to log one, or an API-side revocation
-        // after a clean refresh): the scan strings can't tell terminal from
-        // transient, so split the difference.
-        claude::Refresh::Ok | claude::Refresh::NoData => 30 * 60,
-    })
-}
+/// How long turns are held after one died on Claude auth, in seconds. Flat
+/// and short: refreshing is the proxy's continuous job, so either the blip
+/// passes on its own or the health check surfaces what a human must fix.
+const AUTH_RETRY: u64 = 5 * 60;
 
 /// How many turns the bucket holds when full: an hour's worth, but never
 /// less than one, so a fractional limit still lets a turn through — 0.5 an
@@ -369,13 +318,12 @@ fn init_logging() {
 fn setup(cli: &mut Cli) -> Result<()> {
     // Install the embedded prompts where opencode resolves commands and
     // skills by name, so the binary works without the image copying them,
-    // link the Claude OAuth plugin into opencode's plugin directory
-    // (dropping any stale anthropic credential a previous version left
-    // behind), and wire the codegraph MCP server into opencode's config when
-    // the CLI is actually installed.
+    // retire whatever the opencode-claude-auth era left behind (plugin
+    // links, npm references, the stale anthropic credential), and wire the
+    // codegraph MCP server into opencode's config when the CLI is actually
+    // installed.
     prompts::install(&prompts::opencode_config_dir())?;
-    prompts::install_plugin(&prompts::opencode_config_dir())?;
-    claude::scrub_anthropic_auth(&claude::auth_json_path(), &claude::credentials_path())?;
+    prompts::remove_claude_plugin(&prompts::opencode_config_dir(), &prompts::opencode_auth_json())?;
     prompts::install_mcp(
         &prompts::opencode_config_dir(),
         workspace::codegraph_available(),
@@ -607,59 +555,6 @@ mod tests {
         // stays — slowing down mid-hour doesn't bank a debt.
         assert_eq!(resized(4.0, capacity(4.0), capacity(1.0)), 1.0);
         assert_eq!(resized(0.5, capacity(4.0), capacity(1.0)), 0.5);
-    }
-
-    #[test]
-    fn oauth_gate_follows_the_refresh_verdict() {
-        use crate::claude::Refresh;
-        // No auth failure in the turn log: never gate, whatever the verdict.
-        assert_eq!(
-            gate_retry(&Refresh::Terminal { reason: None }, false, None),
-            None
-        );
-        assert_eq!(gate_retry(&Refresh::Ok, false, None), None);
-        // A flagged turn gates for as long as the verdict warrants.
-        assert_eq!(
-            gate_retry(&Refresh::Terminal { reason: None }, true, None),
-            Some(6 * 60 * 60)
-        );
-        assert_eq!(
-            gate_retry(&Refresh::Transient { reason: None }, true, None),
-            Some(5 * 60)
-        );
-        assert_eq!(gate_retry(&Refresh::Unavailable, true, None), Some(5 * 60));
-        assert_eq!(gate_retry(&Refresh::NoData, true, None), Some(30 * 60));
-        assert_eq!(gate_retry(&Refresh::Ok, true, None), Some(30 * 60));
-    }
-
-    #[test]
-    fn oauth_gate_treats_a_long_expired_transient_as_terminal() {
-        use crate::claude::Refresh;
-        let transient = Refresh::Transient {
-            reason: Some("rate_limit_error".into()),
-        };
-        // Freshly expired: still a plausible rate limit, keep the quick retry.
-        assert_eq!(gate_retry(&transient, true, Some(60)), Some(5 * 60));
-        assert_eq!(
-            gate_retry(&transient, true, Some(2 * 60 * 60)),
-            Some(5 * 60)
-        );
-        // Hours past expiry with refreshes still failing: the endpoint is
-        // tarpitting a dead refresh token, so gate like a terminal verdict.
-        assert_eq!(
-            gate_retry(&transient, true, Some(2 * 60 * 60 + 1)),
-            Some(6 * 60 * 60)
-        );
-        assert_eq!(
-            gate_retry(&Refresh::Unavailable, true, Some(3 * 60 * 60)),
-            Some(6 * 60 * 60)
-        );
-        // The no-verdict fallbacks are left alone: without a failing refresh
-        // on record, a stale expiry proves nothing.
-        assert_eq!(
-            gate_retry(&Refresh::NoData, true, Some(3 * 60 * 60)),
-            Some(30 * 60)
-        );
     }
 
     #[test]

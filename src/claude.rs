@@ -1,275 +1,217 @@
-//! Claude OAuth credential handling. The opencode-claude-auth plugin owns
-//! token *refreshing* — a refresh rotates the single-use refresh token, so
-//! only one party may do it — while this module owns everything around it:
-//! the browser login flow the web UI drives, the canonical credentials file
-//! Claude Code also reads and writes, reconciliation of rotations the plugin
-//! parked in opencode's auth.json, and a health digest of the plugin's
-//! refresh log so failures are diagnosed structurally instead of scraped
-//! from the turn output.
+//! Claude auth health, as reported by CLIProxyAPI. The proxy owns the
+//! subscription OAuth login and refreshes it continuously on its own —
+//! codemine never touches tokens. Logins happen out-of-band (`cliproxyapi
+//! --claude-login` on the host); this module only asks the proxy's
+//! management API how the account is doing, for the web UI's card and the
+//! main loop's gate.
 
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
-/// The OAuth client Claude Code itself registers; logins minted with it get
-/// subscription billing rather than metered API usage.
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
-const REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
-const SCOPE: &str = "org:create_api_key user:profile user:inference";
+use crate::settings::ClaudeSettings;
 
-/// Where Claude Code keeps the OAuth credentials the plugin reads and
-/// refreshes; the canonical store, so an external `claude login` keeps
-/// working alongside the web UI flow.
-pub fn credentials_path() -> PathBuf {
-    crate::config::home().join(".claude/.credentials.json")
+/// Where CLIProxyAPI listens by default; both the Anthropic-compatible API
+/// opencode talks to and the management API share it.
+pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8317";
+
+/// A point-in-time picture of the proxy and its Claude account for the web
+/// UI and the main loop's gate. Without a management key only reachability
+/// is known and the account fields stay empty.
+#[derive(Clone, PartialEq, Serialize)]
+pub struct AuthHealth {
+    /// The proxy answered HTTP at all.
+    pub proxy_up: bool,
+    /// The fields below come from the management API rather than being
+    /// assumed; false when no management key is configured.
+    pub managed: bool,
+    /// At least one live Claude credential is logged into the proxy.
+    /// Assumed true while unmanaged — turns find out the hard way.
+    pub connected: bool,
+    pub email: Option<String>,
+    pub last_refresh: Option<String>,
+    /// The credential's own status is healthy; refreshing is the proxy's
+    /// continuous background job, so false means the login needs redoing.
+    pub refresh_ok: bool,
+    pub success: Option<u64>,
+    pub failed: Option<u64>,
+    /// The management query itself failed (rejected key, unexpected shape);
+    /// account fields fall back to assumptions while this is set.
+    pub error: Option<String>,
 }
 
-/// Where opencode stores provider credentials, which the plugin mirrors
-/// every token rotation into.
-pub fn auth_json_path() -> PathBuf {
-    crate::config::xdg_dir("XDG_DATA_HOME", ".local/share").join("opencode/auth.json")
+/// What blocks turns from running, as a message for the account card; None
+/// when the proxy looks usable. A failed management query does not block —
+/// inference may still work, and the error shows on the card instead.
+pub fn problem(claude: &ClaudeSettings) -> Option<String> {
+    let health = health(claude);
+    if !health.proxy_up {
+        return Some(format!(
+            "CLIProxyAPI is unreachable at {}; is the service running?",
+            claude.base_url
+        ));
+    }
+    if health.managed && !health.connected {
+        return Some(
+            "no Claude account is logged into CLIProxyAPI; \
+             run `cliproxyapi --claude-login` on the host"
+                .into(),
+        );
+    }
+    None
 }
 
-/// Where the plugin logs each refresh attempt's outcome (tokens redacted)
-/// when `CLAUDE_AUTH_DEBUG` names this path. Truncated at every opencode
-/// start that carries the variable, so it holds the latest turn's story.
-pub fn debug_log_path() -> PathBuf {
-    crate::config::xdg_dir("XDG_DATA_HOME", ".local/share").join("opencode/claude-auth-debug.log")
+/// How long a health reading stands before the proxy is asked again: the 5s
+/// main loop and the 2s event stream both read it, and each probe shells out
+/// to curl.
+const HEALTH_TTL: Duration = Duration::from_secs(10);
+
+static HEALTH: Mutex<Option<(Instant, String, AuthHealth)>> = Mutex::new(None);
+
+/// The current health, probed through the management API when a key is
+/// configured and by plain reachability otherwise; cached briefly.
+pub fn health(claude: &ClaudeSettings) -> AuthHealth {
+    let key = format!("{}|{}", claude.base_url, claude.management_key);
+    let mut cached = HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, for_key, health)) = &*cached
+        && at.elapsed() < HEALTH_TTL
+        && *for_key == key
+    {
+        return health.clone();
+    }
+    let health = probe(claude);
+    *cached = Some((Instant::now(), key, health.clone()));
+    health
 }
 
-/// A fingerprint of the credentials file that changes when it's rewritten,
-/// so a fresh login is detectable; a missing file maps to the epoch.
-pub fn credentials_stamp() -> SystemTime {
-    std::fs::metadata(credentials_path())
-        .and_then(|meta| meta.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
+fn probe(claude: &ClaudeSettings) -> AuthHealth {
+    if claude.management_key.is_empty() {
+        // Any HTTP answer at all proves the proxy is there; whether a login
+        // is installed can't be known without the management API.
+        let up = curl_get(&claude.base_url, None).is_ok();
+        return AuthHealth {
+            proxy_up: up,
+            managed: false,
+            connected: up,
+            email: None,
+            last_refresh: None,
+            refresh_ok: true,
+            success: None,
+            failed: None,
+            error: None,
+        };
+    }
+    let url = format!("{}/v0/management/auth-files", claude.base_url);
+    match curl_get(&url, Some(&claude.management_key)) {
+        Ok((200, body)) => match serde_json::from_str(&body) {
+            Ok(files) => health_from(&files),
+            Err(_) => unmanaged(true, "the management API returned unexpected output"),
+        },
+        Ok((status, _)) => unmanaged(true, &format!("the management API answered HTTP {status}")),
+        Err(_) => unmanaged(false, "the proxy is unreachable"),
+    }
 }
 
-/// Whether opencode can authenticate: the plugin needs a credentials file
-/// with both tokens present. Expiry is deliberately not checked — an expired
-/// access token with a live refresh token is the plugin's normal case.
-pub fn oauth_usable() -> bool {
-    usable_at(&credentials_path())
+/// Health when the management API couldn't be read: reachability is all
+/// that's known, so the account is assumed fine and the error is surfaced.
+fn unmanaged(proxy_up: bool, error: &str) -> AuthHealth {
+    AuthHealth {
+        proxy_up,
+        managed: false,
+        connected: proxy_up,
+        email: None,
+        last_refresh: None,
+        refresh_ok: true,
+        success: None,
+        failed: None,
+        error: proxy_up.then(|| error.to_owned()),
+    }
 }
 
-/// How long ago the stored access token expired, in seconds — None when no
-/// expiry is stored or the token is still live. The expiry only moves
-/// forward on a successful refresh or a fresh login, so a large value while
-/// refreshes keep failing means the refresh token is dead no matter what
-/// the endpoint claims: Anthropic answers burned refresh tokens with 429
-/// rate limits rather than invalid_grant.
-pub fn token_expired_for() -> Option<u64> {
-    let now_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_millis() as u64;
-    expired_for_at(&credentials_path(), now_ms)
+/// Distill the management API's auth-files listing into health. Kept pure
+/// (JSON in, health out) so the parse is testable against captured fixtures.
+fn health_from(files: &serde_json::Value) -> AuthHealth {
+    let empty = Vec::new();
+    let claude_entries: Vec<&serde_json::Value> = files["files"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter(|entry| is_claude_entry(entry))
+        .collect();
+    // The first entry that isn't disabled speaks for the account; codemine
+    // deployments hold one login, not a load-balanced pool.
+    let live = claude_entries
+        .iter()
+        .find(|entry| !entry["disabled"].as_bool().unwrap_or(false));
+    AuthHealth {
+        proxy_up: true,
+        managed: true,
+        connected: live.is_some(),
+        email: live.and_then(|entry| entry["email"].as_str().map(String::from)),
+        // last_refresh is null until the proxy's first refresh; the auth
+        // file's mtime moves on every rotation, so it stands in.
+        last_refresh: live.and_then(|entry| {
+            ["last_refresh", "modtime"]
+                .iter()
+                .find_map(|key| entry[key].as_str().map(String::from))
+        }),
+        refresh_ok: live.is_some_and(|entry| {
+            // "active" is the healthy status; unknown ones get the benefit
+            // of the doubt so a proxy upgrade can't read as a dead login.
+            !entry["unavailable"].as_bool().unwrap_or(false)
+                && !matches!(
+                    entry["status"].as_str().unwrap_or("active"),
+                    "error" | "failed" | "expired" | "invalid"
+                )
+        }),
+        success: live.and_then(|entry| entry["success"].as_u64()),
+        failed: live.and_then(|entry| entry["failed"].as_u64()),
+        error: None,
+    }
 }
 
-fn expired_for_at(path: &Path, now_ms: u64) -> Option<u64> {
-    let expires_ms = read_json(path)?["claudeAiOauth"]["expiresAt"].as_u64()?;
-    (now_ms > expires_ms).then(|| (now_ms - expires_ms) / 1000)
-}
-
-fn usable_at(path: &Path) -> bool {
-    read_json(path).is_some_and(|credentials| {
-        ["accessToken", "refreshToken"].iter().all(|key| {
-            credentials["claudeAiOauth"][key]
-                .as_str()
-                .is_some_and(|token| !token.is_empty())
-        })
+/// Whether an auth-files entry belongs to the Claude provider. The listing
+/// covers every provider the proxy holds; Claude entries are recognized by
+/// an explicit provider field or a claude-prefixed file name.
+fn is_claude_entry(entry: &serde_json::Value) -> bool {
+    ["provider", "type", "channel"].iter().any(|key| {
+        entry[key]
+            .as_str()
+            .is_some_and(|value| value.contains("claude") || value.contains("anthropic"))
+    }) || ["id", "name"].iter().any(|key| {
+        entry[key]
+            .as_str()
+            .is_some_and(|value| value.contains("claude") || value.contains("anthropic"))
     })
 }
 
-fn read_json(path: &Path) -> Option<serde_json::Value> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
-}
-
-/// A freshly exchanged token pair, plus whatever optional metadata the token
-/// endpoint volunteered. Deliberately not Debug: the fields are secrets.
-pub struct Tokens {
-    pub access: String,
-    pub refresh: String,
-    pub expires_at_ms: u64,
-    pub scopes: Option<Vec<String>>,
-    pub subscription_type: Option<String>,
-}
-
-/// Install a token pair into the credentials file, preserving any fields it
-/// already carries that this module doesn't know about — Claude Code stores
-/// more than the plugin reads, and a login must not strip it.
-pub fn write_credentials(path: &Path, tokens: &Tokens) -> Result<()> {
-    let mut blob = read_json(path).unwrap_or_else(|| serde_json::json!({}));
-    if !blob.is_object() {
-        blob = serde_json::json!({});
+/// GET a URL through curl, returning the HTTP status and body; Err means no
+/// HTTP conversation happened at all. The management key goes over stdin via
+/// curl's config syntax rather than argv, where it would be readable in the
+/// process listing.
+fn curl_get(url: &str, management_key: Option<&str>) -> Result<(u16, String)> {
+    let mut command = Command::new("curl");
+    command.args(["-sS", "--max-time", "5", "-w", "\n%{http_code}", url]);
+    let mut child = match management_key {
+        Some(_) => command.args(["--config", "-"]),
+        None => &mut command,
     }
-    let oauth = blob
-        .as_object_mut()
-        .expect("blob was just made an object")
-        .entry("claudeAiOauth")
-        .or_insert_with(|| serde_json::json!({}));
-    if !oauth.is_object() {
-        *oauth = serde_json::json!({});
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .context("failed to run curl")?;
+    if let Some(key) = management_key {
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(format!("header = \"X-Management-Key: {key}\"\n").as_bytes())?;
     }
-    let oauth = oauth
-        .as_object_mut()
-        .expect("entry was just made an object");
-    oauth.insert("accessToken".into(), tokens.access.clone().into());
-    oauth.insert("refreshToken".into(), tokens.refresh.clone().into());
-    oauth.insert("expiresAt".into(), tokens.expires_at_ms.into());
-    if let Some(scopes) = &tokens.scopes {
-        oauth.insert("scopes".into(), scopes.clone().into());
-    }
-    if let Some(subscription) = &tokens.subscription_type {
-        oauth.insert("subscriptionType".into(), subscription.clone().into());
-    }
-    write_json_600(path, &blob)
-}
-
-/// Replace `path` with `value` serialized, private to the owner. Atomic via
-/// rename when the filesystem allows it, so readers (the plugin at turn
-/// start, the main loop every pass) see the old or the new file, never a
-/// torn one. When `path` is itself a mountpoint — docker's single-file bind
-/// mount pins the inode and rename fails with EBUSY — the file is rewritten
-/// in place instead: a rare torn read beats losing a token rotation that
-/// can never be replayed.
-fn write_json_600(path: &Path, value: &serde_json::Value) -> Result<()> {
-    let dir = path
-        .parent()
-        .with_context(|| format!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let bytes = serde_json::to_vec(value)?;
-    let mut file = tempfile::NamedTempFile::new_in(dir)
-        .with_context(|| format!("failed to stage a file in {}", dir.display()))?;
-    file.write_all(&bytes)?;
-    file.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    if let Err(persist) = file.persist(path) {
-        tracing::warn!(
-            "rewriting {} in place; it couldn't be replaced: {}",
-            path.display(),
-            persist.error
-        );
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("failed to rewrite {}", path.display()))?;
-        file.write_all(&bytes)?;
-        // create's mode only applies to new files; existing ones keep
-        // whatever they had.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-/// A login the web UI has started: the URL for the user's browser and the
-/// PKCE verifier the eventual code exchange must present.
-pub struct Login {
-    pub url: String,
-    pub verifier: String,
-}
-
-pub fn begin_login() -> Result<Login> {
-    let verifier = random_verifier()?;
-    let url = format!(
-        "{AUTHORIZE_URL}?code=true&client_id={CLIENT_ID}&response_type=code\
-         &redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={verifier}",
-        urlencode(REDIRECT_URI),
-        urlencode(SCOPE),
-        challenge(&verifier),
-    );
-    Ok(Login { url, verifier })
-}
-
-/// 32 bytes of kernel randomness as base64url: 43 characters from the
-/// unreserved set, comfortably inside RFC 7636's 43-128 bounds. The verifier
-/// is a secret, so this deliberately avoids fastrand (not a CSPRNG).
-fn random_verifier() -> Result<String> {
-    let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .context("failed to read /dev/urandom")?;
-    Ok(base64url(&bytes))
-}
-
-fn challenge(verifier: &str) -> String {
-    base64url(&Sha256::digest(verifier.as_bytes()))
-}
-
-/// RFC 4648 §5 base64url without padding.
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let word = u32::from_be_bytes([
-            0,
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ]);
-        for shift in (0..=chunk.len()).map(|i| 18 - 6 * i) {
-            out.push(ALPHABET[(word >> shift) as usize & 63] as char);
-        }
-    }
-    out
-}
-
-/// Percent-encode everything outside RFC 3986's unreserved set.
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-/// Exchange the string the user pasted back for a token pair. `pasted` is
-/// `code#state` as issued by the authorize page; the state must match the
-/// verifier of the login this exchange belongs to, which also catches a
-/// mangled paste before it costs a round trip.
-pub fn exchange(pasted: &str, verifier: &str) -> Result<Tokens> {
-    let (code, state) = split_code(pasted, verifier)?;
-    let body = serde_json::json!({
-        "code": code,
-        "state": state,
-        "grant_type": "authorization_code",
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "code_verifier": verifier,
-    });
-    // The body carries the single-use code and the verifier, so it goes over
-    // stdin rather than argv (same reasoning as precheck's gitea_json). The
-    // trailing -w line smuggles the HTTP status out alongside the body.
-    let mut child = Command::new("curl")
-        .args(["-sS", "--max-time", "15", "-X", "POST"])
-        .args(["-H", "Content-Type: application/json"])
-        .args(["--data", "@-", "-w", "\n%{http_code}", TOKEN_URL])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to run curl")?;
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(body.to_string().as_bytes())?;
     let output = child.wait_with_output()?;
     if !output.status.success() {
         bail!(
@@ -278,24 +220,12 @@ pub fn exchange(pasted: &str, verifier: &str) -> Result<Tokens> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    parse_exchange(&String::from_utf8_lossy(&output.stdout), now_ms())
+    split_status(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn split_code<'a>(pasted: &'a str, verifier: &str) -> Result<(&'a str, &'a str)> {
-    let pasted = pasted.trim();
-    let Some((code, state)) = pasted.split_once('#') else {
-        bail!("expected a code of the form code#state; paste it exactly as shown");
-    };
-    if state != verifier {
-        bail!("the pasted code belongs to a different login attempt; start over");
-    }
-    Ok((code, state))
-}
-
-/// Split curl's output into body and trailing status line and turn a 2xx
-/// into tokens. Kept pure (stdout in, tokens out) so the error paths are
-/// testable without a network.
-fn parse_exchange(stdout: &str, now_ms: u64) -> Result<Tokens> {
+/// Split curl's output into body and the trailing status line its -w format
+/// appends. Kept pure for tests.
+fn split_status(stdout: &str) -> Result<(u16, String)> {
     let (body, status) = stdout
         .trim_end()
         .rsplit_once('\n')
@@ -304,218 +234,7 @@ fn parse_exchange(stdout: &str, now_ms: u64) -> Result<Tokens> {
         .trim()
         .parse()
         .context("curl reported no HTTP status")?;
-    if !(200..300).contains(&status) {
-        bail!("token endpoint answered HTTP {status}: {}", body.trim());
-    }
-    let parsed: serde_json::Value =
-        serde_json::from_str(body).context("token endpoint returned unexpected output")?;
-    let access = parsed["access_token"]
-        .as_str()
-        .context("token endpoint returned no access_token")?;
-    let refresh = parsed["refresh_token"]
-        .as_str()
-        .context("token endpoint returned no refresh_token")?;
-    Ok(Tokens {
-        access: access.into(),
-        refresh: refresh.into(),
-        // The plugin's own fallback lifetime when the endpoint omits one.
-        expires_at_ms: now_ms + parsed["expires_in"].as_u64().unwrap_or(36_000) * 1000,
-        scopes: parsed["scope"]
-            .as_str()
-            .map(|scope| scope.split_whitespace().map(String::from).collect()),
-        subscription_type: parsed["subscription_type"].as_str().map(String::from),
-    })
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Drop the anthropic entry from opencode's stored credentials so the plugin
-/// re-derives it from the Claude Code credentials file: a stale or hand-added
-/// entry makes opencode call Anthropic as a plain third-party app, which
-/// bills extra usage instead of the subscription. A missing or malformed
-/// file is left for opencode to sort out.
-///
-/// The entry can also hold the only live refresh token: the plugin mirrors
-/// every OAuth rotation into auth.json, but its write-back to the credentials
-/// file can fail silently, and a rotation invalidates the refresh token it
-/// was exchanged for. A newer pair is copied into the credentials file before
-/// the entry is dropped, so a restart can't destroy it — and when that copy
-/// fails, the entry stays put rather than be destroyed with it.
-pub fn scrub_anthropic_auth(path: &Path, credentials: &Path) -> Result<()> {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Ok(());
-    };
-    let Ok(mut auth) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        tracing::warn!("{} is not valid JSON; leaving it alone", path.display());
-        return Ok(());
-    };
-    let Some(entry) = auth
-        .as_object_mut()
-        .and_then(|auth| auth.remove("anthropic"))
-    else {
-        return Ok(());
-    };
-    if let Err(err) = rescue_rotation(&entry, credentials) {
-        tracing::warn!(
-            "leaving the anthropic entry in {}; its OAuth pair couldn't be saved: {err:#}",
-            path.display()
-        );
-        return Ok(());
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(&auth)?)
-        .with_context(|| format!("failed to write {}", path.display()))
-}
-
-/// The between-turns half of the scrub: rescue a newer rotation out of
-/// auth.json without touching the entry itself — while the runner is live
-/// the plugin owns that mirror, and deleting it every turn would fight the
-/// plugin's own syncing for no gain.
-pub fn reconcile(path: &Path, credentials: &Path) -> Result<()> {
-    let Some(auth) = read_json(path) else {
-        return Ok(());
-    };
-    match auth.get("anthropic") {
-        Some(entry) => rescue_rotation(entry, credentials),
-        None => Ok(()),
-    }
-}
-
-/// Copy the auth.json entry's OAuth pair into the Claude Code credentials
-/// file when it is a newer rotation than the one stored there, judged by
-/// expiry, which only moves forward on a real refresh. Entries that aren't a
-/// full OAuth pair (plain API keys, malformed leftovers) rescue nothing, and
-/// a missing credentials file or one without the expected login shape is left
-/// alone — the rescue repairs an existing login, it doesn't manufacture one.
-fn rescue_rotation(entry: &serde_json::Value, credentials: &Path) -> Result<()> {
-    let (Some(access), Some(refresh), Some(expires)) = (
-        entry["access"].as_str(),
-        entry["refresh"].as_str(),
-        entry["expires"].as_u64(),
-    ) else {
-        return Ok(());
-    };
-    let Ok(bytes) = std::fs::read(credentials) else {
-        return Ok(());
-    };
-    let mut blob: serde_json::Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("{} is not valid JSON", credentials.display()))?;
-    let Some(oauth) = blob["claudeAiOauth"].as_object_mut() else {
-        return Ok(());
-    };
-    if expires <= oauth.get("expiresAt").and_then(|v| v.as_u64()).unwrap_or(0) {
-        return Ok(());
-    }
-    oauth.insert("accessToken".into(), access.into());
-    oauth.insert("refreshToken".into(), refresh.into());
-    oauth.insert("expiresAt".into(), expires.into());
-    write_json_600(credentials, &blob)?;
-    tracing::info!(
-        "rescued a newer Claude OAuth rotation into {}",
-        credentials.display()
-    );
-    Ok(())
-}
-
-/// The verdict of the plugin's most recent refresh attempt, distilled from
-/// its debug log. Terminal means the refresh token itself was rejected —
-/// only a new login helps — while transient covers rate limits, outages, and
-/// anything else worth retrying.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum Refresh {
-    Ok,
-    Terminal { reason: Option<String> },
-    Transient { reason: Option<String> },
-    Unavailable,
-    NoData,
-}
-
-/// Distill the plugin's JSONL debug log down to one refresh verdict. The
-/// log is truncated at each turn's opencode start, so it covers exactly one
-/// turn. A success resets the verdict; between successes the *worst* event
-/// wins rather than the last, because a dead-token failure trails follow-up
-/// events (`refresh_exhausted`, `credentials_unavailable`) that would
-/// otherwise mask the terminal diagnosis. Malformed lines and unrelated
-/// events are skipped.
-pub fn refresh_digest(path: &Path) -> Refresh {
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return Refresh::NoData;
-    };
-    let Ok(tail) = crate::turn::read_tail(&mut file, 64 * 1024) else {
-        return Refresh::NoData;
-    };
-    let mut digest = Refresh::NoData;
-    for line in tail.lines() {
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let reason = || {
-            ["oauthError", "error"]
-                .iter()
-                .find_map(|key| event[key].as_str().map(String::from))
-        };
-        let verdict = match event["event"].as_str() {
-            Some("refresh_success") => Refresh::Ok,
-            Some("refresh_terminal") => Refresh::Terminal { reason: reason() },
-            Some("refresh_transient" | "refresh_exhausted") => {
-                Refresh::Transient { reason: reason() }
-            }
-            Some("refresh_failed") => match event["kind"].as_str() {
-                Some("terminal") => Refresh::Terminal { reason: reason() },
-                Some("transient") => Refresh::Transient { reason: reason() },
-                // The CLI-fallback failures carry no kind and say nothing
-                // about the token itself.
-                _ => continue,
-            },
-            Some("credentials_unavailable") => Refresh::Unavailable,
-            _ => continue,
-        };
-        digest = match (severity(&digest), severity(&verdict)) {
-            // A success wipes the slate; failures accumulate to the worst.
-            _ if verdict == Refresh::Ok => Refresh::Ok,
-            (held, new) if new > held => verdict,
-            _ => digest,
-        };
-    }
-    digest
-}
-
-/// How bad a verdict is, for worst-event-wins folding.
-fn severity(refresh: &Refresh) -> u8 {
-    match refresh {
-        Refresh::NoData | Refresh::Ok => 0,
-        Refresh::Unavailable => 1,
-        Refresh::Transient { .. } => 2,
-        Refresh::Terminal { .. } => 3,
-    }
-}
-
-/// A point-in-time picture of Claude auth for the web UI: whether a login is
-/// installed, when its access token lapses, and how the plugin's last
-/// refresh went. Derived fresh on every read; nothing is stored.
-#[derive(Clone, PartialEq, Serialize)]
-pub struct AuthHealth {
-    pub connected: bool,
-    pub expires_at: Option<u64>,
-    pub refresh: Refresh,
-}
-
-pub fn health() -> AuthHealth {
-    health_at(&credentials_path(), &debug_log_path())
-}
-
-fn health_at(credentials: &Path, log: &Path) -> AuthHealth {
-    AuthHealth {
-        connected: usable_at(credentials),
-        expires_at: read_json(credentials)
-            .and_then(|blob| blob["claudeAiOauth"]["expiresAt"].as_u64()),
-        refresh: refresh_digest(log),
-    }
+    Ok((status, body.to_owned()))
 }
 
 #[cfg(test)]
@@ -523,312 +242,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64url_matches_rfc4648_vectors() {
-        assert_eq!(base64url(b""), "");
-        assert_eq!(base64url(b"f"), "Zg");
-        assert_eq!(base64url(b"fo"), "Zm8");
-        assert_eq!(base64url(b"foo"), "Zm9v");
-        assert_eq!(base64url(b"foob"), "Zm9vYg");
-        assert_eq!(base64url(b"fooba"), "Zm9vYmE");
-        assert_eq!(base64url(b"foobar"), "Zm9vYmFy");
-        // Bytes that exercise the url-safe alphabet ('-' and '_').
-        assert_eq!(base64url(&[0xfb, 0xff]), "-_8");
-    }
-
-    #[test]
-    fn challenge_matches_rfc7636_vector() {
+    fn split_status_separates_body_and_code() {
         assert_eq!(
-            challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+            split_status("{\"files\":[]}\n200").unwrap(),
+            (200, "{\"files\":[]}".into())
         );
+        assert_eq!(split_status("\n404").unwrap(), (404, "".into()));
+        // curl reports 000 when the connection never happened.
+        assert_eq!(split_status("000").unwrap().0, 0);
+        assert!(split_status("").is_err());
+        assert!(split_status("not a status").is_err());
     }
 
     #[test]
-    fn login_url_carries_the_flow_parameters() {
-        let login = begin_login().unwrap();
-        assert_eq!(login.verifier.len(), 43);
-        assert!(
-            login
-                .verifier
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    fn health_reads_a_live_claude_entry() {
+        // Trimmed from a real CLIProxyAPI 7.3.2 auth-files response.
+        let files = serde_json::json!({ "files": [{
+            "account": "user@example.com",
+            "account_type": "oauth",
+            "disabled": false,
+            "email": "user@example.com",
+            "failed": 1,
+            "id": "claude-user@example.com.json",
+            "last_refresh": null,
+            "modtime": "2026-09-29T22:13:47.616218931-05:00",
+            "provider": "claude",
+            "status": "active",
+            "status_message": "",
+            "success": 12,
+            "type": "claude",
+            "unavailable": false,
+        }], "observed_at": "2026-09-30T03:13:13Z" });
+        let health = health_from(&files);
+        assert!(health.proxy_up && health.managed && health.connected);
+        assert!(health.refresh_ok);
+        assert_eq!(health.email.as_deref(), Some("user@example.com"));
+        // A null last_refresh falls back to the auth file's mtime.
+        assert_eq!(
+            health.last_refresh.as_deref(),
+            Some("2026-09-29T22:13:47.616218931-05:00")
         );
-        assert!(login.url.starts_with("https://claude.ai/oauth/authorize?"));
-        for expected in [
-            "code=true",
-            "response_type=code",
-            "code_challenge_method=S256",
-            "scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference",
-            "redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback",
-            &format!("state={}", login.verifier),
-            &format!("code_challenge={}", challenge(&login.verifier)),
+        assert_eq!((health.success, health.failed), (Some(12), Some(1)));
+        assert_eq!(health.error, None);
+    }
+
+    #[test]
+    fn health_without_claude_entries_is_disconnected() {
+        for files in [
+            serde_json::json!({ "files": [] }),
+            serde_json::json!({}),
+            // Another provider's login is not a Claude login.
+            serde_json::json!({ "files": [{ "id": "gemini-x.json", "status": "ready" }] }),
+            // A disabled credential doesn't count either.
+            serde_json::json!({ "files": [{ "id": "claude-x.json", "disabled": true }] }),
         ] {
-            assert!(login.url.contains(expected), "missing {expected}");
+            let health = health_from(&files);
+            assert!(health.proxy_up && health.managed);
+            assert!(!health.connected, "{files}");
+            assert!(!health.refresh_ok);
         }
     }
 
     #[test]
-    fn split_code_validates_the_paste() {
-        assert_eq!(split_code(" abc#v ", "v").unwrap(), ("abc", "v"));
-        assert!(split_code("abc", "v").is_err());
-        assert!(split_code("abc#other", "v").is_err());
-    }
-
-    #[test]
-    fn parse_exchange_handles_success_and_failure() {
-        let ok = parse_exchange(
-            "{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_in\":3600,\
-             \"scope\":\"user:inference user:profile\"}\n200",
-            1_000,
-        )
-        .unwrap();
-        assert_eq!(ok.access, "a");
-        assert_eq!(ok.refresh, "r");
-        assert_eq!(ok.expires_at_ms, 1_000 + 3_600_000);
-        assert_eq!(
-            ok.scopes.as_deref(),
-            Some(&["user:inference".to_string(), "user:profile".to_string()][..])
-        );
-        assert!(ok.subscription_type.is_none());
-
-        let denied = parse_exchange("{\"error\":\"invalid_grant\"}\n400", 0)
-            .err()
-            .expect("a 400 must not parse");
-        assert!(denied.to_string().contains("HTTP 400"), "{denied:#}");
-        assert!(denied.to_string().contains("invalid_grant"), "{denied:#}");
-
-        assert!(parse_exchange("not json\n200", 0).is_err());
-        assert!(parse_exchange("", 0).is_err());
-    }
-
-    #[test]
-    fn write_credentials_creates_and_merges() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".credentials.json");
-        let tokens = Tokens {
-            access: "a1".into(),
-            refresh: "r1".into(),
-            expires_at_ms: 1000,
-            scopes: Some(vec!["user:inference".into()]),
-            subscription_type: None,
-        };
-
-        write_credentials(&path, &tokens).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        let blob = read_json(&path).unwrap();
-        assert_eq!(blob["claudeAiOauth"]["accessToken"], "a1");
-        assert_eq!(blob["claudeAiOauth"]["scopes"][0], "user:inference");
-        assert!(usable_at(&path));
-
-        // A rewrite preserves fields it doesn't know about, at both levels.
-        std::fs::write(
-            &path,
-            r#"{"claudeAiOauth":{"accessToken":"x","refreshToken":"y","expiresAt":1,
-                "subscriptionType":"max"},"mcpOAuth":{"keep":true}}"#,
-        )
-        .unwrap();
-        write_credentials(
-            &path,
-            &Tokens {
-                access: "a2".into(),
-                refresh: "r2".into(),
-                expires_at_ms: 2000,
-                scopes: None,
-                subscription_type: None,
-            },
-        )
-        .unwrap();
-        let blob = read_json(&path).unwrap();
-        assert_eq!(blob["claudeAiOauth"]["refreshToken"], "r2");
-        assert_eq!(blob["claudeAiOauth"]["expiresAt"], 2000);
-        assert_eq!(blob["claudeAiOauth"]["subscriptionType"], "max");
-        assert_eq!(blob["mcpOAuth"]["keep"], true);
-    }
-
-    #[test]
-    fn scrub_rescues_newer_rotation() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        let creds = dir.path().join(".credentials.json");
-        std::fs::write(
-            &creds,
-            r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"dead","expiresAt":1000,"scopes":["user:inference"]}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            &auth,
-            r#"{"anthropic":{"type":"oauth","access":"new","refresh":"live","expires":2000},"other":{"type":"api","key":"k"}}"#,
-        )
-        .unwrap();
-
-        scrub_anthropic_auth(&auth, &creds).unwrap();
-
-        let blob = read_json(&creds).unwrap();
-        assert_eq!(blob["claudeAiOauth"]["accessToken"], "new");
-        assert_eq!(blob["claudeAiOauth"]["refreshToken"], "live");
-        assert_eq!(blob["claudeAiOauth"]["expiresAt"], 2000);
-        // Fields the rescue doesn't know about survive the rewrite.
-        assert_eq!(blob["claudeAiOauth"]["scopes"][0], "user:inference");
-        let auth_json = read_json(&auth).unwrap();
-        assert!(auth_json.get("anthropic").is_none());
-        assert_eq!(auth_json["other"]["key"], "k");
-    }
-
-    #[test]
-    fn scrub_leaves_credentials_alone_for_older_or_keyless_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        let creds = dir.path().join(".credentials.json");
-        let original =
-            r#"{"claudeAiOauth":{"accessToken":"cur","refreshToken":"cur","expiresAt":5000}}"#;
-
-        // An older rotation, then a plain API key: both drop the entry
-        // without touching the credentials file.
+    fn health_flags_a_failing_credential() {
         for entry in [
-            r#"{"anthropic":{"type":"oauth","access":"a","refresh":"r","expires":1000}}"#,
-            r#"{"anthropic":{"type":"api","key":"sk-x"}}"#,
+            serde_json::json!({ "id": "claude-x.json", "status": "error" }),
+            serde_json::json!({ "id": "claude-x.json", "status": "active", "unavailable": true }),
         ] {
-            std::fs::write(&creds, original).unwrap();
-            std::fs::write(&auth, entry).unwrap();
-            scrub_anthropic_auth(&auth, &creds).unwrap();
-            assert_eq!(std::fs::read_to_string(&creds).unwrap(), original);
-            let auth_json = read_json(&auth).unwrap();
-            assert!(auth_json.get("anthropic").is_none());
+            let health = health_from(&serde_json::json!({ "files": [entry] }));
+            assert!(health.connected);
+            assert!(!health.refresh_ok);
         }
+
+        // An unknown status is not treated as failure.
+        let files = serde_json::json!({ "files": [{
+            "id": "claude-x.json",
+            "status": "cooling",
+            "disabled": false,
+        }]});
+        assert!(health_from(&files).refresh_ok);
     }
 
     #[test]
-    fn scrub_keeps_entry_when_rescue_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        let creds = dir.path().join(".credentials.json");
-        std::fs::write(&creds, "not json").unwrap();
-        let entry = r#"{"anthropic":{"type":"oauth","access":"a","refresh":"r","expires":9000}}"#;
-        std::fs::write(&auth, entry).unwrap();
-
-        scrub_anthropic_auth(&auth, &creds).unwrap();
-
-        // The unparseable credentials file blocked the rescue, so the only
-        // live pair stays parked in auth.json instead of being destroyed.
-        assert_eq!(std::fs::read_to_string(&auth).unwrap(), entry);
-        assert_eq!(std::fs::read_to_string(&creds).unwrap(), "not json");
-    }
-
-    #[test]
-    fn reconcile_rescues_without_scrubbing() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        let creds = dir.path().join(".credentials.json");
-        std::fs::write(
-            &creds,
-            r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"dead","expiresAt":1000}}"#,
-        )
-        .unwrap();
-        let entry =
-            r#"{"anthropic":{"type":"oauth","access":"new","refresh":"live","expires":2000}}"#;
-        std::fs::write(&auth, entry).unwrap();
-
-        reconcile(&auth, &creds).unwrap();
-
-        let blob = read_json(&creds).unwrap();
-        assert_eq!(blob["claudeAiOauth"]["refreshToken"], "live");
-        // The plugin owns the mirror while the runner is live.
-        assert_eq!(std::fs::read_to_string(&auth).unwrap(), entry);
-
-        // Missing auth.json is a no-op, not an error.
-        std::fs::remove_file(&auth).unwrap();
-        reconcile(&auth, &creds).unwrap();
-    }
-
-    #[test]
-    fn refresh_digest_takes_the_last_verdict() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("claude-auth-debug.log");
-
-        assert_eq!(refresh_digest(&log), Refresh::NoData);
-        std::fs::write(&log, "").unwrap();
-        assert_eq!(refresh_digest(&log), Refresh::NoData);
-
-        std::fs::write(
-            &log,
-            [
-                r#"{"event":"plugin_init","accountCount":1}"#,
-                "not json at all",
-                r#"{"event":"refresh_failed","kind":"transient","error":"HTTP 529"}"#,
-                r#"{"event":"refresh_success","source":"oauth"}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        assert_eq!(refresh_digest(&log), Refresh::Ok);
-
-        // A terminal failure trails follow-up events; the worst verdict
-        // since the last success must win, not the last one.
-        std::fs::write(
-            &log,
-            [
-                r#"{"event":"refresh_success"}"#,
-                r#"{"event":"refresh_failed","kind":"terminal","oauthError":"invalid_grant"}"#,
-                // A kindless CLI failure must not overwrite the verdict.
-                r#"{"event":"refresh_failed","source":"cli","error":"spawn failed"}"#,
-                r#"{"event":"refresh_exhausted","source":"file"}"#,
-                r#"{"event":"credentials_unavailable"}"#,
-            ]
-            .join("\n"),
-        )
-        .unwrap();
-        assert_eq!(
-            refresh_digest(&log),
-            Refresh::Terminal {
-                reason: Some("invalid_grant".into())
-            }
-        );
-
-        std::fs::write(&log, r#"{"event":"refresh_exhausted","source":"file"}"#).unwrap();
-        assert_eq!(refresh_digest(&log), Refresh::Transient { reason: None });
-
-        std::fs::write(&log, r#"{"event":"credentials_unavailable"}"#).unwrap();
-        assert_eq!(refresh_digest(&log), Refresh::Unavailable);
-    }
-
-    #[test]
-    fn health_reflects_the_credentials_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let creds = dir.path().join(".credentials.json");
-        let log = dir.path().join("log");
-
-        let empty = health_at(&creds, &log);
-        assert!(!empty.connected);
-        assert_eq!(empty.expires_at, None);
-        assert_eq!(empty.refresh, Refresh::NoData);
-
-        std::fs::write(
-            &creds,
-            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":123}}"#,
-        )
-        .unwrap();
-        let connected = health_at(&creds, &log);
-        assert!(connected.connected);
-        assert_eq!(connected.expires_at, Some(123));
-    }
-
-    #[test]
-    fn expired_for_measures_past_expiry_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let creds = dir.path().join(".credentials.json");
-        // No file, no expiry to measure against.
-        assert_eq!(expired_for_at(&creds, 5_000), None);
-
-        std::fs::write(
-            &creds,
-            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":10000}}"#,
-        )
-        .unwrap();
-        // Still live, and exactly-at-expiry counts as live.
-        assert_eq!(expired_for_at(&creds, 5_000), None);
-        assert_eq!(expired_for_at(&creds, 10_000), None);
-        // Expired: reported in whole seconds.
-        assert_eq!(expired_for_at(&creds, 13_000), Some(3));
+    fn claude_entries_are_recognized_by_field_or_name() {
+        for entry in [
+            serde_json::json!({ "provider": "claude" }),
+            serde_json::json!({ "type": "claude" }),
+            serde_json::json!({ "channel": "anthropic" }),
+            serde_json::json!({ "id": "claude-user@example.com.json" }),
+            serde_json::json!({ "name": "anthropic-main.json" }),
+        ] {
+            assert!(is_claude_entry(&entry), "{entry}");
+        }
+        for entry in [
+            serde_json::json!({ "id": "gemini-user.json" }),
+            serde_json::json!({ "provider": "codex" }),
+            serde_json::json!({}),
+        ] {
+            assert!(!is_claude_entry(&entry), "{entry}");
+        }
     }
 }

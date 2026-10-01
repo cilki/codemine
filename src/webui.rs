@@ -11,8 +11,7 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Json;
@@ -35,32 +34,13 @@ const LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 static INDEX_HTML: &str = include_str!("webui.html");
 
-/// A Claude login the page has started but not finished: the PKCE verifier
-/// the eventual code exchange must present. One at a time — starting a new
-/// login abandons the old one — and expiring, so a forgotten attempt can't
-/// be completed days later.
-struct PendingLogin {
-    verifier: String,
-    created: Instant,
-}
-
-const LOGIN_TTL: Duration = Duration::from_secs(600);
-
 #[derive(Clone)]
 struct AppState {
     status: Shared,
     settings: SharedSettings,
-    login: Arc<Mutex<Option<PendingLogin>>>,
     /// The workspace root, which is all the page wants of it: the disk
     /// figures in the host details describe the filesystem it sits on.
     workspace: PathBuf,
-}
-
-/// The pending login, poison-tolerant like every other lock in the runner.
-fn pending(login: &Mutex<Option<PendingLogin>>) -> std::sync::MutexGuard<'_, Option<PendingLogin>> {
-    login
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Bind and serve on a background thread. Binding happens synchronously so a
@@ -91,7 +71,6 @@ pub fn spawn(
                     AppState {
                         status,
                         settings,
-                        login: Arc::new(Mutex::new(None)),
                         workspace,
                     },
                 ))
@@ -113,8 +92,6 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/paused", axum::routing::put(api_put_paused))
         .route("/api/cancel", axum::routing::post(api_post_cancel))
-        .route("/api/claude/login", axum::routing::post(api_claude_login))
-        .route("/api/claude/code", axum::routing::post(api_claude_code))
         .route("/api/options", get(api_options))
         .route("/api/repos/{forge}", get(api_repos))
         .with_state(state);
@@ -199,13 +176,20 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                 serde_json::to_string(&log_tail(&state.status)).unwrap_or_else(|_| "\"\"".into());
             let host = serde_json::to_string(&crate::host::snapshot(&state.workspace))
                 .unwrap_or_else(|_| "{}".into());
-            // Re-derived from two small files each tick, like the host
-            // snapshot: the main loop is inside a turn for hours at a time,
-            // so auth health can't ride the status it owns. A disabled
-            // Claude section stops the file checks; the page reads the null
-            // as "disabled".
-            let claude = if state.settings.snapshot().0.claude.enabled {
-                serde_json::to_string(&crate::claude::health()).unwrap_or_else(|_| "null".into())
+            // Re-derived each tick, like the host snapshot: the main loop is
+            // inside a turn for hours at a time, so auth health can't ride
+            // the status it owns. The probe shells out to curl (behind a
+            // short cache), so it runs off this current-thread runtime. A
+            // disabled Claude section stops the probing; the page reads the
+            // null as "disabled".
+            let claude_settings = state.settings.snapshot().0.claude;
+            let claude = if claude_settings.enabled {
+                tokio::task::spawn_blocking(move || {
+                    serde_json::to_string(&crate::claude::health(&claude_settings))
+                        .unwrap_or_else(|_| "null".into())
+                })
+                .await
+                .unwrap_or_else(|_| "null".into())
             } else {
                 "null".into()
             };
@@ -295,18 +279,43 @@ async fn api_settings(State(state): State<AppState>) -> Json<serde_json::Value> 
     Json(state.settings.snapshot().0.redacted())
 }
 
-/// Replace the settings. An empty or absent forge token keeps the stored
-/// one; a nonempty token overwrites it.
+/// Replace the settings. An empty or absent secret (forge token, proxy key)
+/// keeps the stored one; a nonempty one overwrites it.
 async fn api_put_settings(
     State(state): State<AppState>,
     Json(incoming): Json<Settings>,
 ) -> Response {
+    let before = state.settings.snapshot().0.claude;
     match state
         .settings
         .update(|settings| settings.apply_update(incoming))
     {
         Ok(()) => {
             let (settings, _) = state.settings.snapshot();
+            // A changed proxy target rewires opencode's provider config and
+            // refetches the model listing against it, off the request path
+            // like the startup warmup. This must happen here rather than at
+            // the next turn boundary: with no models listed the settings
+            // can't even become runnable.
+            if (&settings.claude.base_url, &settings.claude.api_key)
+                != (&before.base_url, &before.api_key)
+            {
+                let claude = settings.claude.clone();
+                std::thread::Builder::new()
+                    .name("provider".into())
+                    .spawn(move || {
+                        if let Err(err) = crate::prompts::install_provider(
+                            &crate::prompts::opencode_config_dir(),
+                            &claude,
+                        ) {
+                            tracing::error!("failed to update opencode's provider config: {err:#}");
+                            return;
+                        }
+                        crate::config::invalidate_models();
+                        drop(crate::config::models());
+                    })
+                    .ok();
+            }
             // The main loop only mirrors the bucket into the status at the
             // next turn boundary; reflect the new ceiling now so the page's
             // counter doesn't lag a running turn. The bucket is resized the
@@ -326,89 +335,6 @@ async fn api_put_settings(
         Err(err) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "error": format!("{err:#}") })),
-        )
-            .into_response(),
-    }
-}
-
-/// Start (or restart) a Claude login: mint a PKCE verifier, park it as the
-/// one pending login, and hand the page the authorize URL for the user's
-/// browser. The verifier itself never leaves the server.
-async fn api_claude_login(State(state): State<AppState>) -> Response {
-    match crate::claude::begin_login() {
-        Ok(login) => {
-            *pending(&state.login) = Some(PendingLogin {
-                verifier: login.verifier,
-                created: Instant::now(),
-            });
-            Json(json!({ "url": login.url })).into_response()
-        }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{err:#}") })),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct Code {
-    code: String,
-}
-
-/// Finish a Claude login: exchange the pasted `code#state` against the
-/// pending verifier and install the tokens as the credentials file. The
-/// verifier is only consumed on success, so a mistyped paste is retryable
-/// without restarting the flow.
-async fn api_claude_code(State(state): State<AppState>, Json(incoming): Json<Code>) -> Response {
-    let verifier = match &*pending(&state.login) {
-        Some(login) if login.created.elapsed() < LOGIN_TTL => login.verifier.clone(),
-        Some(_) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": "the login attempt expired; start over" })),
-            )
-                .into_response();
-        }
-        None => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": "no login in progress" })),
-            )
-                .into_response();
-        }
-    };
-    // The exchange shells out to curl and the write hits the disk; keep both
-    // off the current-thread runtime so status polling stays responsive.
-    let exchanged = tokio::task::spawn_blocking(move || {
-        let tokens = crate::claude::exchange(&incoming.code, &verifier)?;
-        crate::claude::write_credentials(&crate::claude::credentials_path(), &tokens)
-    })
-    .await;
-    match exchanged {
-        Ok(Ok(())) => {
-            *pending(&state.login) = None;
-            // The fresh login typically turns an anthropic-less model listing
-            // into a full one; refetch it off the request path, mirroring the
-            // startup warmup.
-            crate::config::invalidate_models();
-            std::thread::Builder::new()
-                .name("models".into())
-                .spawn(|| drop(crate::config::models()))
-                .ok();
-            // Nudge the event stream so the page's account card repaints
-            // without waiting out the log timer.
-            Status::update(&state.status, |_| {});
-            Json(serde_json::to_value(crate::claude::health()).unwrap_or_default()).into_response()
-        }
-        Ok(Err(err)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": format!("{err:#}") })),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{err}") })),
         )
             .into_response(),
     }
@@ -873,29 +799,6 @@ mod tests {
                     .as_str()
                     .is_some_and(|d| d.starts_with("- "))
         }));
-    }
-
-    #[test]
-    fn claude_login_mints_a_fresh_flow_each_time() {
-        let (addr, _dir) = serve_in_tempdir();
-
-        let response = request(addr, "POST", "/api/claude/login", "");
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        let first = body_json(&response)["url"].as_str().unwrap().to_owned();
-        assert!(first.starts_with("https://claude.ai/oauth/authorize?"));
-        assert!(first.contains("code_challenge="));
-
-        // A second login replaces the first: new verifier, new URL.
-        let second = body_json(&request(addr, "POST", "/api/claude/login", ""));
-        assert_ne!(second["url"].as_str().unwrap(), first);
-    }
-
-    #[test]
-    fn claude_code_requires_a_pending_login() {
-        let (addr, _dir) = serve_in_tempdir();
-        let response = request(addr, "POST", "/api/claude/code", r#"{"code":"x#y"}"#);
-        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
-        assert!(response.contains("no login in progress"), "{response}");
     }
 
     #[test]

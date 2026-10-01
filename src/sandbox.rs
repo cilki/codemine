@@ -77,16 +77,15 @@ fn restrict_writes(repo: &Path, log: &Path) -> Result<()> {
 }
 
 /// Where the agent may write: the assigned clone, the turn log, and the
-/// dotfile state of the tools it runs (opencode sessions, OAuth refreshes,
-/// forge CLI state, package manager caches). Nonexistent paths are skipped —
-/// with no rule there is nothing to allow.
+/// dotfile state of the tools it runs (opencode sessions, forge CLI state,
+/// package manager caches). Nonexistent paths are skipped — with no rule
+/// there is nothing to allow.
 fn writable_paths(repo: &Path, log: &Path) -> Vec<PathBuf> {
     let home = crate::config::home();
     let xdg = crate::config::xdg_dir;
     let mut paths = vec![
         repo.to_path_buf(),
         log.to_path_buf(),
-        home.join(".claude"),
         home.join(".npm"),
         home.join(".bun"),
         // Rust builds unpack registry crates and fetch toolchains here.

@@ -18,7 +18,6 @@ with pkgs;
   gh
   glab
   opencode
-  opencode-claude-auth
   cargo
   rustc
   clippy

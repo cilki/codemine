@@ -30,16 +30,17 @@ pub fn reported_completed(tail: &str) -> bool {
         .any(|line| line.trim_start().starts_with("TASK COMPLETED"))
 }
 
-/// Whether the turn died on unusable Claude OAuth credentials: the API
-/// rejected the token as revoked, or the opencode-claude-auth plugin found
-/// them expired and couldn't refresh them (a dead refresh token prints the
-/// same message as a transient refresh outage, so the main loop's gate must
-/// eventually retry rather than hold for a new login forever).
-pub fn oauth_revoked(tail: &str) -> bool {
+/// Whether the turn died on authentication somewhere between opencode and
+/// Anthropic, as CLIProxyAPI reports it (bodies captured from 7.3.2): a
+/// rejected client key answers `{"error":"Invalid API key"}`, a proxy
+/// holding no Claude credential knows no claude models and answers `unknown
+/// provider for model ...`, and a dead login upstream passes Anthropic's own
+/// `authentication_error` through.
+pub fn auth_error(tail: &str) -> bool {
     let tail = strip_ansi(tail);
-    tail.contains("token has been revoked")
-        || tail.contains("credentials are expired and could not be refreshed")
-        || tail.contains("credentials are unavailable or expired")
+    ["authentication_error", "Invalid API key", "unknown provider for model"]
+        .iter()
+        .any(|needle| tail.contains(needle))
 }
 
 /// The epoch at which an exhausted usage window reopens, parsed from a
@@ -154,15 +155,20 @@ mod tests {
     }
 
     #[test]
-    fn oauth_failures() {
-        assert!(oauth_revoked("OAuth token has been revoked"));
-        assert!(oauth_revoked(
-            "opencode-claude-auth: Claude credentials are expired and could not be refreshed. Run `claude` to re-authenticate."
+    fn auth_failures() {
+        // A dead login upstream, passed through the proxy verbatim.
+        assert!(auth_error(
+            r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}"#
         ));
-        assert!(oauth_revoked(
-            "Error: Claude Code credentials are unavailable or expired. Run `claude` to refresh them."
+        // The proxy's own rejection of a wrong client key.
+        assert!(auth_error(r#"{"error":"Invalid API key"}"#));
+        // A proxy with no Claude credential knows no claude models.
+        assert!(auth_error(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"unknown provider for model claude-sonnet-5"}}"#
         ));
-        assert!(!oauth_revoked("all quiet"));
+        assert!(auth_error("\x1b[91mauthentication_error\x1b[0m"));
+        assert!(!auth_error("all quiet"));
+        assert!(!auth_error("Error: something else entirely"));
     }
 
     #[test]

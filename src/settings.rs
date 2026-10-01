@@ -64,17 +64,34 @@ impl Default for Settings {
 
 /// The Claude account section. Model providers each get a section like the
 /// forges do; Claude is the only one so far, and it starts enabled so a
-/// pre-section config keeps running. Disabled, the runner stops checking the
-/// credentials file entirely.
+/// pre-section config keeps running. The account itself lives in CLIProxyAPI,
+/// which owns the subscription OAuth login and refresh; these settings say
+/// where the proxy listens and how to authenticate to it. Disabled, the
+/// runner stops checking the proxy entirely.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct ClaudeSettings {
     pub enabled: bool,
+    /// Where CLIProxyAPI listens; the Anthropic-compatible API and the
+    /// management API share the port.
+    pub base_url: String,
+    /// A client key from the proxy's `api-keys` list; opencode presents it
+    /// in place of a real Anthropic credential. Write-only in the UI, like
+    /// forge tokens.
+    pub api_key: String,
+    /// The proxy's management key; optional. With it the account card shows
+    /// live login and refresh state, without it only reachability.
+    pub management_key: String,
 }
 
 impl Default for ClaudeSettings {
     fn default() -> Self {
-        ClaudeSettings { enabled: true }
+        ClaudeSettings {
+            enabled: true,
+            base_url: crate::claude::DEFAULT_BASE_URL.into(),
+            api_key: String::new(),
+            management_key: String::new(),
+        }
     }
 }
 
@@ -216,6 +233,11 @@ impl Settings {
                 "claude-card",
                 "no model provider is enabled; enable the Claude account",
             ));
+        } else if self.claude.api_key.is_empty() {
+            problems.push(Problem::new(
+                "claude-api-key",
+                "the CLIProxyAPI client key is not set",
+            ));
         }
         if self.model.is_empty() {
             problems.push(Problem::new("s-model", "model is not set"));
@@ -253,8 +275,8 @@ impl Settings {
         })
     }
 
-    /// The settings as JSON for the UI, with each forge's token replaced by a
-    /// `token_set` flag so tokens are write-only.
+    /// The settings as JSON for the UI, with each secret replaced by a
+    /// `*_set` flag so secrets are write-only.
     pub fn redacted(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(self).expect("settings serialize to JSON");
         for kind in FORGE_KINDS {
@@ -267,12 +289,20 @@ impl Settings {
             forge.remove("token");
             forge.insert("token_set".into(), set.into());
         }
+        let claude = value["claude"]
+            .as_object_mut()
+            .expect("the claude section is an object");
+        for key in ["api_key", "management_key"] {
+            let set = claude[key].as_str().is_some_and(|key| !key.is_empty());
+            claude.remove(key);
+            claude.insert(format!("{key}_set"), set.into());
+        }
         value
     }
 
     /// Replace these settings with `incoming` from the UI. An empty incoming
-    /// token keeps the stored one (the UI never sees tokens back), a nonempty
-    /// one overwrites it.
+    /// secret keeps the stored one (the UI never sees secrets back), a
+    /// nonempty one overwrites it.
     pub fn apply_update(&mut self, mut incoming: Settings) -> Result<()> {
         incoming.model = incoming.model.trim().to_owned();
         incoming.author_email = incoming.author_email.trim().to_owned();
@@ -282,6 +312,19 @@ impl Settings {
             if forge.token.is_empty() {
                 forge.token = self.forge(kind).token.clone();
             }
+        }
+        let claude = &mut incoming.claude;
+        claude.base_url = claude.base_url.trim().trim_end_matches('/').to_owned();
+        if claude.base_url.is_empty() {
+            claude.base_url = ClaudeSettings::default().base_url;
+        }
+        claude.api_key = claude.api_key.trim().to_owned();
+        if claude.api_key.is_empty() {
+            claude.api_key = self.claude.api_key.clone();
+        }
+        claude.management_key = claude.management_key.trim().to_owned();
+        if claude.management_key.is_empty() {
+            claude.management_key = self.claude.management_key.clone();
         }
         incoming.validate()?;
         *self = incoming;
@@ -311,6 +354,10 @@ impl Settings {
             if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
                 bail!("{} URL must start with http:// or https://", kind.name());
             }
+        }
+        let base = &self.claude.base_url;
+        if !base.starts_with("http://") && !base.starts_with("https://") {
+            bail!("the Claude proxy URL must start with http:// or https://");
         }
         Ok(())
     }
@@ -424,6 +471,10 @@ mod tests {
 
     fn configured() -> Settings {
         Settings {
+            claude: ClaudeSettings {
+                api_key: "proxy-key".into(),
+                ..Default::default()
+            },
             github: ForgeSettings {
                 enabled: true,
                 token: "tok".into(),
@@ -504,6 +555,44 @@ mod tests {
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
         assert!(fields.iter().any(|f| f == "claude-card"), "{fields:?}");
         assert!(settings.to_config(&cli()).is_none());
+    }
+
+    #[test]
+    fn a_missing_proxy_key_is_a_problem() {
+        let mut settings = configured();
+        settings.claude.api_key = String::new();
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert!(fields.iter().any(|f| f == "claude-api-key"), "{fields:?}");
+        assert!(settings.to_config(&cli()).is_none());
+        // Disabled entirely, the missing key stops mattering; the disabled
+        // section is the reported problem instead.
+        settings.claude.enabled = false;
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert!(!fields.iter().any(|f| f == "claude-api-key"), "{fields:?}");
+    }
+
+    #[test]
+    fn claude_keys_are_write_only_and_kept_on_empty_updates() {
+        let value = configured().redacted();
+        assert!(value["claude"].get("api_key").is_none());
+        assert!(value["claude"].get("management_key").is_none());
+        assert_eq!(value["claude"]["api_key_set"], true);
+        assert_eq!(value["claude"]["management_key_set"], false);
+
+        let mut settings = configured();
+        let mut incoming = configured();
+        incoming.claude.api_key = String::new();
+        incoming.claude.base_url = String::new();
+        incoming.claude.management_key = " mgmt ".into();
+        settings.apply_update(incoming).unwrap();
+        assert_eq!(settings.claude.api_key, "proxy-key");
+        // An emptied URL falls back to the default rather than breaking.
+        assert_eq!(settings.claude.base_url, crate::claude::DEFAULT_BASE_URL);
+        assert_eq!(settings.claude.management_key, "mgmt");
+
+        let mut bad = configured();
+        bad.claude.base_url = "127.0.0.1:8317".into();
+        assert!(settings.apply_update(bad).is_err());
     }
 
     #[test]

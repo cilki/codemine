@@ -1,6 +1,7 @@
 //! Starter prompts baked into the binary and installed into opencode's config
 //! directory at startup, so the binary works without the image copying them.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -90,42 +91,74 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
     Ok(())
 }
 
-/// Symlink the opencode-claude-auth plugin into opencode's plugin directory,
-/// so any image that ships the package gets the anthropic provider without
-/// image-specific wiring. The package must be recent enough to present
-/// requests as a Claude Code session, or Anthropic bills them as a
-/// third-party app drawing extra usage instead of the subscription
-/// (opencode-claude-auth#145); nix/nixpkgs.nix overlays the pin accordingly.
-/// A missing package is only a warning: opencode still runs, just without
-/// Claude models.
-pub fn install_plugin(dir: &Path) -> Result<()> {
-    scrub_plugin_config(dir)?;
-    match claude_auth_entrypoint() {
-        Some(entrypoint) => link_plugin(dir, &entrypoint),
-        // The host may provision the plugin straight into opencode's plugin
-        // directory instead of a node_modules root (the NixOS module does);
-        // only warn when it's nowhere at all. metadata() follows symlinks,
-        // so a dangling link left by an uninstall doesn't count.
-        None if ["plugin", "plugins"].iter().any(|sub| {
-            std::fs::metadata(dir.join(sub).join("opencode-claude-auth.js")).is_ok()
-        }) =>
-        {
-            Ok(())
-        }
-        None => {
-            tracing::warn!(
-                "opencode-claude-auth is not installed; opencode will have no anthropic provider"
-            );
-            Ok(())
-        }
+/// Point opencode's anthropic provider at CLIProxyAPI: base URL and client
+/// key merged into `opencode.json`, everything else preserved. The proxy
+/// speaks Anthropic's own API shape, so the stock provider works against it
+/// with no auth.json entry and no plugin. With no client key configured yet
+/// the file is left alone — an empty key would just break the provider. The
+/// file is made owner-only since it now carries the key.
+pub fn install_provider(dir: &Path, claude: &crate::settings::ClaudeSettings) -> Result<()> {
+    if claude.api_key.is_empty() {
+        return Ok(());
     }
+    let path = dir.join("opencode.json");
+    let mut config: serde_json::Value = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?,
+        Err(_) => serde_json::json!({}),
+    };
+    config["provider"]["anthropic"]["options"] = serde_json::json!({
+        // The provider's default is https://api.anthropic.com/v1, so the
+        // version segment belongs to the base URL.
+        "baseURL": format!("{}/v1", claude.base_url),
+        "apiKey": claude.api_key,
+    });
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict {}", path.display()))?;
+    Ok(())
 }
 
-/// Drop npm references to the plugin (under its current or previous name)
-/// from opencode's config: alongside the symlink they'd load a second,
-/// differently-versioned copy from the npm registry. The config is only
-/// rewritten when something was actually dropped, because it is often
-/// mounted read-only.
+/// One-time migration from the opencode-claude-auth era: drop the plugin
+/// links a previous version (or the NixOS module) installed, its npm
+/// references in `opencode.json`, and the stale `anthropic` entry in
+/// opencode's auth.json — any of which would fight the provider config for
+/// the account. The tokens in those files are dead weight now; the login
+/// lives in CLIProxyAPI.
+pub fn remove_claude_plugin(dir: &Path, auth_json: &Path) -> Result<()> {
+    for sub in ["plugin", "plugins"] {
+        let link = dir.join(sub).join("opencode-claude-auth.js");
+        if let Err(err) = std::fs::remove_file(&link)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(err).with_context(|| format!("failed to remove {}", link.display()));
+        }
+    }
+    scrub_plugin_config(dir)?;
+    if let Some(mut auth) = std::fs::read(auth_json)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        && auth
+            .as_object_mut()
+            .is_some_and(|auth| auth.remove("anthropic").is_some())
+    {
+        std::fs::write(auth_json, serde_json::to_vec_pretty(&auth)?)
+            .with_context(|| format!("failed to write {}", auth_json.display()))?;
+    }
+    Ok(())
+}
+
+/// Where opencode stores provider credentials; only touched to scrub the
+/// legacy anthropic entry.
+pub fn opencode_auth_json() -> PathBuf {
+    crate::config::xdg_dir("XDG_DATA_HOME", ".local/share").join("opencode/auth.json")
+}
+
+/// Drop npm references to the retired plugin (under its current or previous
+/// name) from opencode's config. The config is only rewritten when something
+/// was actually dropped, because it is often mounted read-only.
 fn scrub_plugin_config(dir: &Path) -> Result<()> {
     let path = dir.join("opencode.json");
     let Some(mut config) = std::fs::read(&path)
@@ -152,41 +185,6 @@ fn scrub_plugin_config(dir: &Path) -> Result<()> {
     config["plugin"] = kept.into();
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
         .with_context(|| format!("failed to write {}", path.display()))
-}
-
-/// The plugin's entrypoint under the usual global node_modules roots.
-fn claude_auth_entrypoint() -> Option<PathBuf> {
-    [
-        crate::config::home().join(".nix-profile/lib/node_modules"),
-        PathBuf::from("/usr/local/lib/node_modules"),
-        PathBuf::from("/usr/lib/node_modules"),
-    ]
-    .iter()
-    .map(|root| root.join("opencode-claude-auth"))
-    .find_map(|pkg| package_entrypoint(&pkg))
-}
-
-/// The file package.json's `main` names, defaulting to index.js like node;
-/// None when the package or the file isn't there.
-fn package_entrypoint(pkg: &Path) -> Option<PathBuf> {
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(pkg.join("package.json")).ok()?).ok()?;
-    let entrypoint = pkg.join(manifest["main"].as_str().unwrap_or("index.js"));
-    entrypoint.is_file().then_some(entrypoint)
-}
-
-fn link_plugin(dir: &Path, entrypoint: &Path) -> Result<()> {
-    let plugin_dir = dir.join("plugin");
-    std::fs::create_dir_all(&plugin_dir)
-        .with_context(|| format!("failed to create {}", plugin_dir.display()))?;
-    let link = plugin_dir.join("opencode-claude-auth.js");
-    if let Err(err) = std::fs::remove_file(&link)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(err).with_context(|| format!("failed to remove {}", link.display()));
-    }
-    std::os::unix::fs::symlink(entrypoint, &link)
-        .with_context(|| format!("failed to link {}", link.display()))
 }
 
 /// Whether opencode's config already names the codegraph MCP server; an
@@ -416,6 +414,98 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(!config["mcp"]["servers"]["other"].is_null());
         assert!(config["mcp"]["servers"]["codegraph"].is_null());
+    }
+
+    #[test]
+    fn install_provider_merges_and_restricts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        let claude = crate::settings::ClaudeSettings {
+            api_key: "k1".into(),
+            ..Default::default()
+        };
+
+        // No key yet: nothing written, nothing created.
+        install_provider(
+            dir.path(),
+            &crate::settings::ClaudeSettings {
+                api_key: String::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!path.exists());
+
+        install_provider(dir.path(), &claude).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            format!("{}/v1", crate::claude::DEFAULT_BASE_URL)
+        );
+        assert_eq!(config["provider"]["anthropic"]["options"]["apiKey"], "k1");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+
+        // A rewrite replaces the options wholesale (a changed key must not
+        // leave the old one behind) but preserves the rest of the file.
+        std::fs::write(
+            &path,
+            r#"{"theme":"dark","provider":{"anthropic":{"options":{"apiKey":"old","stale":true}}}}"#,
+        )
+        .unwrap();
+        install_provider(dir.path(), &claude).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["provider"]["anthropic"]["options"]["apiKey"], "k1");
+        assert!(config["provider"]["anthropic"]["options"]["stale"].is_null());
+    }
+
+    #[test]
+    fn remove_claude_plugin_scrubs_the_legacy_era() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        for sub in ["plugin", "plugins"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+            std::fs::write(dir.path().join(sub).join("opencode-claude-auth.js"), "x").unwrap();
+        }
+        std::fs::write(
+            dir.path().join("opencode.json"),
+            r#"{"theme":"dark","plugin":["opencode-claude-auth@2.2.0","other-plugin"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &auth,
+            r#"{"anthropic":{"type":"oauth","access":"a","refresh":"r"},"other":{"key":"k"}}"#,
+        )
+        .unwrap();
+
+        remove_claude_plugin(dir.path(), &auth).unwrap();
+
+        for sub in ["plugin", "plugins"] {
+            assert!(
+                !dir.path()
+                    .join(sub)
+                    .join("opencode-claude-auth.js")
+                    .exists()
+            );
+        }
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["plugin"], serde_json::json!(["other-plugin"]));
+        let auth_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
+        assert!(auth_json.get("anthropic").is_none());
+        assert_eq!(auth_json["other"]["key"], "k");
+
+        // Nothing to scrub: a second run is a clean no-op, and missing files
+        // are fine.
+        remove_claude_plugin(dir.path(), &auth).unwrap();
+        remove_claude_plugin(tempfile::tempdir().unwrap().path(), &dir.path().join("no")).unwrap();
     }
 
     #[test]
