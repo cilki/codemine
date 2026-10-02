@@ -12,9 +12,10 @@ PRs and useful issues.
 
 Each "turn" does one of the following on a repo:
 
-- `feedback`: responds to reviewer feedback on issues/PRs, fix failing CI,
-  address assigned issues.
-- `rebase`: rebase branches that are behind the default branch.
+- `feedback`: responds to reviewer comments on its open PRs, and opens a PR for
+  an issue it's assigned.
+- `rebase`: rebase open PR branches that are behind their base branch and
+  force-push.
 - `bump`: update dependencies, handling any migration issues.
 - `simplify`: remove dead code, simplify implementations, drop trivial tests.
 - `todo`: implement TODOs in the repo.
@@ -26,7 +27,21 @@ Each "turn" does one of the following on a repo:
 - `docs`: fix outdated docs.
 - `coverage`: improve test coverage.
 - `mutation`: mutate load-bearing code to find gaps the test suite misses.
-- `feature`: implement new features.
+- `feature`: propose a new feature as an issue, leaving the call to you rather
+  than implementing it.
+
+### Model access
+
+Turns reach the model through
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), which holds the
+subscription login and refreshes it on its own — **codemine** never touches
+tokens. Point the settings page at where the proxy listens
+(`http://127.0.0.1:8317` by default) and pick a model there. Both keys are
+optional: a client API key if the proxy has an `api-keys` list, and its
+management key, which earns the UI a live view of the account's login and
+refresh state instead of bare reachability. Log in out-of-band on the host with
+`cliproxyapi --claude-login`. Until the proxy answers, **codemine** stays
+unconfigured and runs no turns.
 
 ### Features
 
@@ -84,8 +99,11 @@ yours.
 
 #### Multiple forge support
 
-**codemine** works with Gitea, GitHub, and GitLab. Just add an access token and
-select what repos **codemine** is enabled on.
+**codemine** works with Gitea, GitHub, and GitLab. Add an access token — plus
+the instance URL and the bot account's username for Gitea, which has no default
+instance — and select what repos **codemine** is enabled on. Everything starts
+disabled, so a fresh login sweeps nothing until a repository is enabled by
+hand, and repositories added later stay out of the pool until they are too.
 
 #### `AGENTS.md` customizations
 
@@ -99,3 +117,14 @@ You can manage the **codemine** instance via a simple web UI on port 8080. This
 is where you configure your forge settings, rate limits, select a model, choose
 what task types are run, view agent logs, etc. Updates to the settings take
 effect on the next turn.
+
+The settings all live there, which leaves the command line short:
+
+```
+usage: codemine [--listen ADDR] [--workspace DIR] [--once]
+
+  --listen ADDR     bind address for the web UI (default 0.0.0.0:8080)
+  --workspace DIR   persistent workspace root (default ~/.codemine)
+  --once            run a single turn and exit
+  --help            show this help
+```
