@@ -54,8 +54,7 @@ the user decide what to do.
 
 ## "feedback"
 
-- Respond to reviewer comments on your open PRs; if CI fails, attempt to
-  diagnose and fix the problem
+- Respond to reviewer comments on your open PRs
 - If you are assigned an issue, create a PR to address it
 
 ## "rebase"

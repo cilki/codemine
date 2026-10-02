@@ -1,9 +1,8 @@
-//! Claude auth health, as reported by CLIProxyAPI. The proxy owns the
+//! CLIProxyAPI health, as reported by its management API. The proxy owns the
 //! subscription OAuth login and refreshes it continuously on its own —
 //! codemine never touches tokens. Logins happen out-of-band (`cliproxyapi
-//! --claude-login` on the host); this module only asks the proxy's
-//! management API how the account is doing, for the web UI's card and the
-//! main loop's gate.
+//! --claude-login` on the host); this module only asks the proxy how the
+//! account it holds is doing, for the web UI's card and the main loop's gate.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -13,13 +12,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::settings::ClaudeSettings;
+use crate::settings::ProxySettings;
 
 /// Where CLIProxyAPI listens by default; both the Anthropic-compatible API
 /// opencode talks to and the management API share it.
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8317";
 
-/// A point-in-time picture of the proxy and its Claude account for the web
+/// A point-in-time picture of the proxy and the account it holds for the web
 /// UI and the main loop's gate. Without a management key only reachability
 /// is known and the account fields stay empty.
 #[derive(Clone, PartialEq, Serialize)]
@@ -44,15 +43,15 @@ pub struct AuthHealth {
     pub error: Option<String>,
 }
 
-/// What blocks turns from running, as a message for the account card; None
+/// What blocks turns from running, as a message for the proxy card; None
 /// when the proxy looks usable. A failed management query does not block —
 /// inference may still work, and the error shows on the card instead.
-pub fn problem(claude: &ClaudeSettings) -> Option<String> {
-    let health = health(claude);
+pub fn problem(proxy: &ProxySettings) -> Option<String> {
+    let health = health(proxy);
     if !health.proxy_up {
         return Some(format!(
             "CLIProxyAPI is unreachable at {}; is the service running?",
-            claude.base_url
+            proxy.base_url
         ));
     }
     if health.managed && !health.connected {
@@ -74,25 +73,27 @@ static HEALTH: Mutex<Option<(Instant, String, AuthHealth)>> = Mutex::new(None);
 
 /// The current health, probed through the management API when a key is
 /// configured and by plain reachability otherwise; cached briefly.
-pub fn health(claude: &ClaudeSettings) -> AuthHealth {
-    let key = format!("{}|{}", claude.base_url, claude.management_key);
-    let mut cached = HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+pub fn health(proxy: &ProxySettings) -> AuthHealth {
+    let key = format!("{}|{}", proxy.base_url, proxy.management_key);
+    let mut cached = HEALTH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((at, for_key, health)) = &*cached
         && at.elapsed() < HEALTH_TTL
         && *for_key == key
     {
         return health.clone();
     }
-    let health = probe(claude);
+    let health = probe(proxy);
     *cached = Some((Instant::now(), key, health.clone()));
     health
 }
 
-fn probe(claude: &ClaudeSettings) -> AuthHealth {
-    if claude.management_key.is_empty() {
+fn probe(proxy: &ProxySettings) -> AuthHealth {
+    if proxy.management_key.is_empty() {
         // Any HTTP answer at all proves the proxy is there; whether a login
         // is installed can't be known without the management API.
-        let up = curl_get(&claude.base_url, None).is_ok();
+        let up = curl_get(&proxy.base_url, None).is_ok();
         return AuthHealth {
             proxy_up: up,
             managed: false,
@@ -105,8 +106,8 @@ fn probe(claude: &ClaudeSettings) -> AuthHealth {
             error: None,
         };
     }
-    let url = format!("{}/v0/management/auth-files", claude.base_url);
-    match curl_get(&url, Some(&claude.management_key)) {
+    let url = format!("{}/v0/management/auth-files", proxy.base_url);
+    match curl_get(&url, Some(&proxy.management_key)) {
         Ok((200, body)) => match serde_json::from_str(&body) {
             Ok(files) => health_from(&files),
             Err(_) => unmanaged(true, "the management API returned unexpected output"),

@@ -17,7 +17,10 @@ use crate::schedule::Schedule;
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
-    pub claude: ClaudeSettings,
+    /// Where the model proxy lives. Named `claude` in configs written before
+    /// the section stopped being Claude-specific.
+    #[serde(alias = "claude")]
+    pub proxy: ProxySettings,
     pub gitea: ForgeSettings,
     pub github: ForgeSettings,
     pub gitlab: ForgeSettings,
@@ -46,7 +49,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            claude: ClaudeSettings::default(),
+            proxy: ProxySettings::default(),
             gitea: ForgeSettings::default(),
             github: ForgeSettings::default(),
             gitlab: ForgeSettings::default(),
@@ -62,16 +65,13 @@ impl Default for Settings {
     }
 }
 
-/// The Claude account section. Model providers each get a section like the
-/// forges do; Claude is the only one so far, and it starts enabled so a
-/// pre-section config keeps running. The account itself lives in CLIProxyAPI,
-/// which owns the subscription OAuth login and refresh; these settings say
-/// where the proxy listens and how to authenticate to it. Disabled, the
-/// runner stops checking the proxy entirely.
+/// The CLIProxyAPI section. Every model provider reaches the models through
+/// the proxy, which owns the subscription OAuth login and refresh; these
+/// settings say where it listens and how to authenticate to it. There is no
+/// enable switch: without the proxy nothing can run a turn at all.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
-pub struct ClaudeSettings {
-    pub enabled: bool,
+pub struct ProxySettings {
     /// Where CLIProxyAPI listens; the Anthropic-compatible API and the
     /// management API share the port.
     pub base_url: String,
@@ -81,16 +81,15 @@ pub struct ClaudeSettings {
     /// [`crate::prompts::install_provider`]. Write-only in the UI, like forge
     /// tokens.
     pub api_key: String,
-    /// The proxy's management key; optional. With it the account card shows
+    /// The proxy's management key; optional. With it the proxy card shows
     /// live login and refresh state, without it only reachability.
     pub management_key: String,
 }
 
-impl Default for ClaudeSettings {
+impl Default for ProxySettings {
     fn default() -> Self {
-        ClaudeSettings {
-            enabled: true,
-            base_url: crate::claude::DEFAULT_BASE_URL.into(),
+        ProxySettings {
+            base_url: crate::proxy::DEFAULT_BASE_URL.into(),
             api_key: String::new(),
             management_key: String::new(),
         }
@@ -230,12 +229,6 @@ impl Settings {
         {
             problems.push(Problem::new("forges", "no forge is enabled with a token"));
         }
-        if !self.claude.enabled {
-            problems.push(Problem::new(
-                "claude-card",
-                "no model provider is enabled; enable the Claude account",
-            ));
-        }
         if self.model.is_empty() {
             problems.push(Problem::new("s-model", "model is not set"));
         }
@@ -286,13 +279,13 @@ impl Settings {
             forge.remove("token");
             forge.insert("token_set".into(), set.into());
         }
-        let claude = value["claude"]
+        let proxy = value["proxy"]
             .as_object_mut()
-            .expect("the claude section is an object");
+            .expect("the proxy section is an object");
         for key in ["api_key", "management_key"] {
-            let set = claude[key].as_str().is_some_and(|key| !key.is_empty());
-            claude.remove(key);
-            claude.insert(format!("{key}_set"), set.into());
+            let set = proxy[key].as_str().is_some_and(|key| !key.is_empty());
+            proxy.remove(key);
+            proxy.insert(format!("{key}_set"), set.into());
         }
         value
     }
@@ -310,18 +303,18 @@ impl Settings {
                 forge.token = self.forge(kind).token.clone();
             }
         }
-        let claude = &mut incoming.claude;
-        claude.base_url = claude.base_url.trim().trim_end_matches('/').to_owned();
-        if claude.base_url.is_empty() {
-            claude.base_url = ClaudeSettings::default().base_url;
+        let proxy = &mut incoming.proxy;
+        proxy.base_url = proxy.base_url.trim().trim_end_matches('/').to_owned();
+        if proxy.base_url.is_empty() {
+            proxy.base_url = ProxySettings::default().base_url;
         }
-        claude.api_key = claude.api_key.trim().to_owned();
-        if claude.api_key.is_empty() {
-            claude.api_key = self.claude.api_key.clone();
+        proxy.api_key = proxy.api_key.trim().to_owned();
+        if proxy.api_key.is_empty() {
+            proxy.api_key = self.proxy.api_key.clone();
         }
-        claude.management_key = claude.management_key.trim().to_owned();
-        if claude.management_key.is_empty() {
-            claude.management_key = self.claude.management_key.clone();
+        proxy.management_key = proxy.management_key.trim().to_owned();
+        if proxy.management_key.is_empty() {
+            proxy.management_key = self.proxy.management_key.clone();
         }
         incoming.validate()?;
         *self = incoming;
@@ -352,9 +345,9 @@ impl Settings {
                 bail!("{} URL must start with http:// or https://", kind.name());
             }
         }
-        let base = &self.claude.base_url;
+        let base = &self.proxy.base_url;
         if !base.starts_with("http://") && !base.starts_with("https://") {
-            bail!("the Claude proxy URL must start with http:// or https://");
+            bail!("the CLIProxyAPI URL must start with http:// or https://");
         }
         Ok(())
     }
@@ -468,7 +461,7 @@ mod tests {
 
     fn configured() -> Settings {
         Settings {
-            claude: ClaudeSettings {
+            proxy: ProxySettings {
                 api_key: "proxy-key".into(),
                 ..Default::default()
             },
@@ -545,55 +538,49 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_claude_account_is_a_problem() {
-        let mut settings = configured();
-        assert!(settings.claude.enabled, "claude starts enabled");
-        settings.claude.enabled = false;
-        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert!(fields.iter().any(|f| f == "claude-card"), "{fields:?}");
-        assert!(settings.to_config(&cli()).is_none());
-    }
-
-    #[test]
-    fn claude_keys_are_optional_but_the_section_must_be_enabled() {
+    fn proxy_keys_are_optional() {
         // Neither key is required: a stock CLIProxyAPI needs no client key,
         // and the management key only buys account status.
         let mut settings = configured();
-        settings.claude.api_key = String::new();
-        settings.claude.management_key = String::new();
+        settings.proxy.api_key = String::new();
+        settings.proxy.management_key = String::new();
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
         assert!(fields.is_empty(), "{fields:?}");
         assert!(settings.to_config(&cli()).is_some());
-
-        // With no provider enabled there is nothing to run turns on.
-        settings.claude.enabled = false;
-        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert!(fields.iter().any(|f| f == "claude-card"), "{fields:?}");
-        assert!(settings.to_config(&cli()).is_none());
     }
 
     #[test]
-    fn claude_keys_are_write_only_and_kept_on_empty_updates() {
+    fn proxy_keys_are_write_only_and_kept_on_empty_updates() {
         let value = configured().redacted();
-        assert!(value["claude"].get("api_key").is_none());
-        assert!(value["claude"].get("management_key").is_none());
-        assert_eq!(value["claude"]["api_key_set"], true);
-        assert_eq!(value["claude"]["management_key_set"], false);
+        assert!(value["proxy"].get("api_key").is_none());
+        assert!(value["proxy"].get("management_key").is_none());
+        assert_eq!(value["proxy"]["api_key_set"], true);
+        assert_eq!(value["proxy"]["management_key_set"], false);
 
         let mut settings = configured();
         let mut incoming = configured();
-        incoming.claude.api_key = String::new();
-        incoming.claude.base_url = String::new();
-        incoming.claude.management_key = " mgmt ".into();
+        incoming.proxy.api_key = String::new();
+        incoming.proxy.base_url = String::new();
+        incoming.proxy.management_key = " mgmt ".into();
         settings.apply_update(incoming).unwrap();
-        assert_eq!(settings.claude.api_key, "proxy-key");
+        assert_eq!(settings.proxy.api_key, "proxy-key");
         // An emptied URL falls back to the default rather than breaking.
-        assert_eq!(settings.claude.base_url, crate::claude::DEFAULT_BASE_URL);
-        assert_eq!(settings.claude.management_key, "mgmt");
+        assert_eq!(settings.proxy.base_url, crate::proxy::DEFAULT_BASE_URL);
+        assert_eq!(settings.proxy.management_key, "mgmt");
 
         let mut bad = configured();
-        bad.claude.base_url = "127.0.0.1:8317".into();
+        bad.proxy.base_url = "127.0.0.1:8317".into();
         assert!(settings.apply_update(bad).is_err());
+    }
+
+    #[test]
+    fn a_config_from_the_claude_era_still_loads_its_proxy_section() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "claude": { "enabled": true, "base_url": "http://box:9000", "api_key": "k" },
+        }))
+        .unwrap();
+        assert_eq!(settings.proxy.base_url, "http://box:9000");
+        assert_eq!(settings.proxy.api_key, "k");
     }
 
     #[test]

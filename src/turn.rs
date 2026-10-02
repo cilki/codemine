@@ -25,7 +25,7 @@ pub struct Report {
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
     /// only these turns count toward the hourly limit.
     pub completed: bool,
-    /// The turn died on Claude authentication (a rejected client key or a
+    /// The turn died on proxy authentication (a rejected client key or a
     /// proxy with no usable login); the main loop briefly gates further
     /// turns so a broken setup can't burn them back to back.
     pub auth_error: bool,
@@ -169,17 +169,23 @@ pub fn run(
         });
     }
 
-    // The commit the agent is about to read, taken while the clone is still
-    // on a clean default branch — after the turn it could be sitting on
-    // whatever branch the agent left behind. A cachable task that skips is
-    // remembered against it. Best-effort: without it the task is simply
-    // drawn again next time.
-    let head = match workspace::head_sha(&dir) {
-        Ok(head) => Some(head),
-        Err(err) => {
-            warn!("failed to read {}'s head commit: {err:#}", dir.display());
-            None
-        }
+    // Whatever this task's answer depends on, read before the agent runs: the
+    // commit it is about to read, taken while the clone is still on a clean
+    // default branch — after the turn it could be sitting on whatever branch
+    // the agent left behind — or the notification stamp it is about to read,
+    // taken before the agent marks any of the feed read. A task that skips is
+    // remembered against it. Best-effort: without it the task is simply drawn
+    // again next time.
+    let state = match cache::basis(task) {
+        Some(cache::Basis::Head) => match workspace::head_sha(&dir) {
+            Ok(head) => Some(head),
+            Err(err) => {
+                warn!("failed to read {}'s head commit: {err:#}", dir.display());
+                None
+            }
+        },
+        Some(cache::Basis::Feed) => probe.state(task, forge, repo),
+        None => None,
     };
 
     // The agent runs inside the Landlock write sandbox, so it cannot work
@@ -212,6 +218,9 @@ pub fn run(
         // would resolve the runner's own launch directory instead.
         .env("PWD", &dir)
         .env("NO_COLOR", "1")
+        // rtk's telemetry is opt-in and already off; this is the hard switch,
+        // so the agent can't report what it ran however rtk is configured.
+        .env("RTK_TELEMETRY_DISABLED", "1")
         // Headless runs auto-reject permission prompts, so every tool the
         // agent needs has to be pre-approved. The Landlock sandbox is the
         // real boundary, and legitimate work (cargo's registry, tool caches)
@@ -307,13 +316,13 @@ pub fn run(
         }
     };
 
-    // A cachable task that came up empty is held back until the repository
-    // moves off this commit; any other outcome retires whatever was
-    // remembered, since a completed turn changed something and a turn that
-    // failed, timed out, or was cancelled never got to answer.
-    if cache::cachable(task) {
-        match (outcome, &head) {
-            (Outcome::Skipped, Some(head)) => cache.remember(task, forge.kind, repo, head),
+    // A task that came up empty is held back until the state it answered for
+    // moves; any other outcome retires whatever was remembered, since a
+    // completed turn changed something and a turn that failed, timed out, or
+    // was cancelled never got to answer.
+    if cache::basis(task).is_some() {
+        match (outcome, &state) {
+            (Outcome::Skipped, Some(state)) => cache.remember(task, forge.kind, repo, state),
             _ => cache.forget(task, forge.kind, repo),
         }
     }

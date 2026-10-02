@@ -1,12 +1,14 @@
-//! Skip memory for the tasks that answer out of the tree alone. `docs`,
-//! `simplify`, `benchmark`, `coverage`, and `mutation` all read the code and
-//! nothing else, so a turn that found nothing to do will find nothing again
-//! until the code moves — drawing them meanwhile buys a session's worth of
-//! tokens and another `TASK SKIPPED`. Each skip is remembered against the
-//! repository's default-branch commit and the task's own instructions, and
-//! the task isn't drawn for that repository again until one of the two
-//! changes. The memory is persisted next to the rest of the workspace, since
-//! the clones outlive the process too.
+//! Skip memory for the tasks whose answer is a function of something the
+//! runner can observe for itself. `docs`, `simplify`, `benchmark`,
+//! `coverage`, and `mutation` all read the code and nothing else, so a turn
+//! that found nothing to do will find nothing again until the code moves.
+//! `feedback` reads the forge's notification feed, so its answer holds until
+//! a thread newer than the ones it already read arrives. Drawing either
+//! meanwhile buys a session's worth of tokens and another `TASK SKIPPED`.
+//! Each skip is remembered against that state and the task's own
+//! instructions, and the task isn't drawn for that repository again until one
+//! of the two changes. The memory is persisted next to the rest of the
+//! workspace, since the clones outlive the process too.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -21,24 +23,41 @@ use tracing::warn;
 
 use crate::config::{Forge, ForgeKind};
 
-/// Whether a skipped turn on this task is worth remembering. Only tasks whose
-/// answer is a function of the tree qualify: one that also depends on the
-/// forge (`feedback`), on the outside world (`bump`), or on the agent's own
-/// imagination (`feature`) could become actionable without a single commit
-/// landing, and a remembered skip would outlast the reason for it.
-pub fn cachable(task: &str) -> bool {
-    matches!(
-        task,
-        "docs" | "simplify" | "benchmark" | "coverage" | "mutation"
-    )
+/// What a skipped turn on this task is remembered against, or `None` when the
+/// skip isn't worth remembering at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Basis {
+    /// The repository's default-branch commit: the task reads the tree and
+    /// nothing else, so its answer holds until the code moves.
+    Head,
+    /// The newest unread thread on the repository's notification feed. This
+    /// is what `feedback` answers out of, and it needs remembering as much as
+    /// the tree does: the feed is also the task's precondition probe, so one
+    /// stale thread nobody marks read keeps the probe true forever. Gated
+    /// tasks are probed first and the first with work wins the draw, so that
+    /// is not one wasted turn but every turn until the thread is cleared.
+    Feed,
+}
+
+/// The state this task's answer depends on. `None` for the tasks that can
+/// become actionable with nothing observable moving — `bump` watches the
+/// outside world, `feature` invents its own work — where a remembered skip
+/// would outlast the reason for it.
+pub fn basis(task: &str) -> Option<Basis> {
+    match task {
+        "docs" | "simplify" | "benchmark" | "coverage" | "mutation" => Some(Basis::Head),
+        "feedback" => Some(Basis::Feed),
+        _ => None,
+    }
 }
 
 /// The state a skip was remembered against. Both halves have to still match
 /// for the skip to stand.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 struct Mark {
-    /// The default branch's commit as the agent saw it.
-    head: String,
+    /// The task's `Basis` as the agent saw it: a commit for `Basis::Head`, a
+    /// notification stamp for `Basis::Feed`.
+    state: String,
     /// Digest of the task's instructions, so a reworded task section gets
     /// drawn again instead of staying gated on the old wording.
     prompt: String,
@@ -72,11 +91,11 @@ impl Cache {
         }
     }
 
-    /// Remember that the task found nothing to do on the repository at
-    /// `head`, so it isn't drawn again until the code or the task moves.
-    pub fn remember(&self, task: &str, forge: ForgeKind, repo: &str, head: &str) {
+    /// Remember that the task found nothing to do on the repository in
+    /// `state`, so it isn't drawn again until that state or the task moves.
+    pub fn remember(&self, task: &str, forge: ForgeKind, repo: &str, state: &str) {
         let mark = Mark {
-            head: head.to_owned(),
+            state: state.to_owned(),
             prompt: digest(task),
         };
         let mut marks = self.lock();
@@ -154,11 +173,13 @@ fn digest(task: &str) -> String {
 }
 
 /// The draw's precondition check with the skip memory folded in, plus the
-/// default-branch commits read along the way. The same repository is probed
-/// once per cachable task, and one round trip answers for all of them.
+/// forge state read along the way: default-branch commits per repository,
+/// notification feeds per forge. Each is fetched at most once and answers for
+/// every candidate the rest of the draw asks about.
 pub struct Probe<'a> {
     cache: &'a Cache,
     heads: RefCell<BTreeMap<(ForgeKind, String), Option<String>>>,
+    feeds: RefCell<BTreeMap<ForgeKind, Option<BTreeMap<String, String>>>>,
 }
 
 impl<'a> Probe<'a> {
@@ -166,34 +187,58 @@ impl<'a> Probe<'a> {
         Probe {
             cache,
             heads: RefCell::new(BTreeMap::new()),
+            feeds: RefCell::new(BTreeMap::new()),
         }
     }
 
     /// Whether the task is worth a turn on this repository: it must have
     /// something to act on, and must not already have come up empty at
-    /// exactly this state. The two are disjoint in practice — no cachable
-    /// task is a gated one — so each candidate costs one probe or the other,
-    /// never both.
+    /// exactly this state. The memory is checked first, so a task held back
+    /// by it costs only the shared state read and never the precondition
+    /// probe — which matters most for `feedback`, the one task that is both
+    /// gated and remembered.
     pub fn actionable(&self, task: &str, forge: &Forge, repo: &str) -> bool {
         !self.remembered(task, forge, repo) && crate::precheck::actionable(task, forge, repo)
     }
 
+    /// The state the task's answer currently depends on, for remembering a
+    /// skip against. `None` when the task keeps no memory, or when the state
+    /// couldn't be read.
+    pub fn state(&self, task: &str, forge: &Forge, repo: &str) -> Option<String> {
+        match basis(task)? {
+            Basis::Head => self.head(forge, repo),
+            Basis::Feed => self.stamp(forge, repo),
+        }
+    }
+
     /// Whether a remembered skip still describes the repository.
     fn remembered(&self, task: &str, forge: &Forge, repo: &str) -> bool {
-        if !cachable(task) {
+        let Some(basis) = basis(task) else {
             return false;
-        }
+        };
         let Some(mark) = self.cache.marked(&key(task, forge.kind, repo)) else {
             return false;
         };
-        // Fail-open like the prechecks: with no head to compare against, the
-        // task is drawn and at worst skips again.
-        self.head(forge, repo).is_some_and(|head| {
-            mark == Mark {
-                head,
-                prompt: digest(task),
-            }
-        })
+        // Checked before the state is read, so a reworded task costs no
+        // round trip on its way to being drawn again.
+        if mark.prompt != digest(task) {
+            return false;
+        }
+        // Fail-open like the prechecks: with no state to compare against,
+        // the task is drawn and at worst skips again.
+        let Some(state) = self.state(task, forge, repo) else {
+            return false;
+        };
+        match basis {
+            // One commit is neither newer nor older than another here: any
+            // move off the remembered one is news.
+            Basis::Head => state == mark.state,
+            // Stamps from one server, only ever compared to each other, so
+            // string order is time order — the same test `events::fresh`
+            // makes. A stamp moving backward is a thread being read or
+            // cleared rather than news, so the skip still stands.
+            Basis::Feed => state <= mark.state,
+        }
     }
 
     /// The repository's default-branch commit, read from the forge once per
@@ -208,6 +253,26 @@ impl<'a> Probe<'a> {
             .ok();
         self.heads.borrow_mut().insert(id, head.clone());
         head
+    }
+
+    /// The newest unread notification on the repository's feed. The feed is
+    /// account-wide, so one request per forge answers for every repository in
+    /// the draw. `None` for a repository with nothing unread on it, or a feed
+    /// that couldn't be read.
+    fn stamp(&self, forge: &Forge, repo: &str) -> Option<String> {
+        if let Some(feed) = self.feeds.borrow().get(&forge.kind) {
+            return feed.as_ref().and_then(|feed| feed.get(repo).cloned());
+        }
+        let feed = crate::events::unread(forge)
+            .inspect_err(|err| {
+                warn!(
+                    "failed to read {}'s activity feed: {err:#}",
+                    forge.kind.name()
+                )
+            })
+            .ok();
+        self.feeds.borrow_mut().insert(forge.kind, feed.clone());
+        feed.and_then(|feed| feed.get(repo).cloned())
     }
 }
 
@@ -242,28 +307,120 @@ mod tests {
         probe
     }
 
-    /// The tree-only tasks are cached; everything that can become actionable
-    /// without a commit is not.
+    /// The same for the notification feed, which the probe reads once per
+    /// forge rather than per repository.
+    fn feed_probe<'a>(cache: &'a Cache, feed: &[(&str, &str)]) -> Probe<'a> {
+        let probe = Probe::new(cache);
+        probe.feeds.borrow_mut().insert(
+            ForgeKind::Github,
+            Some(
+                feed.iter()
+                    .map(|(repo, stamp)| ((*repo).to_owned(), (*stamp).to_owned()))
+                    .collect(),
+            ),
+        );
+        probe
+    }
+
+    /// Each task is remembered against whatever it reads: the tree-only ones
+    /// against the tree, `feedback` against the notification feed. The tasks
+    /// that can become actionable with nothing observable moving keep no
+    /// memory at all.
     #[test]
-    fn cachable_covers_the_tree_only_tasks() {
+    fn basis_matches_what_each_task_reads() {
         for task in ["docs", "simplify", "benchmark", "coverage", "mutation"] {
-            assert!(cachable(task));
+            assert_eq!(basis(task), Some(Basis::Head), "{task}");
         }
-        for task in [
-            "feedback", "rebase", "bump", "todo", "roleplay", "audit", "feature",
-        ] {
-            assert!(!cachable(task));
+        assert_eq!(basis("feedback"), Some(Basis::Feed));
+        for task in ["rebase", "bump", "todo", "roleplay", "audit", "feature"] {
+            assert_eq!(basis(task), None, "{task}");
         }
     }
 
-    /// Every cachable slug still names a task the sweep command defines, so a
-    /// renamed section can't quietly stop being cached.
+    /// Every remembered slug still names a task the sweep command defines, so
+    /// a renamed section can't quietly stop being remembered.
     #[test]
-    fn cachable_tasks_are_real_tasks() {
+    fn remembered_tasks_are_real_tasks() {
         let slugs = crate::prompts::default_tasks();
-        for task in ["docs", "simplify", "benchmark", "coverage", "mutation"] {
+        for task in [
+            "docs",
+            "simplify",
+            "benchmark",
+            "coverage",
+            "mutation",
+            "feedback",
+        ] {
             assert!(slugs.iter().any(|slug| slug == task), "{task} is gone");
         }
+    }
+
+    /// A `feedback` skip is keyed on the feed, not the tree: it stands while
+    /// the feed sits still, and a thread newer than the one it answered for
+    /// draws the task again. Without this one stale notification keeps the
+    /// precheck true and `feedback` — probed first, so first to win the draw
+    /// — is drawn every single turn until somebody marks it read.
+    #[test]
+    fn a_feedback_skip_stands_until_a_newer_thread_arrives() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        let github = forge(ForgeKind::Github);
+        cache.remember(
+            "feedback",
+            ForgeKind::Github,
+            "me/repo",
+            "2026-10-01T02:00:00Z",
+        );
+
+        let unchanged = [("me/repo", "2026-10-01T02:00:00Z")];
+        assert!(feed_probe(&cache, &unchanged).remembered("feedback", &github, "me/repo"));
+        let newer = [("me/repo", "2026-10-01T03:00:00Z")];
+        assert!(!feed_probe(&cache, &newer).remembered("feedback", &github, "me/repo"));
+    }
+
+    /// A stamp moving backward is a thread being read or cleared rather than
+    /// news, so the skip survives it — the same reading `events::fresh` takes.
+    #[test]
+    fn a_cleared_thread_does_not_redraw_feedback() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        cache.remember(
+            "feedback",
+            ForgeKind::Github,
+            "me/repo",
+            "2026-10-01T02:00:00Z",
+        );
+        let older = [("me/repo", "2026-10-01T01:00:00Z")];
+        assert!(feed_probe(&cache, &older).remembered(
+            "feedback",
+            &forge(ForgeKind::Github),
+            "me/repo"
+        ));
+    }
+
+    /// A feed with nothing on the repository fails open like an unreadable
+    /// head. It costs no turn either way: the precheck reads the same empty
+    /// feed and says there is nothing to do.
+    #[test]
+    fn an_empty_feed_draws_feedback() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        cache.remember(
+            "feedback",
+            ForgeKind::Github,
+            "me/repo",
+            "2026-10-01T02:00:00Z",
+        );
+        let elsewhere = [("me/other", "2026-10-01T03:00:00Z")];
+        assert!(!feed_probe(&cache, &elsewhere).remembered(
+            "feedback",
+            &forge(ForgeKind::Github),
+            "me/repo"
+        ));
+        assert!(!feed_probe(&cache, &[]).remembered(
+            "feedback",
+            &forge(ForgeKind::Github),
+            "me/repo"
+        ));
     }
 
     #[test]
@@ -299,16 +456,17 @@ mod tests {
         assert!(!probe(&cache, "abc").remembered("simplify", &forge(ForgeKind::Github), "me/repo"));
     }
 
-    /// An uncachable task is never held back, whatever the file happens to
-    /// hold, and costs no head lookup either.
+    /// A task with no basis is never held back, whatever the file happens to
+    /// hold, and costs no forge lookup either.
     #[test]
-    fn uncachable_tasks_are_never_remembered() {
+    fn unremembered_tasks_are_never_held_back() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        cache.remember("feedback", ForgeKind::Github, "me/repo", "abc");
+        cache.remember("bump", ForgeKind::Github, "me/repo", "abc");
         let probe = Probe::new(&cache);
-        assert!(!probe.remembered("feedback", &forge(ForgeKind::Github), "me/repo"));
+        assert!(!probe.remembered("bump", &forge(ForgeKind::Github), "me/repo"));
         assert!(probe.heads.borrow().is_empty());
+        assert!(probe.feeds.borrow().is_empty());
     }
 
     /// A skip remembered under one wording of the task doesn't gate the next.
@@ -344,7 +502,7 @@ mod tests {
         assert_eq!(
             cache(&root).marked(&key("mutation", ForgeKind::Gitlab, "me/repo")),
             Some(Mark {
-                head: "abc".into(),
+                state: "abc".into(),
                 prompt: digest("mutation"),
             })
         );

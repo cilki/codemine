@@ -3,6 +3,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -91,6 +92,72 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
     Ok(())
 }
 
+/// Hand the opencode plugin install to rtk itself: `rtk init -g --opencode`
+/// writes `~/.config/opencode/plugins/rtk.ts` and nothing else, only when the
+/// contents changed, so repeating it every startup costs nothing. The plugin
+/// pipes each shell command the agent runs through `rtk rewrite`, swapping in
+/// the rtk equivalent so the agent reads compressed build and test output
+/// instead of the raw firehose. Without rtk on the PATH there is nothing to
+/// install and the agent reads raw output; a plugin left behind by an earlier
+/// install disables itself when it can't find the binary. Nothing here is
+/// allowed to fail startup, which is why it reports instead of returning.
+pub fn install_rtk() {
+    let output = match Command::new("rtk")
+        .args(["init", "-g", "--opencode"])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => {
+            tracing::info!("rtk is not installed; the agent's commands run unrewritten");
+            return;
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            "rtk init exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return;
+    }
+    if let Err(err) = install_rtk_config(&rtk_config_path()) {
+        tracing::warn!("{err:#}");
+    }
+}
+
+/// rtk's config, written only when the deployment hasn't supplied one — it is
+/// rtk's file, not ours. `gh` and `glab` are kept out of the rewrite because
+/// the forge skills have the agent read review comments and notification
+/// thread ids straight out of those commands' output, and rtk compresses
+/// exactly that away. The savings rtk is here for are in build and test
+/// output, which these don't touch.
+const RTK_CONFIG: &str = "\
+# Written by codemine because no rtk config was present; edit freely.
+[hooks]
+exclude_commands = [\"gh\", \"glab\"]
+";
+
+/// Where rtk reads its config, resolved the way rtk resolves it: its
+/// `dirs::config_dir` honors `XDG_CONFIG_HOME` exactly as `xdg_dir` does.
+pub fn rtk_config_path() -> PathBuf {
+    crate::config::xdg_dir("XDG_CONFIG_HOME", ".config").join("rtk/config.toml")
+}
+
+/// Write the config if there isn't one, leaving an operator's own settings
+/// alone. The path is a parameter rather than read from the environment so the
+/// test can point it at a tempdir without touching env the rest of the suite
+/// shares.
+fn install_rtk_config(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path.parent().expect("the config path has a parent");
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    std::fs::write(path, RTK_CONFIG).with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// Stands in for the client key when none is configured. A CLIProxyAPI with
 /// an empty `api-keys` list — the default — accepts any key, but the
 /// anthropic provider refuses to send a request without one, so the field
@@ -102,7 +169,7 @@ const UNUSED_API_KEY: &str = "cliproxyapi";
 /// speaks Anthropic's own API shape, so the stock provider works against it
 /// with no auth.json entry and no plugin. The file is made owner-only since
 /// it may carry the key.
-pub fn install_provider(dir: &Path, claude: &crate::settings::ClaudeSettings) -> Result<()> {
+pub fn install_provider(dir: &Path, proxy: &crate::settings::ProxySettings) -> Result<()> {
     let path = dir.join("opencode.json");
     let mut config: serde_json::Value = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -112,11 +179,11 @@ pub fn install_provider(dir: &Path, claude: &crate::settings::ClaudeSettings) ->
     config["provider"]["anthropic"]["options"] = serde_json::json!({
         // The provider's default is https://api.anthropic.com/v1, so the
         // version segment belongs to the base URL.
-        "baseURL": format!("{}/v1", claude.base_url),
-        "apiKey": if claude.api_key.is_empty() {
+        "baseURL": format!("{}/v1", proxy.base_url),
+        "apiKey": if proxy.api_key.is_empty() {
             UNUSED_API_KEY
         } else {
-            &claude.api_key
+            &proxy.api_key
         },
     });
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
@@ -427,7 +494,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opencode.json");
-        let claude = crate::settings::ClaudeSettings {
+        let proxy = crate::settings::ProxySettings {
             api_key: "k1".into(),
             ..Default::default()
         };
@@ -436,7 +503,7 @@ mod tests {
         // the placeholder key a keyless proxy ignores.
         install_provider(
             dir.path(),
-            &crate::settings::ClaudeSettings {
+            &crate::settings::ProxySettings {
                 api_key: String::new(),
                 ..Default::default()
             },
@@ -449,12 +516,12 @@ mod tests {
             UNUSED_API_KEY
         );
 
-        install_provider(dir.path(), &claude).unwrap();
+        install_provider(dir.path(), &proxy).unwrap();
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             config["provider"]["anthropic"]["options"]["baseURL"],
-            format!("{}/v1", crate::claude::DEFAULT_BASE_URL)
+            format!("{}/v1", crate::proxy::DEFAULT_BASE_URL)
         );
         assert_eq!(config["provider"]["anthropic"]["options"]["apiKey"], "k1");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -467,7 +534,7 @@ mod tests {
             r#"{"theme":"dark","provider":{"anthropic":{"options":{"apiKey":"old","stale":true}}}}"#,
         )
         .unwrap();
-        install_provider(dir.path(), &claude).unwrap();
+        install_provider(dir.path(), &proxy).unwrap();
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(config["theme"], "dark");
@@ -539,5 +606,22 @@ mod tests {
             install_mcp(dir.path(), false).unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         }
+    }
+
+    /// rtk's own config is ours to create but not to own: the exclusions land
+    /// when there is nothing there, and an operator's file survives untouched.
+    #[test]
+    fn install_rtk_config_only_writes_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtk/config.toml");
+
+        install_rtk_config(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains(r#"exclude_commands = ["gh", "glab"]"#));
+
+        let original = "[hooks]\nexclude_commands = [\"curl\"]\n";
+        std::fs::write(&path, original).unwrap();
+        install_rtk_config(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 }

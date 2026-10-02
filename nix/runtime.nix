@@ -28,3 +28,7 @@ with pkgs;
 # branch-off); the runner skips indexing when the CLI is absent, and the
 # Dockerfile falls back to the upstream installer.
 ++ lib.optional (pkgs ? codegraph) codegraph
+# rtk is missing from some nixpkgs pins too; the agent's commands run
+# unrewritten when the CLI is absent, and the Dockerfile falls back to the
+# upstream installer.
+++ lib.optional (pkgs ? rtk) rtk

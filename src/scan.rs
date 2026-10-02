@@ -38,9 +38,13 @@ pub fn reported_completed(tail: &str) -> bool {
 /// `authentication_error` through.
 pub fn auth_error(tail: &str) -> bool {
     let tail = strip_ansi(tail);
-    ["authentication_error", "Invalid API key", "unknown provider for model"]
-        .iter()
-        .any(|needle| tail.contains(needle))
+    [
+        "authentication_error",
+        "Invalid API key",
+        "unknown provider for model",
+    ]
+    .iter()
+    .any(|needle| tail.contains(needle))
 }
 
 /// The epoch at which an exhausted usage window reopens, parsed from a

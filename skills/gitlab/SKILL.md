@@ -75,6 +75,25 @@ If a comment is ambiguous, or asks for something you think is wrong, say so in
 the reply instead of guessing. Address every comment: either make the change or
 explain why you didn't.
 
+## Clearing todos you have handled
+
+GitLab tracks what is waiting on you as todos — they fire when someone
+mentions you or assigns you something — and a pending todo is what marks this
+project as having feedback waiting on it. One you have already dealt with has
+to be marked done. Left pending it goes on claiming there is something here to
+answer, and the next look at this project is spent rediscovering that there
+isn't.
+
+```sh
+glab api todos                                  # your pending todos, with the project each belongs to
+glab api --method POST todos/<id>/mark_as_done  # mark one done, by the id the listing shows
+```
+
+Mark a todo done once you have acted on it, replied to it, or read it and
+found nothing owing — including when that is the whole of what you found and
+you are about to skip the turn. Leave pending only what you still owe an
+answer.
+
 ## Issues
 
 Create issues for work you are not going to do yourself: something too large

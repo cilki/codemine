@@ -5,13 +5,13 @@
 //! configured through the always-on web UI and persisted in the workspace.
 
 mod cache;
-mod claude;
 mod config;
 mod emblem;
 mod events;
 mod host;
 mod precheck;
 mod prompts;
+mod proxy;
 mod sandbox;
 mod scan;
 mod schedule;
@@ -55,11 +55,12 @@ fn main() -> Result<()> {
     setup(&mut cli)?;
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
-    // Point opencode at the Claude proxy before anything lists models; the
-    // web UI re-runs this whenever the proxy settings change.
-    prompts::install_provider(&prompts::opencode_config_dir(), &store.snapshot().0.claude)?;
-    // The tasks that only read the tree remember the commit they last came up
-    // empty on, so they aren't drawn again until it moves.
+    // Point opencode at the proxy before anything lists models; the web UI
+    // re-runs this whenever the proxy settings change.
+    prompts::install_provider(&prompts::opencode_config_dir(), &store.snapshot().0.proxy)?;
+    // A task that came up empty remembers the state it answered for — the
+    // tree's commit, or the notification feed for `feedback` — so it isn't
+    // drawn again until that moves.
     let cache = cache::Cache::load(cli.workspace.join("skips.json"));
     let status = Shared::new();
     let addr = webui::spawn(
@@ -92,7 +93,7 @@ fn main() -> Result<()> {
     let mut sized_for: Option<f64> = None;
     let mut refilled = status::epoch_now();
     let mut applied_generation = None;
-    // The epoch until which turns are held after one died on Claude auth: a
+    // The epoch until which turns are held after one died on proxy auth: a
     // short flat pause, since refreshing is CLIProxyAPI's continuous job and
     // anything it can't fix on its own needs a human either way — which the
     // health problem below surfaces independently.
@@ -100,26 +101,23 @@ fn main() -> Result<()> {
     loop {
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
-        // With the Claude section disabled nothing runs anyway (problems()
-        // says so), so the proxy is left entirely unchecked.
-        if let Some(retry_at) = auth_gated.filter(|_| settings.claude.enabled) {
+        if let Some(retry_at) = auth_gated {
             if status::epoch_now() >= retry_at {
-                info!("retrying after the Claude auth gate expired");
+                info!("retrying after the proxy auth gate expired");
                 auth_gated = None;
                 Status::update(&status, |s| s.oauth_gated_until = None);
             } else {
                 problems.push(Problem::new(
-                    "claude-card",
-                    "the last turn failed to authenticate with the Claude proxy; \
+                    "proxy-card",
+                    "the last turn failed to authenticate with CLIProxyAPI; \
                      retrying shortly",
                 ));
             }
         }
-        if settings.claude.enabled
-            && problems.is_empty()
-            && let Some(message) = claude::problem(&settings.claude)
+        if problems.is_empty()
+            && let Some(message) = proxy::problem(&settings.proxy)
         {
-            problems.push(Problem::new("claude-card", message));
+            problems.push(Problem::new("proxy-card", message));
         }
         if !problems.is_empty() {
             Status::update(&status, |s| {
@@ -206,7 +204,7 @@ fn main() -> Result<()> {
                 if report.auth_error {
                     let until = status::epoch_now() + AUTH_RETRY;
                     error!(
-                        "the turn died on Claude auth; holding turns for {} minutes",
+                        "the turn died on proxy auth; holding turns for {} minutes",
                         AUTH_RETRY / 60
                     );
                     auth_gated = Some(until);
@@ -248,7 +246,7 @@ fn main() -> Result<()> {
 
 const HOUR: f64 = 3600.0;
 
-/// How long turns are held after one died on Claude auth, in seconds. Flat
+/// How long turns are held after one died on proxy auth, in seconds. Flat
 /// and short: refreshing is the proxy's continuous job, so either the blip
 /// passes on its own or the health check surfaces what a human must fix.
 const AUTH_RETRY: u64 = 5 * 60;
@@ -319,15 +317,20 @@ fn setup(cli: &mut Cli) -> Result<()> {
     // Install the embedded prompts where opencode resolves commands and
     // skills by name, so the binary works without the image copying them,
     // retire whatever the opencode-claude-auth era left behind (plugin
-    // links, npm references, the stale anthropic credential), and wire the
+    // links, npm references, the stale anthropic credential), wire the
     // codegraph MCP server into opencode's config when the CLI is actually
-    // installed.
+    // installed, and let rtk install its own command-rewrite plugin when that
+    // CLI is there.
     prompts::install(&prompts::opencode_config_dir())?;
-    prompts::remove_claude_plugin(&prompts::opencode_config_dir(), &prompts::opencode_auth_json())?;
+    prompts::remove_claude_plugin(
+        &prompts::opencode_config_dir(),
+        &prompts::opencode_auth_json(),
+    )?;
     prompts::install_mcp(
         &prompts::opencode_config_dir(),
         workspace::codegraph_available(),
     )?;
+    prompts::install_rtk();
 
     std::fs::create_dir_all(&cli.workspace)
         .with_context(|| format!("failed to create {}", cli.workspace.display()))?;

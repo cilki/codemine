@@ -36,15 +36,35 @@ With [codegraph](https://github.com/colbymchenry/codegraph) installed, the agent
 avoids rereading the tree every turn, which cuts token usage substantially on
 large projects.
 
+#### rtk
+
+With [rtk](https://github.com/rtk-ai/rtk) installed, every shell command the
+agent runs is swapped for its rtk equivalent, so it reads compressed build,
+test, and lint output instead of the raw firehose. `gh` and `glab` are left
+alone — the forge skills read ids and review comments straight out of their
+output — via a `~/.config/rtk/config.toml` **codemine** writes if you haven't
+supplied one.
+
 #### Skip caching
 
-The tasks that answer out of the code alone — `simplify`, `benchmark`, `docs`,
-`coverage`, and `mutation` — remember the commit they last found nothing at.
-Until that repository's default branch moves (or the task's own instructions
-change in a **codemine** upgrade), they aren't drawn for it again, so a quiet
-repo stops costing a session per task to rediscover it has nothing to do. The
-memory lives in `skips.json` in the workspace and survives restarts; the other
-tasks can become actionable without a commit landing and are never cached.
+A task that found nothing to do remembers the state it answered for, and isn't
+drawn for that repository again until the state moves (or the task's own
+instructions change in a **codemine** upgrade), so a quiet repo stops costing a
+session per task to rediscover it has nothing to do. What counts as the state
+depends on what the task reads:
+
+- `simplify`, `benchmark`, `docs`, `coverage`, and `mutation` answer out of the
+  code alone, so they remember the commit they last found nothing at.
+- `feedback` answers out of the forge's notification feed, so it remembers the
+  newest thread it read. This matters more than it looks: the same feed is also
+  the task's precondition probe, and `feedback` is probed first and wins the
+  draw ahead of everything else, so one stale notification nobody marks read
+  would otherwise hand it every turn indefinitely.
+
+The memory lives in `skips.json` in the workspace and survives restarts. The
+remaining tasks can become actionable with nothing observable moving — `bump`
+watches the outside world, `feature` invents its own work — and are never
+cached.
 
 #### Prioritization
 

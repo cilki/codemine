@@ -204,13 +204,20 @@
   #settings-status.saving { color: #9aa0a6; }
   #settings-status.ok { color: #2ecc71; }
   #settings-status.err { color: #e74c3c; }
-  #claude-card { margin-bottom: 16px; }
-  #claude-card.invalid { outline: 1px solid #e74c3c; outline-offset: 4px; }
-  #claude-status { font-size: 0.85em; }
-  #claude-status.err { color: #e74c3c; }
-  #claude-status.warn { color: #f39c12; }
-  .claude-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  #claude-note { font-size: 0.85em; min-height: 1.2em; }
+  #proxy-card { margin-bottom: 16px; }
+  #proxy-card.invalid { outline: 1px solid #e74c3c; outline-offset: 4px; }
+  /* The proxy's health, as a dot beside the URL it was probed at; the digest
+     the management API reports is the dot's tooltip. */
+  #proxy-health {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-left: 5px; vertical-align: 0.05em; cursor: help; background: #9aa0a6;
+  }
+  #proxy-health.ok { background: #2ecc71; }
+  #proxy-health.warn { background: #f39c12; }
+  #proxy-health.err { background: #e74c3c; }
+  /* The two keys share a row, and stack when the dialog is too narrow. */
+  .keys { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  #proxy-note { font-size: 0.85em; min-height: 1.2em; }
 </style>
 </head>
 <body>
@@ -290,24 +297,24 @@
     <div class="field tasks"><label>Tasks</label>
       <div class="checks-grid" id="s-tasks"></div>
     </div>
-    <div class="forge" id="claude-card">
+    <div class="forge" id="proxy-card">
       <div class="forge-head">
-        <span class="name">Claude account</span>
-        <label class="check"><input type="checkbox" id="claude-enabled" checked> enabled</label>
+        <span class="name">CLIProxyAPI</span>
       </div>
       <div class="field"><label for="s-model">Model</label>
         <select id="s-model"></select>
       </div>
-      <div class="field"><label for="claude-base-url">CLIProxyAPI URL</label>
-        <input id="claude-base-url" placeholder="http://127.0.0.1:8317"></div>
-      <div class="field"><label for="claude-api-key">Client API key</label>
-        <input id="claude-api-key" type="password" autocomplete="off"></div>
-      <div class="field"><label for="claude-management-key">Management key</label>
-        <input id="claude-management-key" type="password" autocomplete="off"></div>
-      <div class="claude-row">
-        <span class="muted" id="claude-status">checking…</span>
+      <div class="field">
+        <label for="proxy-base-url">URL
+          <span id="proxy-health" role="img" aria-label="checking" title="checking…"></span></label>
+        <input id="proxy-base-url" placeholder="http://127.0.0.1:8317"></div>
+      <div class="keys">
+        <div class="field"><label for="proxy-api-key">Client API key</label>
+          <input id="proxy-api-key" type="password" autocomplete="off"></div>
+        <div class="field"><label for="proxy-management-key">Management key</label>
+          <input id="proxy-management-key" type="password" autocomplete="off"></div>
       </div>
-      <div class="muted" id="claude-note"></div>
+      <div class="muted" id="proxy-note"></div>
     </div>
     <div class="forges" id="forges"></div>
     <div id="settings-status"></div>
@@ -452,9 +459,9 @@
   function render() {
     const a = state.activity;
     markProblems(a.state === "unconfigured" ? a.problems : []);
-    // The account card's notes read the gate and the running turn off the
+    // The proxy card's notes read the gate and the running turn off the
     // status, so a status change repaints it too.
-    if (claudeHealth) renderClaude(claudeHealth);
+    if (proxyHealth) renderProxy(proxyHealth);
     // The pause and cancel buttons live with the log because they act on the
     // running turn's process tree; without a turn there is nothing to signal.
     $("pause").hidden = a.state !== "running";
@@ -736,7 +743,7 @@
     });
     events.addEventListener("log", event => setLog(JSON.parse(event.data)));
     events.addEventListener("host", event => renderHost(JSON.parse(event.data)));
-    events.addEventListener("claude", event => renderClaude(JSON.parse(event.data)));
+    events.addEventListener("proxy", event => renderProxy(JSON.parse(event.data)));
     events.onopen = () => $("disconnected").hidden = true;
     events.onerror = () => $("disconnected").hidden = false;
   }
@@ -773,15 +780,15 @@
   // A stored value that is no longer on offer (auth that stopped loading, a
   // task slug an older sweep.md defined) is kept as an extra choice rather
   // than silently rewritten to something else. Only Anthropic models are
-  // offered: the selector lives in the Claude account card, and whatever
-  // else opencode can resolve isn't backed by a configured provider.
+  // offered: the selector lives in the proxy card, and whatever else
+  // opencode can resolve isn't backed by a configured provider.
   function renderModels(selected) {
     const offered = options.models.filter(id => id.startsWith("anthropic/"));
     const choices = offered.map(id => ({ value: id, textContent: id }));
     if (selected && !offered.includes(selected))
       choices.push({ value: selected, textContent: `${selected} (not offered)` });
     if (!choices.length)
-      choices.push({ value: "", textContent: "none — is the Claude account connected?", disabled: true });
+      choices.push({ value: "", textContent: "none — is the proxy connected?", disabled: true });
     $("s-model").replaceChildren(...choices.map(choice =>
       Object.assign(document.createElement("option"), choice)));
     $("s-model").value = selected;
@@ -941,8 +948,7 @@
   function renderSettings(s) {
     renderModels(s.model);
     renderTasks(s.tasks);
-    $("claude-enabled").checked = s.claude.enabled;
-    $("claude-base-url").value = s.claude.base_url;
+    $("proxy-base-url").value = s.proxy.base_url;
     // Both keys are optional, and each is useless for a different reason
     // when unset, so the empty placeholder says which.
     const UNSET = {
@@ -950,9 +956,9 @@
       "management-key": "none — no account status",
     };
     for (const key of ["api-key", "management-key"]) {
-      const input = $(`claude-${key}`);
+      const input = $(`proxy-${key}`);
       input.value = "";
-      input.placeholder = s.claude[key.replace("-", "_") + "_set"]
+      input.placeholder = s.proxy[key.replace("-", "_") + "_set"]
         ? "key set — leave blank to keep" : UNSET[key];
     }
     $("s-hourly-limit").value = s.hourly_limit ?? "";
@@ -997,12 +1003,11 @@
     const num = value => value === "" ? null : Number(value);
     const minutes = num($("s-timeout").value);
     const body = {
-      claude: {
-        enabled: $("claude-enabled").checked,
-        base_url: $("claude-base-url").value,
+      proxy: {
+        base_url: $("proxy-base-url").value,
         // Empty means "keep the stored key"; the server never sends it back.
-        api_key: $("claude-api-key").value,
-        management_key: $("claude-management-key").value,
+        api_key: $("proxy-api-key").value,
+        management_key: $("proxy-management-key").value,
       },
       model: $("s-model").value,
       tasks: [...enabledTasks],
@@ -1083,49 +1088,47 @@
     }
   }
 
-  // ---- Claude account ----
+  // ---- CLIProxyAPI ----
   // The account itself lives in CLIProxyAPI, which owns the subscription
   // login and refresh; the card only shows what the proxy's management API
   // reports. Logging in happens on the host (`cliproxyapi --claude-login`),
   // so there is no login flow here.
 
-  let claudeHealth = null;
+  let proxyHealth = null;
 
-  function renderClaude(h) {
-    claudeHealth = h;
-    const status = $("claude-status");
-    status.title = "";
-    let text, cls = "muted";
-    if (!h) {
-      // The server stops probing the proxy while the section is disabled
-      // and sends null instead of a health digest.
-      text = "disabled";
-    } else if (!h.proxy_up) {
-      text = "CLIProxyAPI unreachable";
+  function renderProxy(h) {
+    proxyHealth = h;
+    let text, cls;
+    if (!h || !h.proxy_up) {
+      text = "unreachable";
       cls = "err";
     } else if (h.error) {
-      text = "proxy reachable; " + h.error;
+      text = "reachable; " + h.error;
       cls = "warn";
     } else if (!h.managed) {
-      text = "proxy reachable — add the management key for account status";
+      text = "reachable — add the management key for account status";
+      cls = "warn";
     } else if (!h.connected) {
-      text = "not connected — run cliproxyapi --claude-login on the host";
+      text = "reachable, but no account is logged in — "
+        + "run cliproxyapi --claude-login on the host";
       cls = "err";
     } else if (!h.refresh_ok) {
-      text = "refresh failing — log in again on the host";
+      text = "reachable; refresh failing — log in again on the host";
       cls = "err";
     } else {
-      text = "connected" + (h.email ? " as " + h.email : "");
-      const counts = h.success != null
-        ? `${h.success} ok / ${h.failed ?? 0} failed` : "";
-      status.title = [
+      // Connected: the dot's tooltip is the only place the account's own
+      // details show, so it carries the refresh and call counts too.
+      text = ["connected" + (h.email ? " as " + h.email : ""),
         h.last_refresh ? "last refresh " + new Date(h.last_refresh).toLocaleString() : "",
-        counts,
+        h.success != null ? `${h.success} ok / ${h.failed ?? 0} failed` : "",
       ].filter(Boolean).join(" · ");
+      cls = "ok";
     }
-    status.textContent = text;
-    status.className = cls;
-    $("claude-note").textContent = h && state?.oauth_gated_until
+    const dot = $("proxy-health");
+    dot.className = cls;
+    dot.title = text;
+    dot.setAttribute("aria-label", "proxy " + text);
+    $("proxy-note").textContent = h && state?.oauth_gated_until
       ? "turns held until " + new Date(state.oauth_gated_until * 1000).toLocaleString() : "";
   }
 

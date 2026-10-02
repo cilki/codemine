@@ -27,8 +27,10 @@ const PR_LIMIT: usize = 20;
 /// pending do the rest get their turn, as one shuffled pass over every (task,
 /// repository) pair: `check` waves most of them straight through, so this is
 /// the uniform draw it used to be, but a pair the skip cache has already
-/// answered for is passed over instead of drawn. None when nothing at all is
-/// worth a turn.
+/// answered for is passed over instead of drawn. The cache applies to the
+/// gated pass too — `feedback` is both probed and remembered — so a gated
+/// task can no longer monopolize the draw on a precondition that stays true.
+/// None when nothing at all is worth a turn.
 pub fn draw<'a>(
     tasks: &'a [String],
     pool: &'a [(&'a Forge, String)],

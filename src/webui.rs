@@ -3,7 +3,7 @@
 //! updates from, and the settings API the runner is configured through.
 //!
 //! The UI is unauthenticated and binds 0.0.0.0 by default, so everything
-//! here — settings, forge tokens, the Claude login flow — is writable by
+//! here — settings, forge tokens, the proxy keys — is writable by
 //! anyone who can reach the port. Tokens never travel back to the browser,
 //! but the bind address should still be a loopback or trusted network.
 
@@ -163,12 +163,12 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         let mut changes = state.status.subscribe();
         // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
-        let (mut sent_status, mut sent_log, mut sent_host, mut sent_claude) =
+        let (mut sent_status, mut sent_log, mut sent_host, mut sent_proxy) =
             (None, None, None, None);
         loop {
             // Status is compared without the server timestamp, which moves on
             // its own and would make every state look new, but sent with it;
-            // the log, host, and claude events compare and send the same JSON.
+            // the log, host, and proxy events compare and send the same JSON.
             let snapshot = serde_json::to_string(&*state.status.lock()).unwrap_or_default();
             let status =
                 serde_json::to_string(&status_value(&state.status)).unwrap_or_else(|_| "{}".into());
@@ -177,27 +177,21 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             let host = serde_json::to_string(&crate::host::snapshot(&state.workspace))
                 .unwrap_or_else(|_| "{}".into());
             // Re-derived each tick, like the host snapshot: the main loop is
-            // inside a turn for hours at a time, so auth health can't ride
+            // inside a turn for hours at a time, so proxy health can't ride
             // the status it owns. The probe shells out to curl (behind a
-            // short cache), so it runs off this current-thread runtime. A
-            // disabled Claude section stops the probing; the page reads the
-            // null as "disabled".
-            let claude_settings = state.settings.snapshot().0.claude;
-            let claude = if claude_settings.enabled {
-                tokio::task::spawn_blocking(move || {
-                    serde_json::to_string(&crate::claude::health(&claude_settings))
-                        .unwrap_or_else(|_| "null".into())
-                })
-                .await
-                .unwrap_or_else(|_| "null".into())
-            } else {
-                "null".into()
-            };
+            // short cache), so it runs off this current-thread runtime.
+            let proxy_settings = state.settings.snapshot().0.proxy;
+            let proxy = tokio::task::spawn_blocking(move || {
+                serde_json::to_string(&crate::proxy::health(&proxy_settings))
+                    .unwrap_or_else(|_| "null".into())
+            })
+            .await
+            .unwrap_or_else(|_| "null".into());
             for (name, key, payload, sent) in [
                 ("status", &snapshot, &status, &mut sent_status),
                 ("log", &log, &log, &mut sent_log),
                 ("host", &host, &host, &mut sent_host),
-                ("claude", &claude, &claude, &mut sent_claude),
+                ("proxy", &proxy, &proxy, &mut sent_proxy),
             ] {
                 if sent.as_ref() == Some(key) {
                     continue;
@@ -285,7 +279,7 @@ async fn api_put_settings(
     State(state): State<AppState>,
     Json(incoming): Json<Settings>,
 ) -> Response {
-    let before = state.settings.snapshot().0.claude;
+    let before = state.settings.snapshot().0.proxy;
     match state
         .settings
         .update(|settings| settings.apply_update(incoming))
@@ -297,16 +291,16 @@ async fn api_put_settings(
             // like the startup warmup. This must happen here rather than at
             // the next turn boundary: with no models listed the settings
             // can't even become runnable.
-            if (&settings.claude.base_url, &settings.claude.api_key)
+            if (&settings.proxy.base_url, &settings.proxy.api_key)
                 != (&before.base_url, &before.api_key)
             {
-                let claude = settings.claude.clone();
+                let proxy = settings.proxy.clone();
                 std::thread::Builder::new()
                     .name("provider".into())
                     .spawn(move || {
                         if let Err(err) = crate::prompts::install_provider(
                             &crate::prompts::opencode_config_dir(),
-                            &claude,
+                            &proxy,
                         ) {
                             tracing::error!("failed to update opencode's provider config: {err:#}");
                             return;
@@ -806,32 +800,9 @@ mod tests {
         let (addr, _dir) = serve_in_tempdir();
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
         write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
-        let seen = read_until(&mut stream, "event: claude");
-        assert!(seen.contains("event: claude"), "{seen}");
+        let seen = read_until(&mut stream, "event: proxy");
+        assert!(seen.contains("event: proxy"), "{seen}");
         assert!(seen.contains(r#""connected":"#), "{seen}");
-    }
-
-    #[test]
-    fn events_stream_reports_disabled_claude_as_null() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
-        store
-            .update(|s| {
-                s.claude.enabled = false;
-                Ok(())
-            })
-            .unwrap();
-        let addr = spawn(
-            "127.0.0.1:0".parse().unwrap(),
-            Shared::new(),
-            store,
-            dir.path().to_path_buf(),
-        )
-        .unwrap();
-        let mut stream = std::net::TcpStream::connect(addr).unwrap();
-        write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
-        let seen = read_until(&mut stream, "event: claude\ndata: null");
-        assert!(seen.contains("event: claude\ndata: null"), "{seen}");
     }
 
     #[test]

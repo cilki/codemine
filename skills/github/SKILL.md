@@ -74,6 +74,24 @@ If a comment is ambiguous, or asks for something you think is wrong, say so in
 the reply instead of guessing. Address every comment: either make the change or
 explain why you didn't.
 
+## Clearing notifications you have read
+
+Your unread notifications are what marks this repository as having feedback
+waiting on it, so a thread you have already dealt with has to be marked read.
+Left unread it goes on claiming there is something here to answer, and the
+next look at this repository is spent rediscovering that there isn't.
+
+```sh
+gh api repos/<owner>/<repo>/notifications         # unread threads on one repository
+gh api notifications                              # unread threads across all of them
+gh api --method PATCH notifications/threads/<id>  # mark one read, by the id the listing shows
+```
+
+Mark a thread read once you have acted on it, replied to it, or read it and
+found nothing owing — including when that is the whole of what you found and
+you are about to skip the turn. Leave unread only what you still owe an
+answer.
+
 ## Issues
 
 Create issues for work you are not going to do yourself: something too large for
