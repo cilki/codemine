@@ -31,10 +31,12 @@ pub fn reported_completed(tail: &str) -> bool {
 }
 
 /// Whether the turn died on authentication somewhere between opencode and
-/// Anthropic, as CLIProxyAPI reports it (bodies captured from 7.3.2): a
-/// rejected client key answers `{"error":"Invalid API key"}`, a proxy
-/// holding no Claude credential knows no claude models and answers `unknown
-/// provider for model ...`, and a dead login upstream passes Anthropic's own
+/// Anthropic, as CLIProxyAPI reports it (bodies captured from 7.3.2 and
+/// 8.0.4): a rejected client key answers `{"error":"Invalid API key"}`, a
+/// proxy whose login can no longer refresh answers 503 `auth_unavailable: no
+/// auth available (providers=claude, ...)`, a 7.x proxy holding no Claude
+/// credential knows no claude models and answers `unknown provider for model
+/// ...`, and a dead login upstream passes Anthropic's own
 /// `authentication_error` through.
 pub fn auth_error(tail: &str) -> bool {
     let tail = strip_ansi(tail);
@@ -42,6 +44,8 @@ pub fn auth_error(tail: &str) -> bool {
         "authentication_error",
         "Invalid API key",
         "unknown provider for model",
+        "auth_unavailable",
+        "no auth available",
     ]
     .iter()
     .any(|needle| tail.contains(needle))
@@ -169,6 +173,11 @@ mod tests {
         // A proxy with no Claude credential knows no claude models.
         assert!(auth_error(
             r#"{"type":"error","error":{"type":"invalid_request_error","message":"unknown provider for model claude-sonnet-5"}}"#
+        ));
+        // A proxy whose stored login can no longer refresh (8.0.4 answers 503
+        // with the upstream refresh failure redacted).
+        assert!(auth_error(
+            r#"{"type":"error","error":{"type":"api_error","message":"auth_unavailable: no auth available (providers=claude, model=claude-sonnet-4-6; last upstream error: token: [REDACTED]); check Claude auth/key session and cooldown state via /v0/management/auth-files"}}"#
         ));
         assert!(auth_error("\x1b[91mauthentication_error\x1b[0m"));
         assert!(!auth_error("all quiet"));

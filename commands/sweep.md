@@ -19,12 +19,6 @@ default branch at `$4` — do not clone or fetch it again. Leftover build
 artifacts (`target/`, `node_modules/`, ...) from earlier runs may be present and
 are fine to reuse.
 
-Before doing anything else, confirm your shell is in `$4`; if it reports any
-other directory, `cd $4` first. Work only inside `$4`. Never read, modify, or
-run commands in any other checkout of this or any other repository, no matter
-what exists elsewhere on the machine; writes outside `$4` are blocked and will
-fail.
-
 Prefer the `codegraph_explore` tool over grep/find/broad file reads when
 exploring the codebase — it answers structural questions in a single call and is
 much cheaper. Fall back to normal exploration only if the tool is unavailable or
@@ -33,6 +27,10 @@ fails.
 Execute only the assigned task, described below. If there is nothing to do for
 it on the assigned repository, skip the turn — do not switch to a different task
 or repository.
+
+Once you've identified a potential item to work on, read open issues and PRs for
+prior art before embarking. This avoids wasting time working on something that
+already exists.
 
 Only open a pull request for a change worth a reviewer's time. Trivial changes
 are worse than no change at all: dropping an unused import, tweaking a comment,
@@ -144,22 +142,15 @@ the user decide what to do.
 - Open an issue describing the feature, why it's worth having, and a sketch of
   how it could be built rather than implementing it directly
 
+## "lint"
+
+- Use a linter to find and fix "code smells"
+- When fixing clippy lints, always attempt to use the --fix option before
+  handling them manually
+
 # General information
 
 Prefer each repo's nix shell when it has one, so wrap build and test commands in
 `nix develop` or `nix-shell`. Prefer `cargo check` over `cargo build` when you
 only need to know whether something compiles; always check the compilation
 succeeds except for trivial changes.
-
-When fixing clippy lints, always attempt to use the --fix option before handling
-them manually. If `cargo fmt` creates a lot of churn, don't attempt to revert
-anything to shrink the diff.
-
-Avoid "divider" comments like:
-
-```
-// ── Errors ──────────────────────────────────────────────────────────────────
-```
-
-Commit as yourself: use the current model as the author and override the email
-with `noreply@anthropic.com`.
