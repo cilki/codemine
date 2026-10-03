@@ -146,13 +146,15 @@ fn fresh(
 
 /// The repositories with unread activity on one forge, each with the newest
 /// stamp on its feed. One request per forge — every feed is account-scoped —
-/// and the same signals the feedback precheck reads: notification threads on
-/// Gitea and GitHub, todos on GitLab (which fire on mentions and assignments
-/// rather than every comment; that is all GitLab offers across projects).
+/// over notification threads on Gitea and GitHub, todos on GitLab (which fire
+/// on mentions and assignments rather than every comment; that is all GitLab
+/// offers across projects).
 ///
-/// Shared with the skip memory, which remembers a `feedback` skip against the
-/// stamp it answered for and so has to read the feed the same way the watcher
-/// does.
+/// The single reading of "this repository has feedback waiting" in the
+/// runner: the watcher polls it for repositories to queue, and `cache::Probe`
+/// both gates `feedback` on it and remembers a skip against the stamp it
+/// answered for. An event therefore can never queue work the turn's own
+/// precondition would have rejected.
 pub fn unread(forge: &Forge) -> Result<BTreeMap<String, String>> {
     let feed = match forge.kind {
         ForgeKind::Gitea => crate::precheck::gitea_json(forge, "notifications")?,
