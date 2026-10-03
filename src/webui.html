@@ -159,6 +159,7 @@
   .forge-icon { width: 18px; height: 18px; }
   .check { display: flex; align-items: center; gap: 6px; font-size: 0.85em; color: #9aa0a6; }
   .check input { accent-color: var(--accent); }
+  .repos-head { display: flex; align-items: center; justify-content: space-between; }
   .repos { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
   .repos .check { color: #e8eaed; font-size: 0.9em; }
   .repos .check.off { color: #9aa0a6; text-decoration: line-through; }
@@ -168,6 +169,7 @@
   }
   button:hover { background: rgba(200, 113, 55, 0.15); border-color: var(--accent); color: var(--accent); }
   button.small { padding: 4px 10px; font-size: 0.8em; }
+  button:disabled { opacity: 0.4; pointer-events: none; }
   .tasks { margin-top: 12px; }
   .tasks .checks-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 4px 12px;
@@ -867,7 +869,9 @@
         <input id="f-${name}-url" placeholder="${URL_PLACEHOLDER[name]}"></div>
       ${name === "gitea" ? `
       <div class="field"><label for="f-gitea-user">User</label><input id="f-gitea-user"></div>` : ""}
-      <div class="field"><label>Repositories</label>
+      <div class="field">
+        <div class="repos-head"><label>Repositories</label>
+          <button type="button" class="small" id="f-${name}-repos-refresh">refresh</button></div>
         <input id="f-${name}-repos-filter" type="search" placeholder="search repositories" hidden>
         <div class="repos" id="f-${name}-repos"><span class="muted">Not loaded.</span></div>
         <span class="muted" id="f-${name}-repos-note"></span>
@@ -878,6 +882,9 @@
     for (const type of ["input", "change"])
       filter.addEventListener(type, event => event.stopPropagation());
     filter.addEventListener("input", () => applyRepoFilter(name));
+    // The auto-load only runs once per forge, so a listing fetched when the
+    // page opened goes stale; the button re-fetches it on demand.
+    card.querySelector(`#f-${name}-repos-refresh`).onclick = () => loadRepos(name);
     return card;
   }
 
@@ -921,6 +928,8 @@
 
   async function loadRepos(forge) {
     const note = $(`f-${forge}-repos-note`);
+    const button = $(`f-${forge}-repos-refresh`);
+    button.disabled = true;
     note.textContent = "loading…";
     try {
       const res = await fetch(`/api/repos/${forge}`);
@@ -931,6 +940,8 @@
       renderRepos(forge, body.repos.map(r => r.name));
     } catch (err) {
       note.textContent = String(err.message || err);
+    } finally {
+      button.disabled = false;
     }
   }
 
