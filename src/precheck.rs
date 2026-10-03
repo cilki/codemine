@@ -64,16 +64,15 @@ pub fn draw<'a>(
 }
 
 /// Whether the drawn task has anything to act on in this repository.
-/// Fail-open: a probe error is logged and treated as actionable, so a broken
-/// probe costs at most what a blind draw did — an agent turn that ends in
-/// TASK SKIPPED.
+/// `feedback` is answered by `cache::Probe` out of the notification feed it
+/// reads anyway, so only `rebase` needs a probe of its own here. Fail-open: a
+/// probe error is logged and treated as actionable, so a broken probe costs at
+/// most what a blind draw did — an agent turn that ends in TASK SKIPPED.
 pub fn actionable(task: &str, forge: &Forge, repo: &str) -> bool {
-    let probed = match task {
-        "feedback" => has_feedback(forge, repo),
-        "rebase" => has_stale_pr(forge, repo),
-        _ => return true,
-    };
-    probed.unwrap_or_else(|err| {
+    if task != "rebase" {
+        return true;
+    }
+    has_stale_pr(forge, repo).unwrap_or_else(|err| {
         warn!("{task} precheck failed for {repo}: {err:#}");
         true
     })
@@ -107,22 +106,6 @@ fn first_sha(commits: &serde_json::Value) -> Option<String> {
         .as_str()
         .or_else(|| first["id"].as_str())
         .map(str::to_owned)
-}
-
-/// Whether the repository has an unread notification (a pending todo on
-/// GitLab, which scopes them to the user rather than the repo).
-fn has_feedback(forge: &Forge, repo: &str) -> Result<bool> {
-    match forge.kind {
-        ForgeKind::Gitea => {
-            nonempty_array(&gitea_json(forge, &format!("repos/{repo}/notifications"))?)
-        }
-        ForgeKind::Github => nonempty_array(&api_json(
-            forge,
-            "gh",
-            &format!("repos/{repo}/notifications"),
-        )?),
-        ForgeKind::Gitlab => Ok(gitlab_todo_for(&api_json(forge, "glab", "todos")?, repo)),
-    }
 }
 
 /// Whether any open PR branch is behind its base branch.
@@ -265,22 +248,6 @@ fn behind(value: &serde_json::Value, field: &str) -> bool {
     value[field].as_u64().unwrap_or(0) > 0
 }
 
-fn nonempty_array(value: &serde_json::Value) -> Result<bool> {
-    Ok(!value
-        .as_array()
-        .context("expected an array of notifications")?
-        .is_empty())
-}
-
-/// Whether any pending GitLab todo belongs to this project.
-fn gitlab_todo_for(todos: &serde_json::Value, repo: &str) -> bool {
-    todos.as_array().is_some_and(|todos| {
-        todos
-            .iter()
-            .any(|todo| todo["project"]["path_with_namespace"].as_str() == Some(repo))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -329,21 +296,6 @@ mod tests {
             ]
         );
         assert!(pr_refs(&json!({"message": "oops"}), "ref").is_empty());
-    }
-
-    #[test]
-    fn nonempty_array_shapes() {
-        assert!(!nonempty_array(&json!([])).unwrap());
-        assert!(nonempty_array(&json!([{"id": 1}])).unwrap());
-        assert!(nonempty_array(&json!({"message": "bad token"})).is_err());
-    }
-
-    #[test]
-    fn todos_match_by_project_path() {
-        let todos = json!([{"project": {"path_with_namespace": "me/repo"}}]);
-        assert!(gitlab_todo_for(&todos, "me/repo"));
-        assert!(!gitlab_todo_for(&todos, "me/other"));
-        assert!(!gitlab_todo_for(&json!({}), "me/repo"));
     }
 
     fn forge() -> Forge {

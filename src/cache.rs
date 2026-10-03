@@ -194,11 +194,22 @@ impl<'a> Probe<'a> {
     /// Whether the task is worth a turn on this repository: it must have
     /// something to act on, and must not already have come up empty at
     /// exactly this state. The memory is checked first, so a task held back
-    /// by it costs only the shared state read and never the precondition
-    /// probe — which matters most for `feedback`, the one task that is both
-    /// gated and remembered.
+    /// by it never reaches the precondition probe.
     pub fn actionable(&self, task: &str, forge: &Forge, repo: &str) -> bool {
-        !self.remembered(task, forge, repo) && crate::precheck::actionable(task, forge, repo)
+        if self.remembered(task, forge, repo) {
+            return false;
+        }
+        match basis(task) {
+            // A task that answers out of the feed has nothing to answer when
+            // the repository has nothing unread, so its basis doubles as its
+            // precondition. The feed is read once per forge for the memory's
+            // sake anyway, so probing `feedback` across the whole pool costs
+            // the one request it already made rather than one per repository.
+            // Fail-open like the prechecks: an unreadable feed draws the task
+            // and at worst skips again.
+            Some(Basis::Feed) => self.feed(forge).is_none_or(|feed| feed.contains_key(repo)),
+            _ => crate::precheck::actionable(task, forge, repo),
+        }
     }
 
     /// The state the task's answer currently depends on, for remembering a
@@ -255,13 +266,18 @@ impl<'a> Probe<'a> {
         head
     }
 
-    /// The newest unread notification on the repository's feed. The feed is
-    /// account-wide, so one request per forge answers for every repository in
-    /// the draw. `None` for a repository with nothing unread on it, or a feed
-    /// that couldn't be read.
+    /// The newest unread notification on the repository's feed. `None` for a
+    /// repository with nothing unread on it, or a feed that couldn't be read.
     fn stamp(&self, forge: &Forge, repo: &str) -> Option<String> {
+        self.feed(forge)?.get(repo).cloned()
+    }
+
+    /// The forge's unread notifications as repository → newest stamp. The
+    /// feed is account-wide, so one request per forge answers for every
+    /// repository in the draw. `None` when it couldn't be read.
+    fn feed(&self, forge: &Forge) -> Option<BTreeMap<String, String>> {
         if let Some(feed) = self.feeds.borrow().get(&forge.kind) {
-            return feed.as_ref().and_then(|feed| feed.get(repo).cloned());
+            return feed.clone();
         }
         let feed = crate::events::unread(forge)
             .inspect_err(|err| {
@@ -272,7 +288,7 @@ impl<'a> Probe<'a> {
             })
             .ok();
         self.feeds.borrow_mut().insert(forge.kind, feed.clone());
-        feed.and_then(|feed| feed.get(repo).cloned())
+        feed
     }
 }
 
@@ -421,6 +437,53 @@ mod tests {
             &forge(ForgeKind::Github),
             "me/repo"
         ));
+    }
+
+    /// `feedback`'s precondition is answered out of the same feed its memory
+    /// is keyed on, with no mark involved: a repository with something unread
+    /// is drawn, one with nothing on the feed is passed over, and a feed that
+    /// couldn't be read fails open.
+    #[test]
+    fn feedback_is_drawn_only_for_a_repository_with_unread_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        let github = forge(ForgeKind::Github);
+        let feed = [("me/repo", "2026-10-01T02:00:00Z")];
+        assert!(feed_probe(&cache, &feed).actionable("feedback", &github, "me/repo"));
+        assert!(!feed_probe(&cache, &feed).actionable("feedback", &github, "me/other"));
+        assert!(!feed_probe(&cache, &[]).actionable("feedback", &github, "me/repo"));
+
+        let unreadable = Probe::new(&cache);
+        unreadable
+            .feeds
+            .borrow_mut()
+            .insert(ForgeKind::Github, None);
+        assert!(unreadable.actionable("feedback", &github, "me/repo"));
+    }
+
+    /// The memory outranks the precondition: a thread `feedback` has already
+    /// answered for keeps it out of the draw even though the feed still names
+    /// the repository.
+    #[test]
+    fn a_remembered_skip_beats_the_feed_precondition() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        let stamp = "2026-10-01T02:00:00Z";
+        cache.remember("feedback", ForgeKind::Github, "me/repo", stamp);
+        let probe = feed_probe(&cache, &[("me/repo", stamp)]);
+        assert!(!probe.actionable("feedback", &forge(ForgeKind::Github), "me/repo"));
+    }
+
+    /// A task with no precondition of its own is drawn without any forge
+    /// lookup once the memory has let it through.
+    #[test]
+    fn an_unprobed_task_needs_no_forge_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        let probe = Probe::new(&cache);
+        assert!(probe.actionable("docs", &forge(ForgeKind::Github), "me/repo"));
+        assert!(probe.heads.borrow().is_empty());
+        assert!(probe.feeds.borrow().is_empty());
     }
 
     #[test]
