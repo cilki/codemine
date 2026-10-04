@@ -28,14 +28,10 @@ COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint
 
 ENV PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH
 
-# codegraph indexes the workspace clones and serves the codegraph_explore MCP
-# tool to opencode. Use the upstream installer (it bundles its own Node
-# runtime and symlinks into CODEGRAPH_BIN_DIR) unless the nixpkgs pin already
-# provided the package via runtime.nix.
-RUN command -v codegraph \
-  || curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh \
-     | CODEGRAPH_BIN_DIR=/usr/local/bin sh \
-  && codegraph --version
+# codegraph comes from the nix profile (runtime.nix pulls it from
+# nixos-unstable when the pin lacks it); the upstream installer's vendored
+# Node runtime doesn't run on this FHS-less base image.
+RUN codegraph --version
 
 RUN mkdir -p /workspace
 WORKDIR /workspace
