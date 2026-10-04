@@ -223,11 +223,23 @@ impl Settings {
                 }
             }
         }
-        if !FORGE_KINDS
+        let active: Vec<&ForgeSettings> = FORGE_KINDS
             .iter()
-            .any(|&kind| self.forge(kind).active(kind))
-        {
+            .filter(|&&kind| self.forge(kind).active(kind))
+            .map(|&kind| self.forge(kind))
+            .collect();
+        if active.is_empty() {
             problems.push(Problem::new("forges", "no forge is enabled with a token"));
+        } else if active.iter().all(|forge| forge.enabled_repos.is_empty()) {
+            // Every repository starts disabled, so this is where a fresh
+            // install sits once the forge is set up. Without it the runner
+            // looked healthy — "sleeping" between empty draws — while relisting
+            // the forge every minute to rediscover that it has nothing to
+            // sweep.
+            problems.push(Problem::new(
+                "forges",
+                "no repositories are enabled for sweeping",
+            ));
         }
         if self.model.is_empty() {
             problems.push(Problem::new("s-model", "model is not set"));
@@ -468,6 +480,7 @@ mod tests {
             github: ForgeSettings {
                 enabled: true,
                 token: "tok".into(),
+                enabled_repos: ["owner/repo".to_owned()].into(),
                 ..Default::default()
             },
             model: "anthropic/claude".into(),
@@ -592,6 +605,28 @@ mod tests {
         assert!(fields.iter().any(|f| f == "f-gitea-user"), "{fields:?}");
         assert!(fields.iter().any(|f| f == "f-gitea-url"), "{fields:?}");
         assert!(settings.to_config(&cli()).is_none());
+    }
+
+    #[test]
+    fn a_forge_with_no_enabled_repositories_is_a_problem() {
+        // Repositories start disabled, so a forge that is otherwise fully
+        // set up still cannot sweep anything.
+        let mut settings = configured();
+        settings.github.enabled_repos.clear();
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert_eq!(fields, ["forges"], "{fields:?}");
+        assert!(settings.to_config(&cli()).is_none());
+
+        // One enabled repository anywhere is enough; the other forges are
+        // allowed to sit empty.
+        settings.gitea = ForgeSettings {
+            enabled: true,
+            token: "tok".into(),
+            user: "bot".into(),
+            url: "https://git.example.com".into(),
+            enabled_repos: ["owner/repo".to_owned()].into(),
+        };
+        assert!(settings.problems().is_empty());
     }
 
     #[test]

@@ -53,7 +53,10 @@ pub fn run(
         );
     }
     if pool.is_empty() {
-        warn!("no repositories enabled on any forge");
+        // An empty enabled set is a settings problem and never reaches here;
+        // what does is an enabled repository the forge no longer lists —
+        // renamed, deleted, or out of the token's reach.
+        warn!("none of the enabled repositories are listed by their forge");
         return Ok(Report {
             backoff: Backoff::Normal,
             completed: false,

@@ -447,13 +447,22 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Run `command`, failing with whatever it complained about. The caller's
+/// error reaches the web UI as the reason turns can't run, and a bare exit
+/// status there says nothing about what the user has to fix — a mistyped
+/// token is the likely cause and only the command knows it.
 fn run(command: &mut Command) -> Result<()> {
     let program = command.get_program().to_string_lossy().into_owned();
-    let status = command
-        .status()
+    let output = command
+        .stdin(Stdio::null())
+        .output()
         .with_context(|| format!("failed to run {program}"))?;
-    if !status.success() {
-        bail!("{program} exited with {status}");
+    if !output.status.success() {
+        let said = String::from_utf8_lossy(&output.stderr);
+        match said.trim() {
+            "" => bail!("{program} exited with {}", output.status),
+            said => bail!("{program} exited with {}: {said}", output.status),
+        }
     }
     Ok(())
 }
