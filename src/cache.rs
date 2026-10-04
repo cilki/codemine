@@ -1,7 +1,7 @@
 //! Skip memory for the tasks whose answer is a function of something the
 //! runner can observe for itself. `docs`, `simplify`, `benchmark`,
-//! `coverage`, and `mutation` all read the code and nothing else, so a turn
-//! that found nothing to do will find nothing again until the code moves.
+//! `coverage`, `mutation`, and `lint` all read the code and nothing else, so a
+//! turn that found nothing to do will find nothing again until the code moves.
 //! `feedback` reads the forge's notification feed, so its answer holds until
 //! a thread newer than the ones it already read arrives. `rebase` reads the
 //! forge's view of the bot's own open PRs, so its answer holds until one of
@@ -53,7 +53,7 @@ pub enum Basis {
 /// would outlast the reason for it.
 pub fn basis(task: &str) -> Option<Basis> {
     match task {
-        "docs" | "simplify" | "benchmark" | "coverage" | "mutation" => Some(Basis::Head),
+        "docs" | "simplify" | "benchmark" | "coverage" | "mutation" | "lint" => Some(Basis::Head),
         "feedback" => Some(Basis::Feed),
         "rebase" => Some(Basis::Prs),
         _ => None,
@@ -395,15 +395,43 @@ mod tests {
     /// against the tree, `feedback` against the notification feed, `rebase`
     /// against the bot's conflicting PRs. The tasks that can become
     /// actionable with nothing observable moving keep no memory at all.
+    ///
+    /// The check runs both ways over the whole task pool. A slug that no
+    /// longer names a section has stopped being remembered, and a section
+    /// nobody listed here has silently defaulted to keeping no memory, which
+    /// is what a new task gets whether or not that is the right answer for
+    /// it.
     #[test]
     fn basis_matches_what_each_task_reads() {
-        for task in ["docs", "simplify", "benchmark", "coverage", "mutation"] {
+        let head = [
+            "docs",
+            "simplify",
+            "benchmark",
+            "coverage",
+            "mutation",
+            "lint",
+        ];
+        let unremembered = ["bump", "todo", "roleplay", "audit", "feature"];
+        for task in head {
             assert_eq!(basis(task), Some(Basis::Head), "{task}");
         }
         assert_eq!(basis("feedback"), Some(Basis::Feed));
         assert_eq!(basis("rebase"), Some(Basis::Prs));
-        for task in ["bump", "todo", "roleplay", "audit", "feature"] {
+        for task in unremembered {
             assert_eq!(basis(task), None, "{task}");
+        }
+
+        let declared: BTreeSet<&str> = head
+            .into_iter()
+            .chain(unremembered)
+            .chain(["feedback", "rebase"])
+            .collect();
+        let slugs: BTreeSet<String> = crate::prompts::default_tasks().into_iter().collect();
+        for task in &declared {
+            assert!(slugs.contains(*task), "{task} is gone");
+        }
+        for slug in &slugs {
+            assert!(declared.contains(slug.as_str()), "{slug} declares nothing");
         }
     }
 
@@ -416,24 +444,6 @@ mod tests {
         assert!(gated("rebase"));
         for task in ["docs", "simplify", "bump", "todo", "feature"] {
             assert!(!gated(task), "{task}");
-        }
-    }
-
-    /// Every remembered slug still names a task the sweep command defines, so
-    /// a renamed section can't quietly stop being remembered.
-    #[test]
-    fn remembered_tasks_are_real_tasks() {
-        let slugs = crate::prompts::default_tasks();
-        for task in [
-            "docs",
-            "simplify",
-            "benchmark",
-            "coverage",
-            "mutation",
-            "feedback",
-            "rebase",
-        ] {
-            assert!(slugs.iter().any(|slug| slug == task), "{task} is gone");
         }
     }
 
