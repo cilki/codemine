@@ -365,9 +365,10 @@ const PAGE_SIZE: usize = 50;
 
 /// The repositories the bot can reach on a forge, as `<owner>/<repo>`.
 /// Queried fresh each turn so new repositories join the pool without a
-/// restart.
+/// restart. Names the forge reports that aren't usable as a path are dropped
+/// here, which is the one chokepoint every consumer draws from.
 pub fn list_repos(forge: &Forge) -> Result<Vec<String>> {
-    match forge.kind {
+    let listed = match forge.kind {
         ForgeKind::Gitea => list_gitea_repos(),
         ForgeKind::Github => list_api_repos(forge, "gh", "user/repos", "full_name"),
         ForgeKind::Gitlab => list_api_repos(
@@ -376,7 +377,44 @@ pub fn list_repos(forge: &Forge) -> Result<Vec<String>> {
             "projects?membership=true",
             "path_with_namespace",
         ),
+    }?;
+    let mut repos = Vec::with_capacity(listed.len());
+    for repo in listed {
+        match safe_repo_path(&repo) {
+            true => repos.push(repo),
+            false => warn!(
+                "ignoring unusable repository name from {}: {repo:?}",
+                forge.kind.name()
+            ),
+        }
     }
+    Ok(repos)
+}
+
+/// Whether a forge-reported name is safe to use as the path it is treated as
+/// everywhere downstream: a directory under the workspace root (which the
+/// Landlock ruleset then opens for writing, and which a reclone wipes first),
+/// a segment of a forge API URL, and a segment of the clone URL. The name
+/// comes from whatever the forge's listing says, so it is remote input; a
+/// `..` in it would put all three outside where they belong.
+///
+/// Two or more `/`-separated segments, since GitLab nests namespaces, each
+/// one made of the characters the forges themselves permit in an owner or
+/// repository name. `-` can't lead a segment, which no forge allows anyway
+/// and which would otherwise let a name read as a flag when it is passed on
+/// to a child process.
+fn safe_repo_path(repo: &str) -> bool {
+    let segments: Vec<&str> = repo.split('/').collect();
+    segments.len() >= 2
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && !segment.starts_with('-')
+                && *segment != "."
+                && *segment != ".."
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        })
 }
 
 /// `tea` prints the requested fields whitespace-separated with no header, so
@@ -488,7 +526,43 @@ fn last_lines(text: &str, count: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{gitea_repo_path, last_lines};
+    use super::{gitea_repo_path, last_lines, safe_repo_path};
+
+    /// A repository name is a path component, a URL segment, and a Landlock
+    /// write root, so anything that could escape the workspace has to be
+    /// rejected before it gets that far.
+    #[test]
+    fn unsafe_repo_names_are_rejected() {
+        for repo in [
+            "cilki/codemine",
+            "cilki/code.mine",
+            "cilki/code-mine_2",
+            "group/subgroup/project", // GitLab nests namespaces
+            "_owner/repo",
+        ] {
+            assert!(safe_repo_path(repo), "{repo} should be usable");
+        }
+        for repo in [
+            "",
+            "codemine",             // no owner
+            "cilki/",               // no name
+            "/codemine",            // no owner
+            "cilki//codemine",      // empty segment
+            "../etc",               // escapes the workspace root
+            "cilki/../../../etc",   // escapes it from further in
+            "cilki/..",             // escapes it by one level
+            "cilki/.",              // resolves to the owner directory
+            "-cilki/codemine",      // reads as a flag to a child process
+            "cilki/-codemine",      // likewise
+            "cilki/code mine",      // whitespace
+            "cilki/code\\mine",     // separator on other platforms
+            "cilki/code\nmine",     // header and log injection
+            "cilki/code\0mine",     // truncates a C string
+            "cilki/repo?ref=other", // another forge API query
+        ] {
+            assert!(!safe_repo_path(repo), "{repo:?} should be rejected");
+        }
+    }
 
     #[test]
     fn gitea_lines_become_owner_repo_paths() {

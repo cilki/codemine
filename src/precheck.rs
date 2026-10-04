@@ -196,13 +196,20 @@ pub fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::
         .with_context(|| format!("{program} api returned unexpected output"))
 }
 
+/// How long one Gitea API request may take. Without a cap a forge that
+/// accepts the connection and then says nothing hangs the caller forever,
+/// and the callers are the activity watcher and the draw's probes — the
+/// runner would stop taking turns at all.
+const API_TIMEOUT_SECS: u32 = 30;
+
 /// One GET against the Gitea API via curl; `tea` has no generic api
 /// subcommand. The auth header goes through `--config -` on stdin so the
 /// token never lands in argv.
 pub fn gitea_json(forge: &Forge, path: &str) -> Result<serde_json::Value> {
     let url = format!("{}/api/v1/{path}", forge.url.trim_end_matches('/'));
     let mut child = Command::new("curl")
-        .args(["-sf", "--config", "-", &url])
+        .args(["-sf", "--max-time", &API_TIMEOUT_SECS.to_string()])
+        .args(["--config", "-", &url])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
