@@ -10,6 +10,7 @@ mod emblem;
 mod events;
 #[cfg(feature = "hostinfo")]
 mod host;
+mod identity;
 mod precheck;
 mod prompts;
 mod proxy;
@@ -127,9 +128,38 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_secs(5));
             continue;
         }
-        let cfg = settings
+        let mut cfg = settings
             .to_config(&cli)
             .expect("settings without problems are runnable");
+
+        // Who the bot is on each forge: the author email and Gitea's
+        // credential-line user come from the forge, not the settings.
+        // Cached, so this is a map lookup on every pass but the first.
+        match identity::resolve(&mut cfg.forges) {
+            Ok(resolved) => {
+                let identities: std::collections::BTreeMap<String, String> = resolved
+                    .into_iter()
+                    .map(|(name, id)| (name, format!("{} <{}>", id.login, id.email)))
+                    .collect();
+                // Only a change wakes the SSE stream; this runs every pass.
+                if status.lock().identities != identities {
+                    Status::update(&status, |s| s.identities = identities);
+                }
+            }
+            Err((kind, err)) => {
+                error!("{err:#}");
+                Status::update(&status, |s| {
+                    s.activity = Activity::Unconfigured {
+                        problems: vec![Problem::new(
+                            &format!("f-{}-token", kind.name()),
+                            format!("{err:#}"),
+                        )],
+                    }
+                });
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        }
 
         if applied_generation != Some(generation) {
             if let Err(err) = apply_forge_auth(&cli, &cfg) {

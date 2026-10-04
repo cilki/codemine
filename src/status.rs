@@ -2,7 +2,7 @@
 //! runner write into it; the web server only reads, and is woken on every
 //! write so it can push updates instead of polling.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -171,6 +171,10 @@ pub struct Status {
     /// When set, turns are held after one died on proxy auth: the epoch at
     /// which the main loop will try again even without a fresh login.
     pub oauth_gated_until: Option<u64>,
+    /// Who the bot is on each forge, as "login <email>" keyed by forge slug;
+    /// resolved from each forge's whoami endpoint, so empty until the first
+    /// successful resolve.
+    pub identities: BTreeMap<String, String>,
 }
 
 impl Shared {
@@ -187,6 +191,7 @@ impl Shared {
                 turns: VecDeque::new(),
                 log_tail: String::new(),
                 oauth_gated_until: None,
+                identities: BTreeMap::new(),
             })),
             changes: watch::channel(0).0,
         }

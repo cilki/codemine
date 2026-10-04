@@ -131,8 +131,13 @@ pub struct Forge {
     pub kind: ForgeKind,
     pub token: String,
     /// Username for the git credential line; GitHub and GitLab accept any
-    /// token-bearing pseudo-user over HTTPS.
+    /// token-bearing pseudo-user over HTTPS, Gitea's is the account login
+    /// that `identity::resolve` reads off the forge.
     pub user: String,
+    /// The email commits on this forge are authored (and committed) as;
+    /// empty until `identity::resolve` fills it from the forge's whoami
+    /// endpoint, which the main loop does before any turn runs.
+    pub email: String,
     pub url: String,
     /// Repositories included in sweeping; everything else the account can
     /// reach is left alone, so a fresh login starts with nothing swept until
@@ -185,7 +190,6 @@ pub struct Config {
     /// fractional: 0.5 is one turn every two hours.
     pub hourly_limit: Option<f64>,
     pub author_name: String,
-    pub author_email: String,
     pub turn_timeout: Duration,
     /// CPU niceness applied to the agent process tree (1-19).
     pub nice: Option<u8>,
@@ -326,6 +330,7 @@ mod tests {
             kind,
             token: "tok".into(),
             user: String::new(),
+            email: String::new(),
             url: url.into(),
             enabled_repos: BTreeSet::new(),
         };

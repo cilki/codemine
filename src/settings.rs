@@ -33,9 +33,6 @@ pub struct Settings {
     /// two hours. The runner spends them from a bucket, so a whole hour's
     /// worth can run back to back.
     pub hourly_limit: Option<f64>,
-    /// The email commits are authored (and committed) as; empty means
-    /// unconfigured. The author name is always the model's name.
-    pub author_email: String,
     /// Seconds before a turn is cut off.
     pub turn_timeout_secs: u64,
     /// CPU niceness for the agent process tree, 1-19.
@@ -56,7 +53,6 @@ impl Default for Settings {
             model: String::new(),
             tasks: crate::prompts::default_tasks(),
             hourly_limit: None,
-            author_email: String::new(),
             turn_timeout_secs: 21600,
             nice: None,
             ionice: None,
@@ -103,9 +99,6 @@ pub struct ForgeSettings {
     /// Personal access token; empty means no token stored. Never serialized
     /// to the UI — see [`Settings::redacted`].
     pub token: String,
-    /// Bot account username; only Gitea needs it, the other forges use fixed
-    /// pseudo-users for HTTPS auth.
-    pub user: String,
     /// Base URL; empty means the forge's default (github.com / gitlab.com).
     pub url: String,
     /// Repositories included in sweeping. Everything starts disabled — a
@@ -115,12 +108,12 @@ pub struct ForgeSettings {
 }
 
 impl ForgeSettings {
-    /// Whether the forge takes part in sweeps: enabled with a token, plus
-    /// user and URL for Gitea, which has no default instance.
+    /// Whether the forge takes part in sweeps: enabled with a token, plus a
+    /// URL for Gitea, which has no default instance.
     pub fn active(&self, kind: ForgeKind) -> bool {
         self.enabled
             && !self.token.is_empty()
-            && (kind != ForgeKind::Gitea || (!self.user.is_empty() && !self.url.is_empty()))
+            && (kind != ForgeKind::Gitea || !self.url.is_empty())
     }
 
     fn url(&self, kind: ForgeKind) -> String {
@@ -136,7 +129,6 @@ impl ForgeSettings {
 
     fn trim(&mut self) {
         self.token = self.token.trim().to_owned();
-        self.user = self.user.trim().to_owned();
         self.url = self.url.trim().trim_end_matches('/').to_owned();
     }
 }
@@ -189,10 +181,13 @@ impl Settings {
             kind,
             token: forge.token.clone(),
             user: match kind {
-                ForgeKind::Gitea => forge.user.clone(),
+                // Filled with the account login by `identity::resolve`
+                // before the credential line is written.
+                ForgeKind::Gitea => String::new(),
                 ForgeKind::Github => "x-access-token".into(),
                 ForgeKind::Gitlab => "oauth2".into(),
             },
+            email: String::new(),
             url: forge.url(kind),
             enabled_repos: forge.enabled_repos.clone(),
         })
@@ -214,13 +209,8 @@ impl Settings {
                     format!("{name} is enabled but has no token"),
                 ));
             }
-            if kind == ForgeKind::Gitea {
-                if forge.user.is_empty() {
-                    problems.push(Problem::new("f-gitea-user", "gitea needs a bot user"));
-                }
-                if forge.url.is_empty() {
-                    problems.push(Problem::new("f-gitea-url", "gitea needs a URL"));
-                }
+            if kind == ForgeKind::Gitea && forge.url.is_empty() {
+                problems.push(Problem::new("f-gitea-url", "gitea needs a URL"));
             }
         }
         let active: Vec<&ForgeSettings> = FORGE_KINDS
@@ -244,12 +234,6 @@ impl Settings {
         if self.model.is_empty() {
             problems.push(Problem::new("s-model", "model is not set"));
         }
-        if self.author_email.is_empty() {
-            problems.push(Problem::new(
-                "s-author-email",
-                "git author email is not set",
-            ));
-        }
         problems
     }
 
@@ -266,9 +250,9 @@ impl Settings {
             model: self.model.clone(),
             tasks: self.tasks.clone(),
             hourly_limit: self.hourly_limit,
-            // Commits are attributed to the model that authored them.
+            // Commits are attributed to the model that authored them; the
+            // email comes from each forge's account via identity::resolve.
             author_name: model_author_name(&self.model),
-            author_email: self.author_email.clone(),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             nice: self.nice,
             ionice: self.ionice,
@@ -307,7 +291,6 @@ impl Settings {
     /// nonempty one overwrites it.
     pub fn apply_update(&mut self, mut incoming: Settings) -> Result<()> {
         incoming.model = incoming.model.trim().to_owned();
-        incoming.author_email = incoming.author_email.trim().to_owned();
         for kind in FORGE_KINDS {
             let forge = incoming.forge_mut(kind);
             forge.trim();
@@ -484,7 +467,6 @@ mod tests {
                 ..Default::default()
             },
             model: "anthropic/claude".into(),
-            author_email: "bot@example.com".into(),
             ..Default::default()
         }
     }
@@ -531,6 +513,9 @@ mod tests {
         assert_eq!(config.forges.len(), 1);
         assert_eq!(config.forges[0].url, "https://github.com");
         assert_eq!(config.forges[0].user, "x-access-token");
+        // The author email is resolved from the forge account before any
+        // turn runs, never from the settings.
+        assert_eq!(config.forges[0].email, "");
         // Commits are authored as the model, prettified.
         assert_eq!(config.author_name, "Claude");
         assert_eq!(config.workspace, PathBuf::from("/tmp/ws"));
@@ -602,7 +587,6 @@ mod tests {
         settings.gitea.enabled = true;
         settings.gitea.token = "tok".into();
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert!(fields.iter().any(|f| f == "f-gitea-user"), "{fields:?}");
         assert!(fields.iter().any(|f| f == "f-gitea-url"), "{fields:?}");
         assert!(settings.to_config(&cli()).is_none());
     }
@@ -622,7 +606,6 @@ mod tests {
         settings.gitea = ForgeSettings {
             enabled: true,
             token: "tok".into(),
-            user: "bot".into(),
             url: "https://git.example.com".into(),
             enabled_repos: ["owner/repo".to_owned()].into(),
         };

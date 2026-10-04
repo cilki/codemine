@@ -237,9 +237,9 @@ pub fn run(
         // forge's auth has to reach them since nothing is in the process env.
         .envs(cfg.forges.iter().flat_map(|forge| forge.env()))
         .env("GIT_AUTHOR_NAME", &cfg.author_name)
-        .env("GIT_AUTHOR_EMAIL", &cfg.author_email)
+        .env("GIT_AUTHOR_EMAIL", &forge.email)
         .env("GIT_COMMITTER_NAME", &cfg.author_name)
-        .env("GIT_COMMITTER_EMAIL", &cfg.author_email)
+        .env("GIT_COMMITTER_EMAIL", &forge.email)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log.try_clone()?))

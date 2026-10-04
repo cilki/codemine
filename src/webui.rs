@@ -520,7 +520,6 @@ mod tests {
         let update = json!({
             "github": { "enabled": true, "token": "secret" },
             "model": "anthropic/claude",
-            "author_email": "bot@example.com",
             "hourly_limit": 0.5,
         });
         let response = request(addr, "PUT", "/api/settings", &update.to_string());

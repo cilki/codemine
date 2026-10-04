@@ -272,7 +272,6 @@
       <button type="button" class="small" id="settings-close">close</button></div>
     <div class="general-grid">
       <div class="field"><label for="s-hourly-limit">Hourly task limit (blank = unlimited)</label><input id="s-hourly-limit" type="number" min="0" step="any"></div>
-      <div class="field"><label for="s-author-email">Git author email</label><input id="s-author-email"></div>
       <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
       <div class="field"><label for="s-nice">CPU priority</label>
         <select id="s-nice">
@@ -463,6 +462,13 @@
   function render() {
     const a = state.activity;
     markProblems(a.state === "unconfigured" ? a.problems : []);
+    // Who the bot is on each forge, resolved from the forge API rather than
+    // configured, so the settings card shows it read-only.
+    for (const forge of FORGES) {
+      const span = $(`f-${forge}-identity`);
+      const identity = state.identities?.[forge];
+      if (span) span.textContent = identity ? `commits as ${identity}` : "";
+    }
     // The proxy card's notes read the gate and the running turn off the
     // status, so a status change repaints it too.
     if (proxyHealth) renderProxy(proxyHealth);
@@ -870,8 +876,7 @@
         <input id="f-${name}-token" type="password" autocomplete="off"></div>
       <div class="field"><label for="f-${name}-url">URL</label>
         <input id="f-${name}-url" placeholder="${URL_PLACEHOLDER[name]}"></div>
-      ${name === "gitea" ? `
-      <div class="field"><label for="f-gitea-user">User</label><input id="f-gitea-user"></div>` : ""}
+      <span class="muted" id="f-${name}-identity"></span>
       <div class="field">
         <div class="repos-head"><label>Repositories</label>
           <button type="button" class="small" id="f-${name}-repos-refresh">refresh</button></div>
@@ -954,7 +959,7 @@
     for (const forge of FORGES) {
       const f = s[forge];
       const listable = f.enabled && f.token_set
-        && (forge !== "gitea" || (f.url && f.user));
+        && (forge !== "gitea" || f.url);
       if (listable && !loadedRepos.has(forge)) loadRepos(forge);
     }
   }
@@ -976,7 +981,6 @@
         ? "key set — leave blank to keep" : UNSET[key];
     }
     $("s-hourly-limit").value = s.hourly_limit ?? "";
-    $("s-author-email").value = s.author_email;
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     $("s-nice").value = nicePriority(s.nice);
     $("s-ionice").value = s.ionice ?? "";
@@ -989,7 +993,6 @@
       token.value = "";
       token.placeholder = f.token_set ? "token set — leave blank to keep" : "no token";
       $(`f-${forge}-url`).value = f.url;
-      if (forge === "gitea") $("f-gitea-user").value = f.user;
       // Show the stored enables even before a live listing is loaded, so an
       // unreachable forge can't silently drop them.
       renderRepos(forge, [...enabledRepos[forge]].sort());
@@ -1026,7 +1029,6 @@
       model: $("s-model").value,
       tasks: [...enabledTasks],
       hourly_limit: num($("s-hourly-limit").value),
-      author_email: $("s-author-email").value,
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
       nice: NICE[$("s-nice").value] ?? null,
       ionice: $("s-ionice").value || null,
@@ -1042,7 +1044,6 @@
         // Empty means "keep the stored token"; the server never sends it back.
         token: $(`f-${forge}-token`).value,
         url: $(`f-${forge}-url`).value,
-        user: forge === "gitea" ? $("f-gitea-user").value : "",
         enabled_repos: [...enabledRepos[forge]].sort(),
       };
     }

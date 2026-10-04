@@ -310,6 +310,7 @@ mod tests {
             kind: ForgeKind::Github,
             token: "tok".into(),
             user: String::new(),
+            email: String::new(),
             url: "https://github.com".into(),
             enabled_repos: BTreeSet::new(),
         }
