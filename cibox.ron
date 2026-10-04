@@ -1,0 +1,11 @@
+(
+    rust_clippy: (
+        enabled: false,
+    ),
+    rust_audit: (
+        enabled: false,
+    ),
+    gitleaks: (
+        enabled: false,
+    ),
+)

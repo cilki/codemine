@@ -1,0 +1,44 @@
+name: CI
+on:
+  pull_request:
+    branches:
+    - main
+    - master
+  push:
+    branches:
+    - main
+    - master
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Build image
+      run: docker build -t cilki/codemine .
+    timeout-minutes: 30
+  rust-fmt:
+    runs-on: ubuntu-latest
+    container: rust:latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Check formatting
+      run: cargo fmt -- --check
+    timeout-minutes: 10
+  rust-test:
+    runs-on: ubuntu-latest
+    container: rust:latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        key: rust-cache
+        path: |-
+          target/
+          .cargo/
+    - name: Run tests
+      run: cargo test --all-features
+    timeout-minutes: 30

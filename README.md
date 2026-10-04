@@ -33,11 +33,27 @@ Each "turn" does one of the following on a repo:
   than implementing it.
 - `lint`: fix any results thrown by common linters.
 
+### Motivation
+
+I wanted an asynchronous process that uses some of my spare tokens to regularly
+clean up the code I'm generating "in the foreground". Originally I tried
+openclaw, but I found the messaging system unwieldly and annoying. I just want
+to check my open PRs once a day, merge anything I think is ready and comment
+feedback when the AI is going in the wrong direction.
+
+Further, I wanted a simple web interface that I could use to adjust rate limits
+and decide what types of tasks the AI should work on.
+
+I'm running **codemine** on a Raspberry Pi 5 (onboard SSD rather than SD card)
+to great success. I tried lesser hardware, but it often became unresponsive
+during `cargo test`, `nix-shell`, etc. The pi can only reach my private gitea
+instance which I mirror to Github.
+
 ### Getting started
 
-Build the image and bring it up with the workspace on a volume; everything
-that must survive the container — settings, repo clones, the proxy login —
-lives there:
+Build the image and bring it up with the workspace on a volume; everything that
+must survive the container — settings, repo clones, the proxy login — lives
+there:
 
 ```sh
 docker build -t codemine .
@@ -48,21 +64,21 @@ docker run -d --name codemine \
   codemine
 ```
 
-The container starts [CLIProxyAPI](#cliproxyapi) alongside **codemine**. Log
-in to your Claude subscription once; the tokens persist on the volume and
-refresh on their own from then on:
+The container starts [CLIProxyAPI](#cliproxyapi) alongside **codemine**. Log in
+to your AI provider once; the tokens persist on the volume and refresh on their
+own from then on:
 
 ```sh
 docker exec -it codemine cliproxyapi \
   -config /workspace/cliproxyapi/config.yaml -claude-login -no-browser
 ```
 
-Open the URL it prints in your browser and approve the login. The OAuth
-callback lands on port 54545, which is why `docker run` publishes it
-(loopback only) above; the port is silent outside of a login.
+Open the URL it prints in your browser and approve the login. The OAuth callback
+lands on port 54545, which is why `docker run` publishes it (loopback only)
+above.
 
-Then open http://localhost:8080 and finish up in the settings: pick a model,
-add a forge token, and enable some repositories.
+Then open http://localhost:8080 and finish up in the settings: pick a model, add
+a forge token, and enable some repositories.
 
 ### Features
 
@@ -72,8 +88,8 @@ Agents are routed through
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), which manages the
 model subscription. The Docker image runs the proxy itself and the default
 settings already point at it (`http://127.0.0.1:8317`); elsewhere, point the
-settings page at your own instance. Until the proxy answers, **codemine**
-stays unconfigured and runs no turns.
+settings page at your own instance. Until the proxy answers, **codemine** stays
+unconfigured and runs no turns.
 
 #### Codegraph
 
@@ -98,7 +114,6 @@ select what repos **codemine** is enabled for (none by default).
 
 #### Web interface
 
-You can manage the **codemine** instance via a simple web UI on port 8080. This
-is where you configure your forge settings, rate limits, select a model, choose
-what task types are run, view agent logs, etc. Updates to the settings take
-effect on the next turn.
+You can view and manage the **codemine** instance via a simple web UI on
+port 8080. This is where you configure your forge settings, rate limits, select
+a model, choose what task types are run, view agent logs, etc.
