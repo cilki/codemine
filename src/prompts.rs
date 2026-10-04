@@ -1,6 +1,7 @@
 //! Starter prompts baked into the binary and installed into opencode's config
 //! directory at startup, so the binary works without the image copying them.
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -187,10 +188,19 @@ pub fn install_provider(dir: &Path, proxy: &crate::settings::ProxySettings) -> R
         },
     });
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
+    // Written through a temp file beside the target and renamed into place,
+    // the way the settings store writes config.json. Writing the file and
+    // narrowing it afterwards left the key in a file the umask had made
+    // world-readable until the chmod landed, and left a half-written config
+    // behind if the write failed partway; a temp file is created 0600 from
+    // the start and the rename is atomic, so neither window exists.
+    let mut file = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("failed to create a temp file in {}", dir.display()))?;
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(&serde_json::to_vec_pretty(&config)?)?;
+    file.persist(&path)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to restrict {}", path.display()))?;
     Ok(())
 }
 
@@ -503,6 +513,15 @@ mod tests {
             format!("{}/v1", crate::proxy::DEFAULT_BASE_URL)
         );
         assert_eq!(config["provider"]["anthropic"]["options"]["apiKey"], "k1");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+
+        // install_mcp writes the same file first and has no key to protect,
+        // so the real sequence hands install_provider a config at whatever
+        // the umask allowed; the key must not inherit that.
+        std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        install_provider(dir.path(), &proxy).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
 
