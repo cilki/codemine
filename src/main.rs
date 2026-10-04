@@ -8,6 +8,7 @@ mod cache;
 mod config;
 mod emblem;
 mod events;
+#[cfg(feature = "hostinfo")]
 mod host;
 mod precheck;
 mod prompts;

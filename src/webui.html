@@ -227,11 +227,13 @@
 <div class="container">
   <div class="header">
     <img src="/emblem.svg" alt="codemine" class="emblem">
+    <span class="disconnected" id="disconnected" hidden>disconnected</span>
   </div>
 
-  <div class="panel">
-    <div class="panel-title log-head"><span>Host - <span id="host-name">–</span></span>
-      <span class="disconnected" id="disconnected" hidden>disconnected</span></div>
+  <!-- Only shown once a host event arrives; a server built without the
+       hostinfo feature never sends one and the panel stays hidden. -->
+  <div class="panel" id="host-panel" hidden>
+    <div class="panel-title">Host - <span id="host-name">–</span></div>
     <div class="host-grid" id="host"><span class="muted">Loading…</span></div>
   </div>
 
@@ -715,11 +717,12 @@
     const temp = h.temp_c == null ? "" : " (" + Math.round(h.temp_c) + " °C)";
     const items = [
       ["ip", h.ip || "–"],
-      ["cpu", (h.cpu_usage == null ? "–" : Math.round(h.cpu_usage) + "%") + temp],
+      ["cpu", Math.round(h.cpu_usage) + "%" + temp],
       ["memory", memory],
       ["storage", storage],
       ["uptime", fmtDuration(h.uptime_secs)],
     ];
+    $("host-panel").hidden = false;
     $("host-name").textContent = h.hostname || "–";
     if (h.hostname) document.title = "codemine - " + h.hostname;
     $("host").replaceChildren(...items.map(([label, value]) => {

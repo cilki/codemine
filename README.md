@@ -33,15 +33,47 @@ Each "turn" does one of the following on a repo:
   than implementing it.
 - `lint`: fix any results thrown by common linters.
 
+### Getting started
+
+Build the image and bring it up with the workspace on a volume; everything
+that must survive the container — settings, repo clones, the proxy login —
+lives there:
+
+```sh
+docker build -t codemine .
+docker run -d --name codemine \
+  -p 8080:8080 \
+  -p 127.0.0.1:54545:54545 \
+  -v codemine:/workspace \
+  codemine
+```
+
+The container starts [CLIProxyAPI](#cliproxyapi) alongside **codemine**. Log
+in to your Claude subscription once; the tokens persist on the volume and
+refresh on their own from then on:
+
+```sh
+docker exec -it codemine cliproxyapi \
+  -config /workspace/cliproxyapi/config.yaml -claude-login -no-browser
+```
+
+Open the URL it prints in your browser and approve the login. The OAuth
+callback lands on port 54545, which is why `docker run` publishes it
+(loopback only) above; the port is silent outside of a login.
+
+Then open http://localhost:8080 and finish up in the settings: pick a model,
+add a forge token, and enable some repositories.
+
 ### Features
 
 #### CLIProxyAPI
 
 Agents are routed through
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), which manages the
-model subscription. Point the settings page at the proxy
-(`http://127.0.0.1:8317` by default) and pick a model there. Until the proxy
-answers, **codemine** stays unconfigured and runs no turns.
+model subscription. The Docker image runs the proxy itself and the default
+settings already point at it (`http://127.0.0.1:8317`); elsewhere, point the
+settings page at your own instance. Until the proxy answers, **codemine**
+stays unconfigured and runs no turns.
 
 #### Codegraph
 

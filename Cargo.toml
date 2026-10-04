@@ -18,9 +18,14 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sysinfo = { version = "0.39.6", default-features = false, features = ["component", "disk", "system"], optional = true }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
 tokio-stream = "0.1.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wait-timeout = "0.2"
+
+[features]
+default = ["hostinfo"]
+hostinfo = ["dep:sysinfo"]

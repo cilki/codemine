@@ -32,3 +32,14 @@ with pkgs;
 # unrewritten when the CLI is absent, and the Dockerfile falls back to the
 # upstream installer.
 ++ lib.optional (pkgs ? rtk) rtk
+# cliproxyapi owns the Claude subscription login and its continuous token
+# refresh; codemine and opencode are only clients. It hasn't reached the
+# 26.05 pin yet, so pull it from nixos-unstable until it lands.
+++ [
+  (if pkgs ? cliproxyapi then
+    cliproxyapi
+  else
+    (import (builtins.fetchTarball {
+      url = "https://github.com/NixOS/nixpkgs/archive/nixos-unstable.tar.gz";
+    }) { }).cliproxyapi)
+]

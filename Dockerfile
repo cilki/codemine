@@ -24,6 +24,7 @@ RUN nix-env -if /work/nix/profile.nix \
   && rm -rf /root/.cache/nix /nix/var/log/nix /work
 
 COPY --from=build /out/bin/codemine /usr/local/bin/codemine
+COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint
 
 ENV PATH=/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH
 
@@ -39,7 +40,14 @@ RUN command -v codegraph \
 RUN mkdir -p /workspace
 WORKDIR /workspace
 
-# Default port for the always-on web UI (--listen).
-EXPOSE 8080
+# All durable state in one place: codemine's settings and clones, plus
+# CLIProxyAPI's config and OAuth tokens (the entrypoint keeps both under
+# /workspace). Declared so even a bare `docker run` lands it on a volume.
+VOLUME /workspace
 
-ENTRYPOINT [ "/usr/local/bin/codemine" ]
+# Default port for the always-on web UI (--listen), plus the OAuth callback
+# that only answers while `cliproxyapi -claude-login` is running.
+EXPOSE 8080 54545
+
+# Starts CLIProxyAPI alongside codemine; arguments go to codemine.
+ENTRYPOINT [ "/usr/local/bin/entrypoint" ]

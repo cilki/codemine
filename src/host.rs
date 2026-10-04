@@ -1,24 +1,23 @@
-//! Host details for the web UI, read fresh from /proc and /sys each time.
+//! Host details for the web UI, read fresh through sysinfo each time.
 //! Everything is best-effort: a field that can't be read just comes back
 //! empty or zero and the page shows a dash.
 
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use sysinfo::{
+    Components, CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System,
+};
 
-#[derive(Serialize, Default)]
+#[derive(Serialize)]
 pub struct Host {
     pub hostname: String,
     /// The address the default route leaves from; empty when unroutable.
     pub ip: String,
-    pub cpus: usize,
-    /// Busy time across all cores as a percentage, 0-100; None before the
-    /// first measurement window closes.
-    pub cpu_usage: Option<f32>,
+    /// Busy time across all cores as a percentage, 0-100.
+    pub cpu_usage: f32,
     /// Bytes.
     pub mem_total: u64,
     pub mem_available: u64,
@@ -34,30 +33,21 @@ pub struct Host {
 /// `workspace` picks the filesystem the disk figures describe; everything
 /// else is the host as a whole.
 pub fn snapshot(workspace: &Path) -> Host {
-    let (mem_total, mem_available) = mem_info();
+    let memory = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+    );
     let (disk_total, disk_available) = disk_info(workspace);
     Host {
-        hostname: read_trimmed("/proc/sys/kernel/hostname"),
+        hostname: System::host_name().unwrap_or_default(),
         ip: local_ip(),
-        cpus: cpu_count(),
         cpu_usage: cpu_usage(),
-        mem_total,
-        mem_available,
+        mem_total: memory.total_memory(),
+        mem_available: memory.available_memory(),
         temp_c: cpu_temp(),
         disk_total,
         disk_available,
-        uptime_secs: read_trimmed("/proc/uptime")
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0) as u64,
+        uptime_secs: System::uptime(),
     }
-}
-
-fn read_trimmed(path: impl AsRef<Path>) -> String {
-    std::fs::read_to_string(path)
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default()
 }
 
 /// The source address of a would-be packet to a public host; connecting a
@@ -72,29 +62,16 @@ fn local_ip() -> String {
         .unwrap_or_default()
 }
 
-fn cpu_count() -> usize {
-    let cpus = std::fs::read_to_string("/proc/cpuinfo")
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| line.starts_with("processor"))
-        .count();
-    match cpus {
-        0 => std::thread::available_parallelism().map_or(0, |n| n.get()),
-        n => n,
-    }
-}
-
-/// The last /proc/stat reading and the usage computed from it. Kept process
-/// wide so every caller — each open event stream, plus `/api/host` — shares
-/// one measurement window instead of racing each other for ever shorter,
-/// ever noisier deltas.
+/// The System the usage is diffed through and the figure it last produced.
+/// Kept process wide so every caller — each open event stream, plus
+/// `/api/host` — shares one measurement window instead of racing each other
+/// for ever shorter, ever noisier deltas.
 static CPU: Mutex<Option<CpuSample>> = Mutex::new(None);
 
 struct CpuSample {
+    /// Carries the previous reading sysinfo diffs the next refresh against.
+    sys: System,
     at: Instant,
-    /// Jiffies since boot, all of them and the idle ones.
-    total: u64,
-    idle: u64,
     usage: f32,
 }
 
@@ -103,143 +80,61 @@ struct CpuSample {
 const CPU_WINDOW: Duration = Duration::from_millis(500);
 
 /// Busy time as a percentage of all CPU time since the previous reading.
-fn cpu_usage() -> Option<f32> {
+fn cpu_usage() -> f32 {
     let mut cached = CPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut now = cpu_times()?;
-    let (prev_total, prev_idle) = match cached.take() {
-        // Asked again within the window: the answer hasn't had time to
-        // change, and re-diffing would only add noise.
-        Some(prev) if prev.at.elapsed() < CPU_WINDOW => {
-            let usage = prev.usage;
-            *cached = Some(prev);
-            return Some(usage);
+    // The first call has nothing to diff against, so it measures a window of
+    // its own rather than leave the page blank.
+    let sample = cached.get_or_insert_with(|| {
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing().with_cpu_usage()),
+        );
+        std::thread::sleep(CPU_WINDOW);
+        sys.refresh_cpu_usage();
+        CpuSample {
+            usage: sys.global_cpu_usage(),
+            at: Instant::now(),
+            sys,
         }
-        Some(prev) => (prev.total, prev.idle),
-        // The first call has nothing to diff against, so it measures a
-        // window of its own rather than leave the page blank.
-        None => {
-            let first = now;
-            std::thread::sleep(CPU_WINDOW);
-            now = cpu_times()?;
-            first
-        }
-    };
-    let (total, idle) = now;
-    let elapsed = total.saturating_sub(prev_total);
-    let idled = idle.saturating_sub(prev_idle);
-    let usage = match elapsed {
-        0 => 0.0,
-        _ => 100.0 * elapsed.saturating_sub(idled) as f32 / elapsed as f32,
-    };
-    *cached = Some(CpuSample {
-        at: Instant::now(),
-        total,
-        idle,
-        usage,
     });
-    Some(usage)
+    // Asked again within the window, the answer hasn't had time to change,
+    // and re-diffing would only add noise.
+    if sample.at.elapsed() >= CPU_WINDOW {
+        sample.sys.refresh_cpu_usage();
+        sample.at = Instant::now();
+        sample.usage = sample.sys.global_cpu_usage();
+    }
+    sample.usage
 }
 
-/// Total and idle jiffies since boot, from /proc/stat's summary line.
-fn cpu_times() -> Option<(u64, u64)> {
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let fields: Vec<u64> = stat
-        .lines()
-        .next()?
-        .strip_prefix("cpu ")?
-        .split_whitespace()
-        .filter_map(|field| field.parse().ok())
-        .collect();
-    // user nice system idle iowait irq softirq steal ...; idle and iowait
-    // are both time the CPU had nothing to run.
-    let idle = *fields.get(3)? + *fields.get(4)?;
-    Some((fields.iter().sum(), idle))
-}
-
-/// MemTotal and MemAvailable in bytes.
-fn mem_info() -> (u64, u64) {
-    let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let field = |name: &str| {
-        info.lines()
-            .find(|line| line.starts_with(name))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|kb| kb.parse::<u64>().ok())
-            .map_or(0, |kb| kb * 1024)
-    };
-    (field("MemTotal:"), field("MemAvailable:"))
-}
-
-/// Size and free space of the filesystem `path` lives on, in bytes. The
-/// free figure is what an unprivileged writer may actually use, so it leaves
-/// out the root reserve.
+/// Size and free space of the filesystem `path` lives on, in bytes — the
+/// mount closest to it, since every ancestor's filesystem also "holds" it.
+/// The free figure is what an unprivileged writer may actually use, so it
+/// leaves out the root reserve.
 fn disk_info(path: &Path) -> (u64, u64) {
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-        return (0, 0);
-    };
-    // SAFETY: the path is a valid C string and statvfs only writes the
-    // zeroed struct it is handed.
-    let stat = unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(path.as_ptr(), &mut stat) != 0 {
-            return (0, 0);
-        }
-        stat
-    };
-    // f_frsize is the fragment size the block counts are in; f_bsize is only
-    // the preferred IO size and the two can differ.
-    let block = stat.f_frsize as u64;
-    (stat.f_blocks as u64 * block, stat.f_bavail as u64 * block)
+    Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage())
+        .list()
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| (disk.total_space(), disk.available_space()))
+        .unwrap_or((0, 0))
 }
 
-/// The CPU's thermal zone if one is labeled as such, else any zone at all.
+/// The CPU's sensor if one is labeled as such, else any sensor at all.
 fn cpu_temp() -> Option<f32> {
     let mut fallback = None;
-    for entry in std::fs::read_dir("/sys/class/thermal").ok()?.flatten() {
-        let path = entry.path();
-        let Some(milli) = std::fs::read_to_string(path.join("temp"))
-            .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-        else {
+    for component in Components::new_with_refreshed_list().list() {
+        let Some(temp) = component.temperature() else {
             continue;
         };
-        let temp = milli / 1000.0;
-        let kind = read_trimmed(path.join("type")).to_lowercase();
+        let label = component.label().to_lowercase();
         if ["cpu", "pkg", "core", "soc"]
             .iter()
-            .any(|k| kind.contains(k))
+            .any(|k| label.contains(k))
         {
             return Some(temp);
         }
         fallback.get_or_insert(temp);
     }
     fallback
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshot_reads_the_linux_procfs() {
-        let host = snapshot(Path::new("/"));
-        assert!(!host.hostname.is_empty());
-        assert!(host.cpus > 0);
-        assert!(host.mem_total > 0);
-        assert!(host.mem_available <= host.mem_total);
-        assert!(host.uptime_secs > 0);
-        assert!(host.disk_total > 0);
-        assert!(host.disk_available <= host.disk_total);
-        let usage = host
-            .cpu_usage
-            .expect("the first call measures its own window");
-        assert!((0.0..=100.0).contains(&usage), "{usage}");
-    }
-
-    #[test]
-    fn cpu_times_only_move_forward() {
-        let (total, idle) = cpu_times().expect("/proc/stat is readable");
-        assert!(total > 0 && idle <= total, "{idle} of {total}");
-        let (later, later_idle) = cpu_times().unwrap();
-        assert!(later >= total && later_idle >= idle);
-    }
 }

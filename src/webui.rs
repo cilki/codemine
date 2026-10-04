@@ -40,6 +40,7 @@ struct AppState {
     settings: SharedSettings,
     /// The workspace root, which is all the page wants of it: the disk
     /// figures in the host details describe the filesystem it sits on.
+    #[cfg_attr(not(feature = "hostinfo"), allow(dead_code))]
     workspace: PathBuf,
 }
 
@@ -86,15 +87,16 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/favicon.svg", get(favicon))
         .route("/api/status", get(api_status))
         .route("/api/log", get(api_log))
-        .route("/api/host", get(api_host))
         .route("/api/turns/{started}/log", get(api_turn_log))
         .route("/api/events", get(api_events))
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/paused", axum::routing::put(api_put_paused))
         .route("/api/cancel", axum::routing::post(api_post_cancel))
         .route("/api/options", get(api_options))
-        .route("/api/repos/{forge}", get(api_repos))
-        .with_state(state);
+        .route("/api/repos/{forge}", get(api_repos));
+    #[cfg(feature = "hostinfo")]
+    let app = app.route("/api/host", get(api_host));
+    let app = app.with_state(state);
     let listener = tokio::net::TcpListener::from_std(listener)?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -125,6 +127,7 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 /// A fresh host-details snapshot; the event stream pushes the same shape.
+#[cfg(feature = "hostinfo")]
 async fn api_host(State(state): State<AppState>) -> Json<crate::host::Host> {
     Json(crate::host::snapshot(&state.workspace))
 }
@@ -163,8 +166,9 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         let mut changes = state.status.subscribe();
         // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
-        let (mut sent_status, mut sent_log, mut sent_host, mut sent_proxy) =
-            (None, None, None, None);
+        let (mut sent_status, mut sent_log, mut sent_proxy) = (None, None, None);
+        #[cfg(feature = "hostinfo")]
+        let mut sent_host = None;
         loop {
             // Status is compared without the server timestamp, which moves on
             // its own and would make every state look new, but sent with it;
@@ -174,6 +178,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                 serde_json::to_string(&status_value(&state.status)).unwrap_or_else(|_| "{}".into());
             let log =
                 serde_json::to_string(&log_tail(&state.status)).unwrap_or_else(|_| "\"\"".into());
+            #[cfg(feature = "hostinfo")]
             let host = serde_json::to_string(&crate::host::snapshot(&state.workspace))
                 .unwrap_or_else(|_| "{}".into());
             // Re-derived each tick, like the host snapshot: the main loop is
@@ -187,12 +192,15 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             })
             .await
             .unwrap_or_else(|_| "null".into());
-            for (name, key, payload, sent) in [
+            #[cfg_attr(not(feature = "hostinfo"), allow(unused_mut))]
+            let mut channels = vec![
                 ("status", &snapshot, &status, &mut sent_status),
                 ("log", &log, &log, &mut sent_log),
-                ("host", &host, &host, &mut sent_host),
                 ("proxy", &proxy, &proxy, &mut sent_proxy),
-            ] {
+            ];
+            #[cfg(feature = "hostinfo")]
+            channels.push(("host", &host, &host, &mut sent_host));
+            for (name, key, payload, sent) in channels {
                 if sent.as_ref() == Some(key) {
                     continue;
                 }
@@ -490,6 +498,13 @@ mod tests {
         assert!(response.contains("image/svg+xml"), "{response}");
         assert!(response.contains("<svg"), "{response}");
         assert!(!response.contains("<?xml"), "{response}");
+
+        // The host endpoint rides the hostinfo feature.
+        let response = request(addr, "GET", "/api/host", "");
+        #[cfg(feature = "hostinfo")]
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        #[cfg(not(feature = "hostinfo"))]
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
     }
 
     #[test]

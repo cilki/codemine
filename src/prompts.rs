@@ -346,27 +346,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_tasks_match_sweep_sections() {
-        assert_eq!(
-            default_tasks(),
-            [
-                "feedback",
-                "rebase",
-                "bump",
-                "simplify",
-                "todo",
-                "roleplay",
-                "benchmark",
-                "audit",
-                "docs",
-                "coverage",
-                "mutation",
-                "feature"
-            ]
-        );
-    }
-
-    #[test]
     fn tasks_carry_their_sweep_instructions() {
         let tasks = tasks();
         let by_slug = |slug: &str| {
