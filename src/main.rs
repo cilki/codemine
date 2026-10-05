@@ -24,6 +24,7 @@ mod usage;
 mod webui;
 mod workspace;
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -37,7 +38,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Cli, Config, ForgeKind, USAGE};
-use crate::settings::{Problem, SettingsStore};
+use crate::settings::{Problem, Settings, SettingsStore};
 use crate::status::{Activity, Allowance, Shared, Status};
 use crate::turn::Backoff;
 
@@ -116,79 +117,35 @@ fn main() -> Result<()> {
                 ));
             }
         }
-        if problems.is_empty()
-            && let Some(message) = proxy::problem(&settings.proxy)
-        {
-            problems.push(Problem::new("proxy-card", message));
-        }
-        if !problems.is_empty() {
-            Status::update(&status, |s| {
-                s.activity = Activity::Unconfigured { problems }
-            });
-            std::thread::sleep(Duration::from_secs(5));
-            continue;
-        }
-        let mut cfg = settings
-            .to_config(&cli)
-            .expect("settings without problems are runnable");
-
-        // Who the bot is on each forge: the author email and Gitea's
-        // credential-line user come from the forge, not the settings.
-        // Cached, so this is a map lookup on every pass but the first.
-        match identity::resolve(&mut cfg.forges) {
-            Ok(resolved) => {
-                let identities: std::collections::BTreeMap<String, String> = resolved
-                    .into_iter()
-                    .map(|(name, id)| (name, format!("{} <{}>", id.login, id.email)))
-                    .collect();
-                // Only a change wakes the SSE stream; this runs every pass.
-                if status.lock().identities != identities {
-                    Status::update(&status, |s| s.identities = identities);
-                }
-            }
-            Err((kind, err)) => {
-                error!("{err:#}");
+        let cfg = match runnable(
+            &cli,
+            &settings,
+            problems,
+            generation,
+            &mut applied_generation,
+            &status,
+        ) {
+            Ok(cfg) => cfg,
+            Err(problems) => {
                 Status::update(&status, |s| {
-                    s.activity = Activity::Unconfigured {
-                        problems: vec![Problem::new(
-                            &format!("f-{}-token", kind.name()),
-                            format!("{err:#}"),
-                        )],
-                    }
+                    s.activity = Activity::Unconfigured { problems }
                 });
-                std::thread::sleep(Duration::from_secs(5));
+                std::thread::sleep(UNCONFIGURED_RETRY);
                 continue;
             }
-        }
-
-        if applied_generation != Some(generation) {
-            if let Err(err) = apply_forge_auth(&cli, &cfg) {
-                error!("failed to apply forge auth: {err:#}");
-                Status::update(&status, |s| {
-                    s.activity = Activity::Unconfigured {
-                        problems: vec![Problem::new(
-                            "",
-                            format!("failed to apply forge auth: {err:#}"),
-                        )],
-                    }
-                });
-                std::thread::sleep(Duration::from_secs(5));
-                continue;
-            }
-            applied_generation = Some(generation);
-        }
+        };
 
         // Off-hours holds come before the bucket so the allowance keeps
         // growing across the closed stretch, the same as any idle time; a
         // turn already under way is left to finish, since the window gates
         // when turns start, not how long they may run.
-        if let Some(wait) = cfg.schedule.hold(schedule::local_second_of_day()) {
-            let until = status::epoch_now() + wait;
+        if let Some(closed) = cfg.schedule.hold(schedule::local_second_of_day()) {
+            let until = status::epoch_now() + closed;
             Status::update(&status, |s| s.activity = Activity::OffHours { until });
             // Sliced like the rate-limit wait, and cut short by an edit, so
             // a widened window applies at once instead of at the end of the
             // hold.
-            hold(&store, generation, wait.min(60));
+            wait(closed.min(60), 1, || store.generation() != generation);
             continue;
         }
 
@@ -216,14 +173,14 @@ fn main() -> Result<()> {
             if allowance < 1.0 {
                 // Whole seconds rounded up, so the wait can't expire a hair
                 // early and spin the loop.
-                let wait = ((1.0 - allowance) * HOUR / limit).ceil() as u64;
+                let left = ((1.0 - allowance) * HOUR / limit).ceil() as u64;
                 Status::update(&status, |s| {
-                    s.activity = Activity::RateLimited { until: now + wait }
+                    s.activity = Activity::RateLimited { until: now + left }
                 });
                 // Sleep in slices and fall back into the loop, cut short by
                 // an edit, so a limit raised in the web UI applies at once
                 // instead of at the end of the wait.
-                hold(&store, generation, wait.min(60));
+                wait(left.min(60), 1, || store.generation() != generation);
                 continue;
             }
         } else {
@@ -277,6 +234,68 @@ fn main() -> Result<()> {
 
 const HOUR: f64 = 3600.0;
 
+/// How long the loop waits before looking again while something blocks turns
+/// from running. The web UI is how those get fixed, so this is also how long
+/// a fix takes to be noticed.
+const UNCONFIGURED_RETRY: Duration = Duration::from_secs(5);
+
+/// Everything that has to hold before a turn can run, asked in the order
+/// that costs the least to find out: the proxy is reachable, each forge
+/// token's account is known (its login and commit email come from the forge,
+/// not the settings), and git and tea have been taught the current tokens.
+/// `blocking` is what the caller already knows stands in the way — unsound
+/// settings, or the hold after a turn died on proxy auth — and short-circuits
+/// the rest, since every check below costs a round trip. The error side is
+/// what the web UI shows as blocking turns, each problem tied to the field
+/// that fixes it.
+fn runnable(
+    cli: &Cli,
+    settings: &Settings,
+    blocking: Vec<Problem>,
+    generation: u64,
+    applied_generation: &mut Option<u64>,
+    status: &Shared,
+) -> Result<Config, Vec<Problem>> {
+    if !blocking.is_empty() {
+        return Err(blocking);
+    }
+    if let Some(message) = proxy::problem(&settings.proxy) {
+        return Err(vec![Problem::new("proxy-card", message)]);
+    }
+    let mut cfg = settings
+        .to_config(cli)
+        .expect("settings without problems are runnable");
+
+    // Cached, so resolving is a map lookup on every pass but the first.
+    let resolved = identity::resolve(&mut cfg.forges).map_err(|(kind, err)| {
+        error!("{err:#}");
+        vec![Problem::new(
+            &format!("f-{}-token", kind.name()),
+            format!("{err:#}"),
+        )]
+    })?;
+    let identities: BTreeMap<String, String> = resolved
+        .into_iter()
+        .map(|(name, id)| (name, format!("{} <{}>", id.login, id.email)))
+        .collect();
+    // Only a change wakes the SSE stream; this runs every pass.
+    if status.lock().identities != identities {
+        Status::update(status, |s| s.identities = identities);
+    }
+
+    if *applied_generation != Some(generation) {
+        apply_forge_auth(cli, &cfg).map_err(|err| {
+            error!("failed to apply forge auth: {err:#}");
+            vec![Problem::new(
+                "",
+                format!("failed to apply forge auth: {err:#}"),
+            )]
+        })?;
+        *applied_generation = Some(generation);
+    }
+    Ok(cfg)
+}
+
 /// How long turns are held after one died on proxy auth, in seconds. Flat
 /// and short: refreshing is the proxy's continuous job, so either the blip
 /// passes on its own or the health check surfaces what a human must fix.
@@ -314,17 +333,22 @@ pub fn resized(allowance: f64, was: f64, now: f64) -> f64 {
     (allowance + (now - was).max(0.0)).min(now)
 }
 
-/// Sleep for `seconds`, returning early once the settings change: the wait
-/// was computed from a limit or a window that no longer applies, so the loop
-/// goes back around and works the hold out again.
-fn hold(store: &SettingsStore, generation: u64, seconds: u64) {
+/// Sleep up to `seconds`, waking every `slice` seconds to ask `interrupt`
+/// whether the wait still applies. Every pause the runner takes was computed
+/// from something that can move under it — a limit raised in the web UI, a
+/// window widened, a comment landing on a forge — so none of them are slept
+/// out in one go.
+fn wait(seconds: u64, slice: u64, interrupt: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() || store.generation() != generation {
-            break;
+        if interrupt() {
+            return;
         }
-        std::thread::sleep(left.min(Duration::from_secs(1)));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_secs(slice)));
     }
 }
 
@@ -528,18 +552,13 @@ fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared, pending: &events:
     // Sliced, so fresh forge activity starts the next turn right away
     // instead of waiting out the pause. The usage-limit hold is slept out in
     // full: nothing can run before the window reopens.
-    let deadline = Instant::now() + Duration::from_secs(seconds);
-    loop {
-        if !limited && !pending.is_empty() {
+    wait(seconds, 5, || {
+        let activity = !limited && !pending.is_empty();
+        if activity {
             info!("forge activity; ending the sleep early");
-            break;
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        std::thread::sleep(left.min(Duration::from_secs(5)));
-    }
+        activity
+    });
 }
 
 fn iso8601(epoch: u64) -> Option<String> {
@@ -592,6 +611,37 @@ mod tests {
         // stays — slowing down mid-hour doesn't bank a debt.
         assert_eq!(resized(4.0, capacity(4.0), capacity(1.0)), 1.0);
         assert_eq!(resized(0.5, capacity(4.0), capacity(1.0)), 0.5);
+    }
+
+    /// Every hold the runner takes goes through `wait`, so both halves of it
+    /// matter: the interrupt is consulted before anything is slept, and again
+    /// at each hop, so a wait that stops applying ends there rather than at
+    /// its deadline.
+    #[test]
+    fn a_wait_is_sliced_and_abandoned_once_it_stops_applying() {
+        // Already moot: a minute-long hold costs nothing.
+        let start = Instant::now();
+        wait(60, 1, || true);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // Moot partway through: woken at the hop after, not at the deadline.
+        let polls = std::cell::Cell::new(0);
+        let start = Instant::now();
+        wait(60, 1, || {
+            polls.set(polls.get() + 1);
+            polls.get() > 2
+        });
+        assert_eq!(polls.get(), 3);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            start.elapsed()
+        );
+
+        // Nothing to interrupt it: slept out in full.
+        let start = Instant::now();
+        wait(1, 1, || false);
+        assert!(start.elapsed() >= Duration::from_secs(1));
     }
 
     #[test]
