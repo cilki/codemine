@@ -55,6 +55,13 @@ instance which I mirror to Github.
 
 ### Getting started
 
+The agent is confined with [Landlock](https://landlock.io) and a turn fails
+rather than running it unconfined, so **codemine** needs a Linux 5.19 or newer
+kernel (Landlock ABI 2 — anything older cannot allow the cross-directory
+renames git performs constantly). In a container it is the host's kernel that
+has to provide this, and the container's seccomp policy has to let the
+`landlock_*` syscalls through.
+
 Build the image and bring it up with the workspace on a volume; everything that
 must survive the container — settings, the skip cache, the proxy login — lives
 there. Repository clones live there too, but are recloned fresh on every start,
@@ -109,11 +116,21 @@ settings already point at it (`http://127.0.0.1:8317`); elsewhere, point the
 settings page at your own instance. Until the proxy answers, **codemine** stays
 unconfigured and runs no turns.
 
+#### Sandboxing
+
+The agent runs under a Landlock ruleset that only lets it write to the clone it
+was assigned, that turn's log, and the state directories of the tools it runs
+(`~/.cargo`, `~/.npm`, the XDG directories, `/tmp`, `/nix`). It therefore
+cannot work from some other checkout it finds on the machine. Reads stay
+unrestricted: the agent needs toolchains and configs from all over, and the
+damage vector is writing where it shouldn't.
+
 #### Codegraph
 
 With [codegraph](https://github.com/colbymchenry/codegraph) installed, the agent
 avoids rereading the tree every turn, which cuts token usage substantially on
-large projects.
+large projects. The Docker image ships it; elsewhere the runner skips indexing
+when the CLI is absent and the agent explores the tree normally.
 
 #### RTK
 
@@ -121,6 +138,8 @@ With [rtk](https://github.com/rtk-ai/rtk) installed, the agent's shell commands
 are compressed to save tokens. Hover over the Tokens stat in the web UI to see
 how much rtk has saved since startup. rtk estimates these numbers at 4 bytes
 per token, so the percentage is reliable but the token counts are approximate.
+rtk is optional even in the image, since the pinned nixpkgs doesn't always
+carry it.
 
 #### Scheduling and rate limiting
 
@@ -141,6 +160,8 @@ add an access token, and tick the repositories **codemine** should sweep (none b
 default). Each repository has its own set of tasks, toggled by clicking the task
 labels in its row; the labels along the top turn a task on or off for every
 repository at once. A freshly ticked repository starts with every task on.
+GitHub and GitLab default to their public instances; Gitea has no default one,
+so it needs the URL of yours as well as the token.
 
 #### Web interface
 
