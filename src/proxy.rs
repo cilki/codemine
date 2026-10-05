@@ -1,7 +1,8 @@
 //! CLIProxyAPI health, as reported by its management API. The proxy owns the
 //! subscription OAuth login and refreshes it continuously on its own —
 //! codemine never touches tokens. Logins happen out-of-band (`cliproxyapi
-//! --claude-login` on the host); this module only asks the proxy how the
+//! -claude-login`, run wherever the proxy itself runs — inside the container
+//! for the image, which bundles it); this module only asks the proxy how the
 //! account it holds is doing, for the web UI's card and the main loop's gate.
 
 use std::io::Write;
@@ -57,7 +58,7 @@ pub fn problem(proxy: &ProxySettings) -> Option<String> {
     if health.managed && !health.connected {
         return Some(
             "no Claude account is logged into CLIProxyAPI; \
-             run `cliproxyapi --claude-login` on the host"
+             run `cliproxyapi -claude-login` where the proxy runs"
                 .into(),
         );
     }

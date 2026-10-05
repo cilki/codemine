@@ -1106,8 +1106,8 @@
   // ---- CLIProxyAPI ----
   // The account itself lives in CLIProxyAPI, which owns the subscription
   // login and refresh; the card only shows what the proxy's management API
-  // reports. Logging in happens on the host (`cliproxyapi --claude-login`),
-  // so there is no login flow here.
+  // reports. Logging in happens wherever the proxy runs (`cliproxyapi
+  // -claude-login`), so there is no login flow here.
 
   let proxyHealth = null;
 
@@ -1125,10 +1125,10 @@
       cls = "warn";
     } else if (!h.connected) {
       text = "reachable, but no account is logged in — "
-        + "run cliproxyapi --claude-login on the host";
+        + "run cliproxyapi -claude-login where the proxy runs";
       cls = "err";
     } else if (!h.refresh_ok) {
-      text = "reachable; refresh failing — log in again on the host";
+      text = "reachable; refresh failing — log in again where the proxy runs";
       cls = "err";
     } else {
       // Connected: the dot's tooltip is the only place the account's own

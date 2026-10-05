@@ -51,6 +51,13 @@ instance which I mirror to Github.
 
 ### Getting started
 
+The agent is confined with [Landlock](https://landlock.io) and a turn fails
+rather than running it unconfined, so **codemine** needs a Linux 5.19 or newer
+kernel (Landlock ABI 2 — anything older cannot allow the cross-directory
+renames git performs constantly). In a container it is the host's kernel that
+has to provide this, and the container's seccomp policy has to let the
+`landlock_*` syscalls through.
+
 Build the image and bring it up with the workspace on a volume; everything that
 must survive the container — settings, repo clones, the proxy login — lives
 there:
@@ -80,6 +87,22 @@ above.
 Then open http://localhost:8080 and finish up in the settings: pick a model, add
 a forge token, and enable some repositories.
 
+Everything but the three command-line options is configured there and persisted
+in the workspace:
+
+```
+usage: codemine [--listen ADDR] [--workspace DIR] [--once]
+
+  --listen ADDR     bind address for the web UI (default 0.0.0.0:8080)
+  --workspace DIR   persistent workspace root (default ~/.codemine)
+  --once            run a single turn and exit
+  --help            show this help
+```
+
+The entrypoint already passes `--workspace /workspace`, and arguments given
+after the image name reach **codemine** and override it, so appending `--once`
+to the `docker run` above runs a single turn and exits.
+
 ### Features
 
 #### CLIProxyAPI
@@ -91,26 +114,43 @@ settings already point at it (`http://127.0.0.1:8317`); elsewhere, point the
 settings page at your own instance. Until the proxy answers, **codemine** stays
 unconfigured and runs no turns.
 
+#### Sandboxing
+
+The agent runs under a Landlock ruleset that only lets it write to the clone it
+was assigned, that turn's log, and the state directories of the tools it runs
+(`~/.cargo`, `~/.npm`, the XDG directories, `/tmp`, `/nix`). It therefore
+cannot work from some other checkout it finds on the machine. Reads stay
+unrestricted: the agent needs toolchains and configs from all over, and the
+damage vector is writing where it shouldn't.
+
 #### Codegraph
 
 With [codegraph](https://github.com/colbymchenry/codegraph) installed, the agent
 avoids rereading the tree every turn, which cuts token usage substantially on
-large projects.
+large projects. The Docker image ships it; elsewhere the runner skips indexing
+when the CLI is absent and the agent explores the tree normally.
 
 #### RTK
 
 With [rtk](https://github.com/rtk-ai/rtk) installed, the agent's shell commands
-are compressed to save tokens.
+are compressed to save tokens. It is optional even in the image, since the
+pinned nixpkgs doesn't always carry it.
 
 #### Scheduling and rate limiting
 
-With a schedule enabled, turns can only _start_ inside a daily window. You can
-also limit the number of turns that can run per hour.
+With a schedule enabled, turns can only _start_ inside a daily window; one
+already under way is left to finish. The hourly limit counts the turns that
+reported getting something done — a turn that found nothing to do and skipped
+is free. It is spent from a bucket holding an hour's worth, so the limit can be
+fractional (0.5 is one task every two hours) and an hour's worth can run back
+to back.
 
 #### Multiple forge support
 
 **codemine** works with Gitea, GitHub, and GitLab. Add an access token and
-select what repos **codemine** is enabled for (none by default).
+select what repos **codemine** is enabled for (none by default). GitHub and
+GitLab default to the public instances; Gitea has no default one, so it needs
+the URL of yours as well as the token.
 
 #### Web interface
 
