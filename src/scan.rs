@@ -52,14 +52,24 @@ pub fn auth_error(tail: &str) -> bool {
 }
 
 /// The epoch at which an exhausted usage window reopens, parsed from a
-/// `usage limit reached|<epoch>` notice. Epochs under nine digits are noise.
+/// `usage limit reached|<epoch>` notice.
+///
+/// The runner holds turns until whatever this says, and what it reads is the
+/// agent's own output — which carries, verbatim, whatever the repository
+/// under the turn printed into it. So the digits are only taken as an epoch
+/// when they are the length of one: nine or ten. Fewer is the noise the lower
+/// bound always rejected; more is a number that reached the log some other
+/// way, and eleven digits already name a date past the year 5000.
 pub fn usage_limit_epoch(tail: &str) -> Option<u64> {
     let tail = strip_ansi(tail);
     tail.split("usage limit reached|").skip(1).find_map(|rest| {
         let digits = &rest[..rest
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(rest.len())];
-        (digits.len() >= 9).then(|| digits.parse().ok()).flatten()
+        (9..=10)
+            .contains(&digits.len())
+            .then(|| digits.parse().ok())
+            .flatten()
     })
 }
 
@@ -193,5 +203,25 @@ mod tests {
         assert_eq!(usage_limit_epoch("usage limit reached|123"), None); // too short
         assert_eq!(usage_limit_epoch("usage limit reached soon"), None);
         assert_eq!(usage_limit_epoch("all quiet"), None);
+
+        // Ten digits is still a date a usage window could carry; the notice
+        // is scanned for in the agent's output, so anything longer is a
+        // number from the repository under the turn rather than an epoch.
+        // Taken at face value these park the runner for centuries, and the
+        // widest of them overflows the Instant the wait is built from.
+        assert_eq!(
+            usage_limit_epoch("usage limit reached|9999999999"),
+            Some(9_999_999_999)
+        );
+        assert_eq!(usage_limit_epoch("usage limit reached|99999999999"), None);
+        assert_eq!(
+            usage_limit_epoch("usage limit reached|18446744073709551615"),
+            None
+        );
+        // One good notice still wins over a decoy alongside it.
+        assert_eq!(
+            usage_limit_epoch("usage limit reached|99999999999\nusage limit reached|1757000000"),
+            Some(1757000000)
+        );
     }
 }
