@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Cli, Config, ForgeKind, USAGE};
@@ -339,7 +339,14 @@ pub fn resized(allowance: f64, was: f64, now: f64) -> f64 {
 /// window widened, a comment landing on a forge — so none of them are slept
 /// out in one go.
 fn wait(seconds: u64, slice: u64, interrupt: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    // Checked: adding a duration to an `Instant` panics on overflow, and this
+    // runs on the thread the main loop is. A figure too far out to be a point
+    // in time is not a wait anyone asked for, so it is no wait at all —
+    // degrading into an immediate return keeps the loop going where the panic
+    // took the whole runner down with it.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(seconds))
+        .unwrap_or_else(Instant::now);
     loop {
         if interrupt() {
             return;
@@ -521,6 +528,36 @@ fn run(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// The longest a usage-limit notice may hold the runner. The epoch it names
+/// is read out of the turn log, which is the agent's own output and so
+/// carries whatever the repository under the turn printed into it. The widest
+/// window Anthropic reports is a weekly one, so a reopening further out than
+/// that is a number that reached the log some other way, and obeying it costs
+/// far more than re-asking does: the usage hold is the one wait nothing can
+/// cut short, so until the process is restarted the runner takes no turns at
+/// all.
+const MAX_USAGE_HOLD: u64 = 7 * 24 * 3600;
+
+/// How long to hold before the next turn, and whether the hold is a usage
+/// window — which, unlike an ordinary pause, fresh forge activity may not cut
+/// short, since nothing can run before the window reopens.
+fn hold(backoff: Backoff, now: u64) -> (u64, bool) {
+    match backoff {
+        // A minute past the reopening, so the next turn isn't racing it.
+        Backoff::UsageLimit(epoch) if epoch > now => {
+            let asked = (epoch - now).saturating_add(60);
+            if asked > MAX_USAGE_HOLD {
+                warn!(
+                    "usage: the log asks for a {asked}s hold, further out than a \
+                     usage window reaches; holding {MAX_USAGE_HOLD}s instead"
+                );
+            }
+            (asked.min(MAX_USAGE_HOLD), true)
+        }
+        _ => (60, false),
+    }
+}
+
 /// When the usage window is exhausted, Anthropic reports the epoch at which it
 /// reopens; wait for that instead of burning turns until then. Otherwise pause
 /// just long enough to keep a failing run from spinning the loop.
@@ -529,24 +566,18 @@ fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared, pending: &events:
         return;
     }
     let now = status::epoch_now();
-    let (seconds, limited) = match backoff {
-        Backoff::UsageLimit(epoch) if epoch > now => {
-            info!(
-                "usage: limit reached; sleeping until {}",
-                iso8601(epoch).unwrap_or_else(|| epoch.to_string())
-            );
-            (epoch - now + 60, true)
-        }
-        _ => (60, false),
-    };
+    let (seconds, limited) = hold(backoff, now);
+    let until = now + seconds;
+    if limited {
+        info!(
+            "usage: limit reached; sleeping until {}",
+            iso8601(until).unwrap_or_else(|| until.to_string())
+        );
+    }
     Status::update(status, |s| {
         s.activity = match limited {
-            true => Activity::UsageLimit {
-                until: now + seconds,
-            },
-            false => Activity::Sleeping {
-                until: now + seconds,
-            },
+            true => Activity::UsageLimit { until },
+            false => Activity::Sleeping { until },
         };
     });
     // Sliced, so fresh forge activity starts the next turn right away
@@ -642,6 +673,50 @@ mod tests {
         let start = Instant::now();
         wait(1, 1, || false);
         assert!(start.elapsed() >= Duration::from_secs(1));
+    }
+
+    /// A span too long to be a point in time used to panic here — adding it
+    /// to an `Instant` overflows — and this is the main loop's own thread, so
+    /// the panic took the runner with it.
+    #[test]
+    fn a_wait_too_far_out_to_represent_is_no_wait_at_all() {
+        let start = Instant::now();
+        wait(u64::MAX, 5, || false);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The usage hold is the one wait nothing can cut short, and the epoch it
+    /// is built from is parsed out of the turn log — the agent's own output,
+    /// which carries whatever the repository under the turn printed into it.
+    /// So it is capped: a far-future epoch must not take the runner out of
+    /// service until somebody restarts it.
+    #[test]
+    fn a_usage_hold_never_outlasts_a_usage_window() {
+        let now = 1_760_000_000;
+        // No limit reported: the short pause that keeps a failing run from
+        // spinning the loop.
+        assert_eq!(hold(Backoff::Normal, now), (60, false));
+        // A window reopening in an hour is obeyed as given, plus the minute
+        // of slack that keeps the next turn from racing it.
+        assert_eq!(hold(Backoff::UsageLimit(now + 3600), now), (3660, true));
+        // One that already reopened is no hold at all.
+        assert_eq!(hold(Backoff::UsageLimit(now - 1), now), (60, false));
+        // A weekly window is the widest Anthropic reports, and lands right at
+        // the cap rather than being clipped by it.
+        assert_eq!(
+            hold(Backoff::UsageLimit(now + MAX_USAGE_HOLD - 60), now),
+            (MAX_USAGE_HOLD, true)
+        );
+        // Anything beyond is capped: the largest epoch the scanner will hand
+        // over is a 261-year hold taken at face value.
+        assert_eq!(
+            hold(Backoff::UsageLimit(9_999_999_999), now),
+            (MAX_USAGE_HOLD, true)
+        );
+        assert_eq!(
+            hold(Backoff::UsageLimit(u64::MAX), now),
+            (MAX_USAGE_HOLD, true)
+        );
     }
 
     #[test]
