@@ -45,6 +45,27 @@ fn lock() -> MutexGuard<'static, BTreeMap<Key, Cached>> {
     CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The cache's answer for a key, if it still stands: a resolved identity, or
+/// the reason a recent lookup failed. None means the forge has to be asked.
+///
+/// A function of its own so the guard cannot outlive the lookup. `resolve`
+/// records what it learns under the same lock, and a guard borrowed into a
+/// `match` scrutinee lives until the end of the match — long enough to meet
+/// that second lock and park the thread forever on this non-reentrant mutex.
+fn cached(key: &Key) -> Option<Result<Identity, String>> {
+    let answer = lock().get(key).cloned();
+    match answer {
+        Some(Cached::Known(identity)) => Some(Ok(identity)),
+        Some(Cached::Failed(when, why)) if when.elapsed() < RETRY => Some(Err(why)),
+        _ => None,
+    }
+}
+
+/// Record an answer for a key, holding the lock only for the write.
+fn remember(key: Key, answer: Cached) {
+    lock().insert(key, answer);
+}
+
 /// Fill each forge's author email — and Gitea's credential-line user — from
 /// its whoami endpoint, through the cache, returning who the bot is on each
 /// forge for the UI. Fails on the first forge that can't answer, naming it:
@@ -56,12 +77,10 @@ pub fn resolve(
     let mut resolved = BTreeMap::new();
     for forge in forges.iter_mut() {
         let key = (forge.kind, forge.url.clone(), forge.token.clone());
-        let identity = match lock().get(&key).cloned() {
-            Some(Cached::Known(identity)) => identity,
-            Some(Cached::Failed(when, why)) if when.elapsed() < RETRY => {
-                return Err((forge.kind, anyhow!("{why}")));
-            }
-            _ => match whoami(forge) {
+        let identity = match cached(&key) {
+            Some(Ok(identity)) => identity,
+            Some(Err(why)) => return Err((forge.kind, anyhow!("{why}"))),
+            None => match whoami(forge) {
                 Ok(identity) => {
                     tracing::info!(
                         "{} commits as {} <{}>",
@@ -69,7 +88,7 @@ pub fn resolve(
                         identity.login,
                         identity.email
                     );
-                    lock().insert(key, Cached::Known(identity.clone()));
+                    remember(key, Cached::Known(identity.clone()));
                     identity
                 }
                 Err(err) => {
@@ -77,7 +96,7 @@ pub fn resolve(
                         "could not identify the {} account",
                         forge.kind.name()
                     ));
-                    lock().insert(key, Cached::Failed(Instant::now(), format!("{err:#}")));
+                    remember(key, Cached::Failed(Instant::now(), format!("{err:#}")));
                     return Err((forge.kind, err));
                 }
             },
@@ -234,6 +253,33 @@ mod tests {
         assert_eq!(forges[0].email, "bot@gitea.example.com");
         assert_eq!(forges[1].user, "x-access-token");
         assert_eq!(forges[1].email, "bot@github.example.com");
+    }
+
+    /// The cache-miss path: `resolve` asks the forge, records the answer, and
+    /// returns. It has to take the lock twice to do that — once to find
+    /// nothing, once to write what it learned — so a guard that survived the
+    /// lookup would hang here rather than fail. The forge is unreachable, so
+    /// the recorded answer is a failure, which the next call hands back
+    /// without asking again.
+    #[test]
+    fn a_fresh_lookup_records_its_answer() {
+        let mut forges = vec![forge(ForgeKind::Gitea, "", "fresh-lookup-test")];
+        // Nothing listens on port 1, so whoami fails as fast as the request
+        // can be refused.
+        forges[0].url = "http://127.0.0.1:1".into();
+
+        let (kind, err) = resolve(&mut forges).unwrap_err();
+        assert_eq!(kind, ForgeKind::Gitea);
+        let first = format!("{err:#}");
+        assert!(
+            first.contains("could not identify the gitea account"),
+            "{first}"
+        );
+
+        // Held, rather than re-asked: the same message comes back verbatim,
+        // which it only can if the failing lookup made it to the cache.
+        let (_, err) = resolve(&mut forges).unwrap_err();
+        assert_eq!(format!("{err:#}"), first);
     }
 
     #[test]
