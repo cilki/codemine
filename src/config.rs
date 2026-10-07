@@ -41,11 +41,28 @@ impl ForgeKind {
 /// restart, so an empty result is retried on the next call instead.
 static MODELS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
-/// The models the web UI offers, from the cache, fetching on a miss;
-/// main warms it in a background thread at startup. The cache is not held
-/// across the fetch, so concurrent callers may both fetch live — both
-/// results came from opencode, either is fine to keep.
-pub fn models() -> Vec<String> {
+/// The models the web UI offers: what opencode can resolve, narrowed to
+/// what the proxy behind it will actually answer for. opencode lists the
+/// whole catalog its provider config covers, including undated aliases
+/// (`anthropic/claude-sonnet-4-5`) that CLIProxyAPI serves only under their
+/// dated IDs — offering those meant a reasonable pick from the dropdown
+/// killed every turn. A proxy whose listing can't be read narrows nothing.
+pub fn models(proxy: &crate::settings::ProxySettings) -> Vec<String> {
+    let listed = listing();
+    match crate::proxy::served_models(proxy) {
+        Some(served) => listed
+            .into_iter()
+            .filter(|id| crate::proxy::servable(id, &served))
+            .collect(),
+        None => listed,
+    }
+}
+
+/// The `opencode models` listing from the cache, fetching on a miss; main
+/// warms it in a background thread at startup. The cache is not held across
+/// the fetch, so concurrent callers may both fetch live — both results came
+/// from opencode, either is fine to keep.
+fn listing() -> Vec<String> {
     if let Some(models) = &*lock(&MODELS) {
         return models.clone();
     }
