@@ -51,7 +51,7 @@ If a push is rejected, stop and report it rather than working around it.
 To see your open pull requests and what reviewers have said about them:
 
 ```sh
-gh pr list --repo <owner>/<repo> --json number,state,headRefName,baseRefName,title # open pull requests, with their branches
+gh pr list --repo <owner>/<repo> --json number,state,headRefName,baseRefName,title,author,mergeable # open pull requests, with their branches; mergeable is MERGEABLE, CONFLICTING, or UNKNOWN
 gh pr view <number> --comments --repo <owner>/<repo>                               # the conversation under a pull request
 ```
 

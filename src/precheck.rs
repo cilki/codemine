@@ -16,14 +16,14 @@ pub fn gated(task: &str) -> bool {
     matches!(task, "feedback" | "rebase")
 }
 
-/// Open PRs examined per repository; a repo with more open PRs than one page
-/// almost certainly has one behind its base anyway.
+/// Open PRs examined per repository; the bot's own open PRs fit well inside
+/// one page.
 const PR_LIMIT: usize = 20;
 
 /// Draw a (task, forge, repo) triple worth an agent turn. The gated tasks are
 /// probed first — every enabled one against every repository, in a shuffled
-/// order — and the first pair with work wins, so responsive work (a stale PR,
-/// a review comment) is never waiting on a lucky draw. Only once nothing is
+/// order — and the first pair with work wins, so responsive work (a
+/// conflicting PR, a review comment) is never waiting on a lucky draw. Only once nothing is
 /// pending do the rest get their turn, as one shuffled pass over every (task,
 /// repository) pair: `check` waves most of them straight through, so this is
 /// the uniform draw it used to be, but a pair the skip cache has already
@@ -65,14 +65,15 @@ pub fn draw<'a>(
 
 /// Whether the drawn task has anything to act on in this repository.
 /// `feedback` is answered by `cache::Probe` out of the notification feed it
-/// reads anyway, so only `rebase` needs a probe of its own here. Fail-open: a
-/// probe error is logged and treated as actionable, so a broken probe costs at
+/// reads anyway, so only `rebase` needs a probe of its own here: whether any
+/// of the bot's own open PRs conflict with their base. Fail-open: a probe
+/// error is logged and treated as actionable, so a broken probe costs at
 /// most what a blind draw did — an agent turn that ends in TASK SKIPPED.
 pub fn actionable(task: &str, forge: &Forge, repo: &str) -> bool {
     if task != "rebase" {
         return true;
     }
-    has_stale_pr(forge, repo).unwrap_or_else(|err| {
+    has_conflicting_pr(forge, repo).unwrap_or_else(|err| {
         warn!("{task} precheck failed for {repo}: {err:#}");
         true
     })
@@ -108,24 +109,28 @@ fn first_sha(commits: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether any open PR branch is behind its base branch.
-fn has_stale_pr(forge: &Forge, repo: &str) -> Result<bool> {
+/// Whether any open PR authored by the bot conflicts with its base branch.
+/// A branch that is merely behind but merges cleanly doesn't count: there is
+/// nothing a rebase turn would have to resolve.
+fn has_conflicting_pr(forge: &Forge, repo: &str) -> Result<bool> {
+    if forge.login.is_empty() {
+        // An unresolved login would silently match no author at all; bailing
+        // routes through `actionable`'s fail-open instead.
+        bail!("the {} login is unresolved", forge.kind.name());
+    }
     match forge.kind {
         ForgeKind::Gitea => {
+            // Gitea's listing carries `mergeable`, which also reads false
+            // while its conflict check is still running and for draft PRs;
+            // the worst case is a dispatched turn that ends in TASK SKIPPED.
             let prs = gitea_json(
                 forge,
                 &format!("repos/{repo}/pulls?state=open&limit={PR_LIMIT}"),
             )?;
-            for (base, head) in pr_refs(&prs, "ref") {
-                // Compared head-first on purpose: Gitea counts the commits
-                // the right side has that the left lacks, so this is how far
-                // the branch trails its base.
-                let compare = gitea_json(forge, &format!("repos/{repo}/compare/{head}...{base}"))?;
-                if behind(&compare, "total_commits") {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            let prs = prs.as_array().context("expected an array of pulls")?;
+            Ok(prs
+                .iter()
+                .any(|pr| authored_by(pr, &forge.login) && conflicting(pr)))
         }
         ForgeKind::Github => {
             let prs = api_json(
@@ -133,14 +138,13 @@ fn has_stale_pr(forge: &Forge, repo: &str) -> Result<bool> {
                 "gh",
                 &format!("repos/{repo}/pulls?state=open&per_page={PR_LIMIT}"),
             )?;
-            // head.label is `owner:branch`, so fork heads resolve too.
-            for (base, head) in pr_refs(&prs, "label") {
-                let compare = api_json(
-                    forge,
-                    "gh",
-                    &format!("repos/{repo}/compare/{base}...{head}"),
-                )?;
-                if behind(&compare, "behind_by") {
+            for number in owned_pr_numbers(&prs, &forge.login) {
+                // The listing carries no mergeability; the GET both reads it
+                // and triggers GitHub's lazy computation, so a null (still
+                // computing) answer reads as not conflicting and a later
+                // probe sees the computed value.
+                let pr = api_json(forge, "gh", &format!("repos/{repo}/pulls/{number}"))?;
+                if conflicting(&pr) {
                     return Ok(true);
                 }
             }
@@ -148,30 +152,22 @@ fn has_stale_pr(forge: &Forge, repo: &str) -> Result<bool> {
         }
         ForgeKind::Gitlab => {
             let project = repo.replace('/', "%2F");
+            // The listing's `has_conflicts` is GitLab's cached merge status;
+            // the recheck parameter schedules an async refresh so a stale
+            // answer heals by the next probe.
             let mrs = api_json(
                 forge,
                 "glab",
-                &format!("projects/{project}/merge_requests?state=opened&per_page={PR_LIMIT}"),
+                &format!(
+                    "projects/{project}/merge_requests?state=opened&per_page={PR_LIMIT}&with_merge_status_recheck=true"
+                ),
             )?;
-            let iids: Vec<u64> = mrs
+            let mrs = mrs
                 .as_array()
-                .context("expected an array of merge requests")?
+                .context("expected an array of merge requests")?;
+            Ok(mrs
                 .iter()
-                .filter_map(|mr| mr["iid"].as_u64())
-                .collect();
-            for iid in iids {
-                let mr = api_json(
-                    forge,
-                    "glab",
-                    &format!(
-                        "projects/{project}/merge_requests/{iid}?include_diverged_commits_count=true"
-                    ),
-                )?;
-                if behind(&mr, "diverged_commits_count") {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+                .any(|mr| authored_by(mr, &forge.login) && conflicting(mr)))
         }
     }
 }
@@ -232,27 +228,35 @@ pub fn gitea_json(forge: &Forge, path: &str) -> Result<serde_json::Value> {
     serde_json::from_slice(&output.stdout).context("gitea api returned unexpected output")
 }
 
-/// The (base ref, head) pairs of a PR listing; `head_key` picks which field
-/// of `head` names the branch (`ref` on Gitea, `label` on GitHub).
-fn pr_refs(prs: &serde_json::Value, head_key: &str) -> Vec<(String, String)> {
+/// Whether the PR was authored by `login`, under either forge spelling of
+/// the author field (`user.login` on Gitea and GitHub, `author.username` on
+/// GitLab).
+fn authored_by(pr: &serde_json::Value, login: &str) -> bool {
+    pr["user"]["login"]
+        .as_str()
+        .or_else(|| pr["author"]["username"].as_str())
+        == Some(login)
+}
+
+/// Whether the forge reports the PR as unable to merge into its base, under
+/// either spelling: `mergeable == false` on Gitea and GitHub,
+/// `has_conflicts == true` on GitLab. A missing or null field (GitHub still
+/// computing) reads as not conflicting, failing toward skipping the turn.
+fn conflicting(pr: &serde_json::Value) -> bool {
+    pr["mergeable"].as_bool() == Some(false) || pr["has_conflicts"].as_bool() == Some(true)
+}
+
+/// The numbers of the listed PRs authored by `login`; GitHub's listing
+/// carries no mergeability, so each costs a GET of its own.
+fn owned_pr_numbers(prs: &serde_json::Value, login: &str) -> Vec<u64> {
     prs.as_array()
         .map(|prs| {
             prs.iter()
-                .filter_map(|pr| {
-                    Some((
-                        pr["base"]["ref"].as_str()?.to_owned(),
-                        pr["head"][head_key].as_str()?.to_owned(),
-                    ))
-                })
+                .filter(|pr| authored_by(pr, login))
+                .filter_map(|pr| pr["number"].as_u64())
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Whether a comparison response counts any trailing commits in `field`;
-/// a missing field reads as up to date.
-fn behind(value: &serde_json::Value, field: &str) -> bool {
-    value[field].as_u64().unwrap_or(0) > 0
 }
 
 #[cfg(test)]
@@ -273,36 +277,57 @@ mod tests {
     }
 
     #[test]
-    fn behind_reads_the_count() {
-        assert!(behind(&json!({"behind_by": 3}), "behind_by"));
-        assert!(!behind(&json!({"behind_by": 0}), "behind_by"));
-        assert!(!behind(&json!({"total_commits": 0}), "total_commits"));
-        assert!(behind(&json!({"total_commits": 2}), "total_commits"));
-        assert!(!behind(&json!({}), "diverged_commits_count"));
+    fn authored_by_reads_either_author_spelling() {
+        assert!(authored_by(&json!({"user": {"login": "bot"}}), "bot"));
+        assert!(authored_by(&json!({"author": {"username": "bot"}}), "bot"));
+        assert!(!authored_by(&json!({"user": {"login": "someone"}}), "bot"));
+        assert!(!authored_by(&json!({}), "bot"));
+        // An empty login never matches a missing author field.
+        assert!(!authored_by(&json!({}), ""));
     }
 
     #[test]
-    fn pr_refs_pairs_base_with_the_chosen_head_field() {
+    fn conflicting_reads_either_conflict_spelling() {
+        assert!(conflicting(&json!({"mergeable": false})));
+        assert!(!conflicting(&json!({"mergeable": true})));
+        // GitHub still computing mergeability reads as not conflicting.
+        assert!(!conflicting(&json!({"mergeable": null})));
+        assert!(conflicting(&json!({"has_conflicts": true})));
+        assert!(!conflicting(&json!({"has_conflicts": false})));
+        assert!(!conflicting(&json!({})));
+    }
+
+    #[test]
+    fn owned_pr_numbers_keeps_only_the_bots_prs() {
         let prs = json!([
-            {"base": {"ref": "main"}, "head": {"ref": "fix", "label": "fork:fix"}},
-            {"base": {"ref": "dev"}, "head": {"ref": "feat", "label": "me:feat"}},
-            {"unrelated": true},
+            {"number": 1, "user": {"login": "bot"}},
+            {"number": 2, "user": {"login": "someone"}},
+            {"user": {"login": "bot"}},
+            {"number": 4, "user": {"login": "bot"}},
         ]);
-        assert_eq!(
-            pr_refs(&prs, "label"),
-            [
-                ("main".to_owned(), "fork:fix".to_owned()),
-                ("dev".to_owned(), "me:feat".to_owned()),
-            ]
-        );
-        assert_eq!(
-            pr_refs(&prs, "ref"),
-            [
-                ("main".to_owned(), "fix".to_owned()),
-                ("dev".to_owned(), "feat".to_owned()),
-            ]
-        );
-        assert!(pr_refs(&json!({"message": "oops"}), "ref").is_empty());
+        assert_eq!(owned_pr_numbers(&prs, "bot"), [1, 4]);
+        assert!(owned_pr_numbers(&json!({"message": "oops"}), "bot").is_empty());
+    }
+
+    /// The probe's listing filter: only a PR that is both the bot's and
+    /// conflicting counts.
+    #[test]
+    fn only_an_owned_conflicting_pr_counts() {
+        let hit = |prs: &serde_json::Value| {
+            prs.as_array()
+                .unwrap()
+                .iter()
+                .any(|pr| authored_by(pr, "bot") && conflicting(pr))
+        };
+        let mut prs = json!([
+            {"user": {"login": "bot"}, "mergeable": true},
+            {"user": {"login": "someone"}, "mergeable": false},
+        ]);
+        assert!(!hit(&prs));
+        prs.as_array_mut()
+            .unwrap()
+            .push(json!({"user": {"login": "bot"}, "mergeable": false}));
+        assert!(hit(&prs));
     }
 
     fn forge() -> Forge {
@@ -310,6 +335,7 @@ mod tests {
             kind: ForgeKind::Github,
             token: "tok".into(),
             user: String::new(),
+            login: String::new(),
             email: String::new(),
             url: "https://github.com".into(),
             enabled_repos: BTreeSet::new(),

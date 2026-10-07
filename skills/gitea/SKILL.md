@@ -50,7 +50,7 @@ If a push is rejected, stop and report it rather than working around it.
 To see your open pull requests and what reviewers have said about them:
 
 ```sh
-tea pr ls --repo <owner>/<repo> --fields index,state,head,base,title # open pull requests, with their branches
+tea pr ls --repo <owner>/<repo> --fields index,state,head,base,title,author,mergeable # open pull requests, with their branches
 tea pr <number> --comments --repo <owner>/<repo>                     # the conversation under a pull request
 ```
 

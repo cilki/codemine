@@ -134,6 +134,11 @@ pub struct Forge {
     /// token-bearing pseudo-user over HTTPS, Gitea's is the account login
     /// that `identity::resolve` reads off the forge.
     pub user: String,
+    /// The account's login on the forge, as PRs name their author; empty
+    /// until `identity::resolve` fills it from the forge's whoami endpoint,
+    /// which the main loop does before any turn runs. Distinct from `user`,
+    /// which on GitHub and GitLab is a fixed credential pseudo-user.
+    pub login: String,
     /// The email commits on this forge are authored (and committed) as;
     /// empty until `identity::resolve` fills it from the forge's whoami
     /// endpoint, which the main loop does before any turn runs.
@@ -330,6 +335,7 @@ mod tests {
             kind,
             token: "tok".into(),
             user: String::new(),
+            login: String::new(),
             email: String::new(),
             url: url.into(),
             enabled_repos: BTreeSet::new(),

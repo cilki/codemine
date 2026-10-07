@@ -102,6 +102,7 @@ pub fn resolve(
             },
         };
         forge.email = identity.email.clone();
+        forge.login = identity.login.clone();
         if forge.kind == ForgeKind::Gitea {
             forge.user = identity.login.clone();
         }
@@ -169,6 +170,7 @@ mod tests {
             kind,
             token: token.into(),
             user: user.into(),
+            login: String::new(),
             email: String::new(),
             url: "https://forge.example.com".into(),
             enabled_repos: BTreeSet::new(),
@@ -248,10 +250,13 @@ mod tests {
         }
         resolve(&mut forges).unwrap();
         // Gitea's credential-line user is the resolved login; the other
-        // forges keep their fixed pseudo-users.
+        // forges keep their fixed pseudo-users. The login lands on every
+        // forge either way.
         assert_eq!(forges[0].user, "gitea-bot");
+        assert_eq!(forges[0].login, "gitea-bot");
         assert_eq!(forges[0].email, "bot@gitea.example.com");
         assert_eq!(forges[1].user, "x-access-token");
+        assert_eq!(forges[1].login, "github-bot");
         assert_eq!(forges[1].email, "bot@github.example.com");
     }
 

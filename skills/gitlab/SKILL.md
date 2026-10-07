@@ -54,6 +54,7 @@ To see your open merge requests and what reviewers have said about them:
 ```sh
 glab mr list --repo <namespace>/<project>              # open merge requests, with their branches
 glab mr view <number> --comments --repo <namespace>/<project> # the conversation under a merge request
+glab api "projects/:id/merge_requests?state=opened&author_username=<you>" --jq '.[] | {iid, source_branch, has_conflicts}' # which of your merge requests conflict with their base
 ```
 
 When a comment points at a file or line, read that spot in the diff

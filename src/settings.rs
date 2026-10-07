@@ -187,6 +187,7 @@ impl Settings {
                 ForgeKind::Github => "x-access-token".into(),
                 ForgeKind::Gitlab => "oauth2".into(),
             },
+            login: String::new(),
             email: String::new(),
             url: forge.url(kind),
             enabled_repos: forge.enabled_repos.clone(),

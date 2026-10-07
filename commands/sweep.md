@@ -57,8 +57,10 @@ the user decide what to do.
 
 ## "rebase"
 
-- If any of your open PR branches are behind their base branch, rebase them and
-  force-push
+- If any of your own open PR branches have merge conflicts with their base
+  branch, rebase them onto the base, resolve the conflicts, and force-push
+- Leave branches that merge cleanly alone, even when they are behind their
+  base, and leave other authors' PRs alone entirely
 
 ## "bump"
 
