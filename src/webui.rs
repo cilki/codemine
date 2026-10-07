@@ -258,15 +258,18 @@ fn log_tail(status: &Shared) -> String {
         .unwrap_or(fallback)
 }
 
-/// The choices the settings form renders: the models opencode can actually
-/// resolve (an `opencode models` listing fetched once and cached, so a
-/// provider whose auth didn't load is visibly absent) and the task pool,
+/// The choices the settings form renders: the models that can actually run a
+/// turn (an `opencode models` listing fetched once and cached, narrowed to
+/// what the proxy serves, so a provider whose auth didn't load and a model
+/// the proxy won't answer for are both visibly absent) and the task pool,
 /// which comes from the embedded sweep command so the checkboxes can't drift
 /// from the prompt.
-async fn api_options() -> Json<serde_json::Value> {
-    // A cache miss shells out to opencode; keep it off the current-thread
-    // runtime so status polling stays responsive meanwhile.
-    let models = tokio::task::spawn_blocking(crate::config::models)
+async fn api_options(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let proxy = state.settings.snapshot().0.proxy;
+    // A cache miss shells out to opencode, and the narrowing makes a blocking
+    // request to the proxy; keep both off the current-thread runtime so status
+    // polling stays responsive meanwhile.
+    let models = tokio::task::spawn_blocking(move || crate::config::models(&proxy))
         .await
         .unwrap_or_default();
     Json(json!({
@@ -314,7 +317,7 @@ async fn api_put_settings(
                             return;
                         }
                         crate::config::invalidate_models();
-                        drop(crate::config::models());
+                        drop(crate::config::models(&proxy));
                     })
                     .ok();
             }

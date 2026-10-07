@@ -78,9 +78,12 @@ fn main() -> Result<()> {
     // Warm the model listing off the startup path: `opencode models` can
     // take the better part of a minute on small hosts, and the first
     // settings page load shouldn't stall for it.
+    // The listing is narrowed to what the proxy serves, so the warmup needs
+    // the proxy settings too.
+    let warm_against = store.snapshot().0.proxy;
     std::thread::Builder::new()
         .name("models".into())
-        .spawn(|| drop(config::models()))?;
+        .spawn(move || drop(config::models(&warm_against)))?;
 
     // Watch the forges for activity: a comment on a PR or issue queues that
     // repository for a feedback turn ahead of the draw, and ends the
@@ -357,8 +360,8 @@ fn runnable(
     if !blocking.is_empty() {
         return Err(blocking);
     }
-    if let Some(message) = proxy::problem(&settings.proxy) {
-        return Err(vec![Problem::new("proxy-card", message)]);
+    if let Some(problem) = proxy::problem(&settings.proxy, &settings.model) {
+        return Err(vec![problem]);
     }
     let mut cfg = settings
         .to_config(cli)
