@@ -17,16 +17,21 @@ jobs:
     - name: Build image
       run: docker build -t cilki/codemine .
     timeout-minutes: 30
-  rust-fmt:
+  rust-audit:
     runs-on: ubuntu-latest
     container: rust:latest
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    - name: Install rustfmt
-      run: rustup component add rustfmt
-    - name: Check formatting
-      run: cargo fmt -- --check
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        key: cargo-audit-cache
+        path: .cargo/
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+    - name: Run audit
+      run: cargo audit
     timeout-minutes: 10
   rust-test:
     runs-on: ubuntu-latest
