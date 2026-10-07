@@ -14,12 +14,17 @@ use crate::scan;
 use crate::status::{Activity, Outcome, Status, TurnRecord, epoch_now};
 use crate::workspace;
 
+#[derive(Default)]
 pub enum Backoff {
     /// The usage window is exhausted until this epoch.
     UsageLimit(u64),
+    #[default]
     Normal,
 }
 
+/// A turn that never started reports exactly this: nothing to back off from,
+/// nothing spent, nothing to gate on, nothing cancelled.
+#[derive(Default)]
 pub struct Report {
     pub backoff: Backoff,
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
@@ -57,12 +62,7 @@ pub fn run(
         // what does is an enabled repository the forge no longer lists —
         // renamed, deleted, or out of the token's reach.
         warn!("none of the enabled repositories are listed by their forge");
-        return Ok(Report {
-            backoff: Backoff::Normal,
-            completed: false,
-            auth_error: false,
-            canceled: false,
-        });
+        return Ok(Report::default());
     }
     // Fresh forge activity jumps the queue: the watcher saw a comment land,
     // so that repository gets a feedback turn ahead of the random draw.
@@ -97,12 +97,7 @@ pub fn run(
         })
     }) else {
         warn!("every enabled task has nothing to do on any enabled repository");
-        return Ok(Report {
-            backoff: Backoff::Normal,
-            completed: false,
-            auth_error: false,
-            canceled: false,
-        });
+        return Ok(Report::default());
     };
 
     let dir = workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo);
@@ -164,12 +159,7 @@ pub fn run(
                 log_path: log_path.clone(),
             });
         });
-        return Ok(Report {
-            backoff: Backoff::Normal,
-            completed: false,
-            auth_error: false,
-            canceled: false,
-        });
+        return Ok(Report::default());
     }
 
     // Whatever this task's answer depends on, read before the agent runs: the
@@ -372,15 +362,15 @@ const PAGE_SIZE: usize = 50;
 /// here, which is the one chokepoint every consumer draws from.
 pub fn list_repos(forge: &Forge) -> Result<Vec<String>> {
     let listed = match forge.kind {
-        ForgeKind::Gitea => list_gitea_repos(),
-        ForgeKind::Github => list_api_repos(forge, "gh", "user/repos", "full_name"),
+        ForgeKind::Gitea => list_gitea_repos()?,
+        ForgeKind::Github => list_api_repos(forge, "gh", "user/repos", "full_name")?,
         ForgeKind::Gitlab => list_api_repos(
             forge,
             "glab",
             "projects?membership=true",
             "path_with_namespace",
-        ),
-    }?;
+        )?,
+    };
     let mut repos = Vec::with_capacity(listed.len());
     for repo in listed {
         match safe_repo_path(&repo) {
@@ -420,12 +410,31 @@ fn safe_repo_path(repo: &str) -> bool {
         })
 }
 
+/// Ask for one page of a forge listing at a time until a short one ends it.
+/// Every listing here takes `PAGE_SIZE` rows and answers with fewer only on
+/// the last page, so it is the number of rows the forge sent — not what the
+/// caller manages to make of them — that decides whether to ask for another.
+/// Counting the kept values instead let one unusable row (a blank `tea`
+/// line, a JSON object without the field) read as the end of the listing and
+/// silently drop every repository after it from the pool.
+fn paginate<R>(mut page: impl FnMut(usize) -> Result<Vec<R>>) -> Result<Vec<R>> {
+    let mut rows = Vec::new();
+    for number in 1.. {
+        let batch = page(number)?;
+        let full = batch.len() >= PAGE_SIZE;
+        rows.extend(batch);
+        if !full {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
 /// `tea` prints the requested fields whitespace-separated with no header, so
 /// owner and name come back as two columns and are rejoined into the
 /// `<owner>/<repo>` path the rest of the runner expects.
 fn list_gitea_repos() -> Result<Vec<String>> {
-    let mut repos = Vec::new();
-    for page in 1.. {
+    let lines = paginate(|page| {
         let output = Command::new("tea")
             .args([
                 "repos",
@@ -451,17 +460,18 @@ fn list_gitea_repos() -> Result<Vec<String>> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let before = repos.len();
-        repos.extend(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(gitea_repo_path),
-        );
-        if repos.len() - before < PAGE_SIZE {
-            break;
-        }
-    }
-    Ok(repos)
+        // Blank lines are tea's own padding rather than listed repositories,
+        // so they don't count toward the page either way.
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect())
+    })?;
+    Ok(lines
+        .iter()
+        .filter_map(|line| gitea_repo_path(line))
+        .collect())
 }
 
 /// The `<owner>/<repo>` path from one `tea repos ls` line; None for the blank
@@ -472,42 +482,27 @@ fn gitea_repo_path(line: &str) -> Option<String> {
     fields.next().is_none().then(|| format!("{owner}/{name}"))
 }
 
-/// Page through a REST listing and pluck one field per repository; gh and
-/// glab expose the same `api` subcommand shape and authenticate from the
-/// forge's environment variables.
+/// Page through a REST listing and pluck one field per repository. gh and
+/// glab expose the same `api` subcommand shape, which `precheck::api_json`
+/// already drives — including authenticating from the forge's environment
+/// variables — so only the paging and the field belong here.
 fn list_api_repos(forge: &Forge, program: &str, path: &str, field: &str) -> Result<Vec<String>> {
     let separator = if path.contains('?') { '&' } else { '?' };
-    let mut repos = Vec::new();
-    for page in 1.. {
-        let output = Command::new(program)
-            .args([
-                "api",
-                &format!("{path}{separator}per_page={PAGE_SIZE}&page={page}"),
-            ])
-            .envs(forge.env())
-            .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("failed to run {program}"))?;
-        if !output.status.success() {
-            bail!(
-                "{program} api exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+    let rows = paginate(|page| {
+        let listing = precheck::api_json(
+            forge,
+            program,
+            &format!("{path}{separator}per_page={PAGE_SIZE}&page={page}"),
+        )?;
+        match listing {
+            serde_json::Value::Array(rows) => Ok(rows),
+            _ => bail!("{program} api returned unexpected output"),
         }
-        let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("{program} api returned unexpected output"))?;
-        let count = values.len();
-        repos.extend(
-            values
-                .iter()
-                .filter_map(|value| value[field].as_str().map(String::from)),
-        );
-        if count < PAGE_SIZE {
-            break;
-        }
-    }
-    Ok(repos)
+    })?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| row[field].as_str().map(String::from))
+        .collect())
 }
 
 /// The last `limit` bytes of the file, lossily decoded.
@@ -529,7 +524,46 @@ fn last_lines(text: &str, count: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{gitea_repo_path, last_lines, safe_repo_path};
+    use anyhow::{Result, bail};
+
+    use super::{PAGE_SIZE, gitea_repo_path, last_lines, paginate, safe_repo_path};
+
+    /// Paging is driven by what the forge sent, not by what survives the
+    /// caller's filtering: a full page of rows the caller throws away still
+    /// means there is more listing behind it. Counting the kept values made
+    /// one unusable row truncate the repository pool, and an enabled
+    /// repository that falls out of the pool silently stops being swept.
+    #[test]
+    fn paging_ends_on_a_short_page_not_on_an_unusable_row() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let rows = paginate(|page| {
+            asked.borrow_mut().push(page);
+            Ok(match page {
+                1 | 2 => vec![page; PAGE_SIZE],
+                _ => vec![page; 3],
+            })
+        })
+        .unwrap();
+        assert_eq!(*asked.borrow(), [1, 2, 3]);
+        assert_eq!(rows.len(), 2 * PAGE_SIZE + 3);
+
+        // A listing that ends on an exactly-full page costs one more, empty
+        // request rather than being guessed at.
+        let asked = std::cell::RefCell::new(0);
+        let rows = paginate(|page| {
+            *asked.borrow_mut() += 1;
+            Ok(match page {
+                1 => vec![0; PAGE_SIZE],
+                _ => Vec::new(),
+            })
+        })
+        .unwrap();
+        assert_eq!((*asked.borrow(), rows.len()), (2, PAGE_SIZE));
+
+        // A failed page fails the whole listing: a half-read pool would read
+        // as repositories the forge no longer lists.
+        assert!(paginate(|_| -> Result<Vec<usize>> { bail!("forge said no") }).is_err());
+    }
 
     /// A repository name is a path component, a URL segment, and a Landlock
     /// write root, so anything that could escape the workspace has to be
