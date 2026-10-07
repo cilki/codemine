@@ -473,8 +473,11 @@ fn setup(cli: &mut Cli) -> Result<()> {
     )?;
     prompts::install_rtk();
 
-    std::fs::create_dir_all(&cli.workspace)
-        .with_context(|| format!("failed to create {}", cli.workspace.display()))?;
+    // Owner-only: the workspace holds the repository clones, the turn logs,
+    // and (in the container image) the proxy's subscription login, none of
+    // which the runner writes itself and so none of which it can make private
+    // file by file.
+    workspace::private_dir(&cli.workspace)?;
     // Run from the workspace: everything the runner owns lives there, and
     // this way it doesn't pin whatever directory it was launched from. The
     // path is made absolute first so a relative --workspace still resolves

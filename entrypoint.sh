@@ -7,7 +7,12 @@
 set -eu
 
 dir=/workspace/cliproxyapi
+# Owner-only, like the rest of the workspace: the auth directory holds the
+# subscription's OAuth tokens, and they are the proxy's to write, not ours to
+# chmod. An existing directory is narrowed too, since a volume from before
+# this was enforced was created world-readable.
 mkdir -p "$dir/auth"
+chmod 700 "$dir" "$dir/auth"
 if [ ! -f "$dir/config.yaml" ]; then
   cat > "$dir/config.yaml" <<EOF
 config-version: 8

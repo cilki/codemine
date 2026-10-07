@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -87,14 +88,39 @@ pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    private_dir(parent)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(&serde_json::to_vec_pretty(value)?)?;
     file.write_all(b"\n")?;
     file.persist(path)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// Create a directory of the workspace, owner-only, narrowing an existing one
+/// to the same.
+///
+/// The files the runner writes itself are already owner-only (`config.json`,
+/// `git-credentials`, `skips.json`), but most of what the workspace holds is
+/// written by something else: `git clone` lays down the repository trees,
+/// opencode writes the turn logs through an inherited descriptor, and in the
+/// container image CLIProxyAPI keeps its subscription login under the same
+/// root. None of those are ours to chmod one by one, and `create_dir_all`
+/// leaves the directories above them at 0777 & ~umask — 0755 on a default
+/// umask — so every local user can walk in and read the lot. Taking the
+/// traversal bit off the directory covers everything beneath it at once.
+///
+/// Existing directories are narrowed too, not just newly created ones: a
+/// workspace made before this was enforced keeps the mode it was made with,
+/// and that is exactly the deployment with something worth reading in it.
+pub fn private_dir(path: &Path) -> Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to restrict {}", path.display()))
 }
 
 /// Make the repository's clone exist, current, and indexed, and return its
@@ -130,8 +156,7 @@ fn reclone(workspace: &Path, url: &str, dir: &Path, log: &File) -> Result<()> {
             .with_context(|| format!("failed to remove {}", dir.display()))?;
     }
     let parent = dir.parent().expect("repo dirs have parents");
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    private_dir(parent)?;
     run_logged(
         git_in(workspace, parent).args(["clone", url]).arg(dir),
         GIT_TIMEOUT,
@@ -494,6 +519,32 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A workspace directory is owner-only however it came to exist: the
+    /// clones, the turn logs, and the proxy's login underneath it are only as
+    /// private as the directories above them.
+    #[test]
+    fn workspace_directories_are_owner_only() {
+        let root = tempfile::tempdir().unwrap();
+
+        // Created from nothing, intermediate levels included.
+        let nested = root.path().join("gitea/owner");
+        private_dir(&nested).unwrap();
+        assert_eq!(mode_of(&nested), 0o700);
+        assert_eq!(mode_of(&root.path().join("gitea")), 0o700);
+
+        // And an existing world-readable one, as a workspace from before this
+        // was enforced would be.
+        let old = root.path().join("logs");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&old).unwrap();
+        assert_eq!(mode_of(&old), 0o700);
+    }
 
     /// git with a fixed identity, so the test doesn't depend on whatever
     /// the machine has configured.

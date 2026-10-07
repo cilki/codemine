@@ -1,7 +1,8 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -168,7 +169,7 @@ pub fn run(
     };
 
     let started = epoch_now();
-    let (log_path, mut log) = open_log(cfg, started)?;
+    let (log_path, mut log) = open_log(&cfg.workspace.join("logs"), started)?;
     let turn = Turn {
         task,
         forge,
@@ -305,16 +306,23 @@ fn pick<'a>(
 /// Create the turn's log and the directory it lives in. Opened for reading as
 /// well as writing: the runner tails the same handle for the page while the
 /// agent appends to it.
-fn open_log(cfg: &Config, started: u64) -> Result<(PathBuf, File)> {
-    let logs_dir = cfg.workspace.join("logs");
-    std::fs::create_dir_all(&logs_dir)
-        .with_context(|| format!("failed to create {}", logs_dir.display()))?;
+///
+/// Owner-only, like the directory holding it. A turn log is the agent's whole
+/// session transcript — the contents of a private repository, the output of
+/// every command it ran, and whatever of its environment a tool happened to
+/// print — and the runner's own secrets are already kept out of reach of
+/// other local users, so this must not be the way back in. The mode applies
+/// only on creation, which is every log: `setup` clears the directory at
+/// startup, so a name can never be reused.
+fn open_log(logs_dir: &Path, started: u64) -> Result<(PathBuf, File)> {
+    workspace::private_dir(logs_dir)?;
     let path = logs_dir.join(format!("{started}.log"));
     let log = File::options()
         .create(true)
         .truncate(true)
         .read(true)
         .write(true)
+        .mode(0o600)
         .open(&path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     Ok((path, log))
@@ -703,8 +711,8 @@ mod tests {
     use anyhow::{Result, bail};
 
     use super::{
-        ExitStatus, Outcome, PAGE_SIZE, Verdict, gitea_repo_path, last_lines, outcome_of, paginate,
-        safe_repo_path,
+        ExitStatus, Outcome, PAGE_SIZE, Verdict, gitea_repo_path, last_lines, open_log, outcome_of,
+        paginate, safe_repo_path,
     };
 
     fn verdict(completed: bool, errored: bool) -> Verdict {
@@ -819,6 +827,23 @@ mod tests {
         // A failed page fails the whole listing: a half-read pool would read
         // as repositories the forge no longer lists.
         assert!(paginate(|_| -> Result<Vec<usize>> { bail!("forge said no") }).is_err());
+    }
+
+    /// The log and the directory under it are both closed to other local
+    /// users: a transcript of a private repository's build and review is not
+    /// public reading just because it landed on disk.
+    #[test]
+    fn the_turn_log_and_its_directory_are_owner_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let logs = workspace.path().join("logs");
+        let (path, _file) = open_log(&logs, 1_700_000_000).unwrap();
+        assert!(path.starts_with(&logs));
+        fn mode(path: &std::path::Path) -> u32 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+        assert_eq!(mode(&logs), 0o700, "{:o}", mode(&logs));
+        assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
     }
 
     /// A repository name is a path component, a URL segment, and a Landlock
