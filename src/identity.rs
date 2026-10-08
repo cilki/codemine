@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::{Forge, ForgeKind};
-use crate::precheck::{api_json, gitea_json};
+use crate::precheck::forge_json;
 
 /// The account a forge token authenticates as.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -112,12 +112,8 @@ pub fn resolve(
 }
 
 fn whoami(forge: &Forge) -> Result<Identity> {
-    let value = match forge.kind {
-        ForgeKind::Gitea => gitea_json(forge, "user")?,
-        ForgeKind::Github => api_json(forge, "gh", "user")?,
-        ForgeKind::Gitlab => api_json(forge, "glab", "user")?,
-    };
-    parse_identity(forge.kind, &value)
+    // Every forge spells its whoami endpoint the same way.
+    parse_identity(forge.kind, &forge_json(forge, "user", "user", "user")?)
 }
 
 /// The login and email out of a whoami response. A present-but-empty field

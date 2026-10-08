@@ -156,16 +156,10 @@ fn fresh(
 /// answered for. An event therefore can never queue work the turn's own
 /// precondition would have rejected.
 pub fn unread(forge: &Forge) -> Result<BTreeMap<String, String>> {
-    let feed = match forge.kind {
-        ForgeKind::Gitea => crate::precheck::gitea_json(forge, "notifications")?,
-        ForgeKind::Github => crate::precheck::api_json(forge, "gh", "notifications")?,
-        ForgeKind::Gitlab => crate::precheck::api_json(forge, "glab", "todos")?,
-    };
+    let feed = crate::precheck::forge_json(forge, "notifications", "notifications", "todos")?;
     Ok(match forge.kind {
-        ForgeKind::Gitea | ForgeKind::Github => {
-            digest(&feed, &["repository", "full_name"], "updated_at")
-        }
         ForgeKind::Gitlab => digest(&feed, &["project", "path_with_namespace"], "created_at"),
+        _ => digest(&feed, &["repository", "full_name"], "updated_at"),
     })
 }
 

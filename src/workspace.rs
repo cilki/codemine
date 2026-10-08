@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -23,6 +24,25 @@ const CODEGRAPH_INIT_TIMEOUT: Duration = Duration::from_secs(1800);
 /// Where a repository lives in the workspace; `repo` is `<owner>/<repo>`.
 pub fn repo_dir(root: &Path, forge_slug: &str, repo: &str) -> PathBuf {
     root.join(forge_slug).join(repo)
+}
+
+/// Atomically write `value` as pretty JSON, for the state the runner keeps at
+/// the workspace root: the settings and the skip cache. The temp file is
+/// created next to the target so the rename can't cross filesystems, and it
+/// carries `tempfile`'s owner-only mode — which is what keeps the forge
+/// tokens in `config.json` out of reach of other local users.
+pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    file.write_all(b"\n")?;
+    file.persist(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 /// Make the repository's clone exist, current, and indexed, and return its

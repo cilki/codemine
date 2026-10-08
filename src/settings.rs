@@ -3,7 +3,6 @@
 //! changes apply at the next turn boundary.
 
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -420,26 +419,9 @@ impl SettingsStore {
         let mut inner = self.lock();
         let mut candidate = inner.0.clone();
         f(&mut candidate)?;
-        self.persist(&candidate)?;
+        crate::workspace::write_json(&self.path, &candidate)?;
         inner.0 = candidate;
         inner.1 += 1;
-        Ok(())
-    }
-
-    /// Atomic 0600 write: the temp file is created next to the target (same
-    /// filesystem, so the rename is atomic) with owner-only permissions.
-    fn persist(&self, settings: &Settings) -> Result<()> {
-        let parent = self
-            .path
-            .parent()
-            .with_context(|| format!("{} has no parent directory", self.path.display()))?;
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-        let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        file.write_all(&serde_json::to_vec_pretty(settings)?)?;
-        file.write_all(b"\n")?;
-        file.persist(&self.path)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
         Ok(())
     }
 
