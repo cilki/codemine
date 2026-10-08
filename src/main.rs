@@ -39,7 +39,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Cli, Config, ForgeKind, USAGE};
 use crate::settings::{Problem, Settings, SettingsStore};
-use crate::status::{Activity, Allowance, Shared, Status};
+use crate::status::{Activity, Shared, Status};
 use crate::turn::Backoff;
 
 fn main() -> Result<()> {
@@ -87,14 +87,6 @@ fn main() -> Result<()> {
     let pending = events::Pending::new();
     events::spawn(store.clone(), pending.clone())?;
 
-    // Turns available to spend right now. The bucket refills at the
-    // configured rate and holds at most an hour's worth, so a limit of 2
-    // runs two turns back to back and then one every half hour. It starts
-    // full, whatever limit is configured later, and is resized in step with
-    // the limit it was last sized against.
-    let mut allowance = f64::INFINITY;
-    let mut sized_for: Option<f64> = None;
-    let mut refilled = status::epoch_now();
     let mut applied_generation = None;
     // The epoch until which turns are held after one died on proxy auth: a
     // short flat pause, since refreshing is CLIProxyAPI's continuous job and
@@ -169,43 +161,28 @@ fn main() -> Result<()> {
             continue;
         }
 
-        // An edited limit resizes the bucket instead of waiting for the old
-        // one to run out: raising it hands the extra turns over now, and
-        // lowering it spills what no longer fits. An unlimited stretch isn't
-        // accounted for at all — the allowance only drains over one — so a
-        // limit set afterwards starts from a full bucket.
-        if cfg.hourly_limit != sized_for {
-            allowance = match (sized_for, cfg.hourly_limit) {
-                (Some(old), Some(new)) => resized(allowance, capacity(old), capacity(new)),
-                (None, Some(new)) => capacity(new),
-                (_, None) => allowance,
-            };
-            sized_for = cfg.hourly_limit;
-        }
-
+        // Bring the bucket up to date and ask whether it can pay for a turn:
+        // an edited limit resizes it rather than waiting for the old one to
+        // run out, and its clock advances every pass, so the time it grew
+        // for is counted once whether or not this pass gets to run a turn.
+        // The bucket is the one in the shared status, which the web UI
+        // resizes too — see `status::Bucket`.
         let now = status::epoch_now();
-        // The bucket's clock advances every pass, so the time it grew for is
-        // counted once whether or not this pass gets to run a turn.
-        let since = std::mem::replace(&mut refilled, now);
-        if let Some(limit) = cfg.hourly_limit {
-            allowance = refill(allowance, since, now, limit);
-            Status::update(&status, |s| s.allowance = Some(spendable(allowance, limit)));
-            if allowance < 1.0 {
-                // Whole seconds rounded up, so the wait can't expire a hair
-                // early and spin the loop.
-                let left = ((1.0 - allowance) * HOUR / limit).ceil() as u64;
-                Status::update(&status, |s| {
-                    s.activity = Activity::RateLimited { until: now + left }
-                });
-                once_only(&cli, "the hourly limit is spent")?;
-                // Sleep in slices and fall back into the loop, cut short by
-                // an edit, so a limit raised in the web UI applies at once
-                // instead of at the end of the wait.
-                wait(left.min(60), 1, || store.generation() != generation);
-                continue;
-            }
-        } else {
-            Status::update(&status, |s| s.allowance = None);
+        let hold = Status::update(&status, |s| {
+            s.allowance.resize(cfg.hourly_limit);
+            s.allowance.refill(now);
+            s.allowance.hold()
+        });
+        if let Some(left) = hold {
+            Status::update(&status, |s| {
+                s.activity = Activity::RateLimited { until: now + left }
+            });
+            once_only(&cli, "the hourly limit is spent")?;
+            // Sleep in slices and fall back into the loop, cut short by an
+            // edit, so a limit raised in the web UI applies at once instead
+            // of at the end of the wait.
+            wait(left.min(60), 1, || store.generation() != generation);
+            continue;
         }
 
         match turn::run(&cfg, &status, &pending, &cache) {
@@ -220,10 +197,10 @@ fn main() -> Result<()> {
                     Status::update(&status, |s| s.oauth_gated_until = Some(until));
                 }
                 if report.completed {
-                    allowance -= 1.0;
-                    if let Some(limit) = cfg.hourly_limit {
-                        let left = spendable(allowance, limit);
-                        Status::update(&status, |s| s.allowance = Some(left));
+                    let left = Status::update(&status, |s| s.allowance.spend());
+                    // Both are Some together: the bucket only spends under a
+                    // limit, which is also the only case worth logging.
+                    if let (Some(left), Some(limit)) = (left, cfg.hourly_limit) {
                         info!(
                             "{:.1} of {} turns left at {limit}/hour",
                             left.available, left.capacity
@@ -252,8 +229,6 @@ fn main() -> Result<()> {
         }
     }
 }
-
-const HOUR: f64 = 3600.0;
 
 /// How long the loop waits before looking again while something blocks turns
 /// from running. The web UI is how those get fixed, so this is also how long
@@ -360,38 +335,6 @@ fn runnable(
 /// and short: refreshing is the proxy's continuous job, so either the blip
 /// passes on its own or the health check surfaces what a human must fix.
 const AUTH_RETRY: u64 = 5 * 60;
-
-/// How many turns the bucket holds when full: an hour's worth, but never
-/// less than one, so a fractional limit still lets a turn through — 0.5 an
-/// hour is one turn every two hours rather than none at all.
-fn capacity(limit: f64) -> f64 {
-    limit.floor().max(1.0)
-}
-
-/// The bucket as the page shows it. The allowance is clamped at zero: a turn
-/// that just spent the last of it leaves a hair less than none behind, and
-/// "-0.0 of 2" reads as a bug.
-fn spendable(allowance: f64, limit: f64) -> Allowance {
-    Allowance {
-        available: allowance.max(0.0),
-        capacity: capacity(limit),
-    }
-}
-
-/// The allowance grown for the time since it was last topped up, capped at
-/// the bucket's capacity so an idle runner banks at most one hour.
-fn refill(allowance: f64, since: u64, now: u64, limit: f64) -> f64 {
-    let earned = now.saturating_sub(since) as f64 * limit / HOUR;
-    (allowance + earned).min(capacity(limit))
-}
-
-/// What the bucket holds after its capacity changes from `was` to `now`:
-/// the growth is handed over at once, so a raised limit buys turns now
-/// rather than an hour from now, and whatever a shrunken bucket can't hold
-/// spills.
-pub fn resized(allowance: f64, was: f64, now: f64) -> f64 {
-    (allowance + (now - was).max(0.0)).min(now)
-}
 
 /// Sleep up to `seconds`, waking every `slice` seconds to ask `interrupt`
 /// whether the wait still applies. Every pause the runner takes was computed
@@ -720,43 +663,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_bucket_allows_a_burst_then_the_rate() {
-        // Two an hour: two turns in hand at once, one back every half hour.
-        assert_eq!(capacity(2.0), 2.0);
-        let full = refill(f64::INFINITY, 0, 0, 2.0);
-        assert_eq!(full, 2.0);
-        let spent = full - 2.0;
-        assert_eq!(refill(spent, 100, 100, 2.0), 0.0);
-        assert_eq!(refill(spent, 100, 100 + 1800, 2.0), 1.0);
-        // An idle day banks an hour's worth and not a turn more.
-        assert_eq!(refill(spent, 0, 86_400, 2.0), 2.0);
-    }
-
-    #[test]
-    fn a_fractional_limit_holds_one_turn() {
-        assert_eq!(capacity(0.5), 1.0);
-        assert_eq!(refill(0.0, 0, 3600, 0.5), 0.5);
-        assert_eq!(refill(0.0, 0, 7200, 0.5), 1.0);
-        assert_eq!(refill(0.0, 0, 86_400, 0.5), 1.0);
-    }
-
-    #[test]
-    fn a_changed_limit_resizes_the_bucket() {
-        // Spent out at one an hour, then raised to four: the three turns the
-        // new limit adds are in hand right away, not an hour from now.
-        assert_eq!(resized(0.0, capacity(1.0), capacity(4.0)), 3.0);
-        // A full bucket grows with the limit and stops at the new ceiling.
-        assert_eq!(resized(1.0, capacity(1.0), capacity(4.0)), 4.0);
-        // A raise too small to fit another turn hands over nothing; the wait
-        // still shortens, since the bucket refills faster.
-        assert_eq!(resized(0.0, capacity(1.0), capacity(1.5)), 0.0);
-        // Lowered: what the bucket can no longer hold spills, and what fits
-        // stays — slowing down mid-hour doesn't bank a debt.
-        assert_eq!(resized(4.0, capacity(4.0), capacity(1.0)), 1.0);
-        assert_eq!(resized(0.5, capacity(4.0), capacity(1.0)), 0.5);
-    }
-
     /// Every hold the runner takes goes through `wait`, so both halves of it
     /// matter: the interrupt is consulted before anything is slept, and again
     /// at each hop, so a wait that stops applying ends there rather than at
@@ -879,15 +785,5 @@ mod tests {
         assert!(err.to_string().contains("model is not set"), "{err}");
         // The long-running runner keeps going and retries instead.
         assert!(once_only(&cli(&[]), "model is not set").is_ok());
-    }
-
-    #[test]
-    fn the_bucket_never_shows_a_negative_allowance() {
-        // The turn that spends the last whole turn leaves a sliver behind.
-        let left = spendable(-0.000_001, 2.0);
-        assert_eq!(left.available, 0.0);
-        assert_eq!(left.capacity, 2.0);
-        // A fractional limit still holds one turn, so the page reads "1 / 1".
-        assert_eq!(spendable(1.0, 0.25).capacity, 1.0);
     }
 }

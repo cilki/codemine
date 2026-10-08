@@ -127,12 +127,123 @@ pub enum Activity {
     },
 }
 
-/// The turn budget the hourly limit hands out: how many turns may start
-/// right now, out of how many the bucket holds when full.
+/// The turn budget the hourly limit hands out, as the page reads it: how
+/// many turns may start right now, out of how many the bucket holds when
+/// full.
 #[derive(Serialize, Clone, Copy)]
 pub struct Allowance {
     pub available: f64,
     pub capacity: f64,
+}
+
+const HOUR: f64 = 3600.0;
+
+/// The hourly limit's token bucket. It refills at the configured rate and
+/// holds at most an hour's worth, so a limit of 2 runs two turns back to
+/// back and then one every half hour.
+///
+/// It lives in the shared status rather than in the main loop because the
+/// loop sits inside a turn for hours at a time: a limit edited in the web UI
+/// has to resize the bucket there and then, not at the next turn boundary.
+/// So both sides spend and resize the one bucket, where the loop used to own
+/// the real figures and the page a mirror of them that the UI resized with a
+/// second copy of the same arithmetic.
+#[derive(Clone, Copy)]
+pub struct Bucket {
+    /// Turns in hand. Meaningless while `limit` is None: an unlimited
+    /// stretch isn't accounted for at all, and the limit set after one
+    /// starts the bucket full.
+    available: f64,
+    /// The limit the bucket is currently sized against; None means turns run
+    /// back to back.
+    limit: Option<f64>,
+    /// When the bucket was last topped up, epoch seconds.
+    refilled: u64,
+}
+
+/// Serialized as the `allowance` the page reads: the figures while a limit
+/// applies, `null` while none does.
+impl Serialize for Bucket {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.allowance().serialize(serializer)
+    }
+}
+
+impl Bucket {
+    /// An unlimited bucket, its clock started; the first limit to arrive
+    /// fills it.
+    pub fn new() -> Bucket {
+        Bucket {
+            available: 0.0,
+            limit: None,
+            refilled: epoch_now(),
+        }
+    }
+
+    /// How many turns the bucket holds when full: an hour's worth, but never
+    /// less than one, so a fractional limit still lets a turn through — 0.5
+    /// an hour is one turn every two hours rather than none at all.
+    fn capacity(limit: f64) -> f64 {
+        limit.floor().max(1.0)
+    }
+
+    /// Size the bucket against `limit` instead of waiting for the old one to
+    /// run out: the growth is handed over at once, so a raised limit buys
+    /// turns now rather than an hour from now, and whatever a shrunken bucket
+    /// can't hold spills. A limit that hasn't moved changes nothing.
+    pub fn resize(&mut self, limit: Option<f64>) {
+        if limit == self.limit {
+            return;
+        }
+        if let Some(new) = limit {
+            let new = Self::capacity(new);
+            self.available = match self.limit {
+                // An unlimited stretch drains nothing, so there is no
+                // accounting to carry into the limit that follows it.
+                None => new,
+                Some(old) => (self.available + (new - Self::capacity(old)).max(0.0)).min(new),
+            };
+        }
+        self.limit = limit;
+    }
+
+    /// Grow the bucket for the time since it was last topped up, capped at
+    /// its capacity so an idle runner banks at most one hour. The clock
+    /// advances whether or not a limit applies, so the time it grew for is
+    /// counted exactly once.
+    pub fn refill(&mut self, now: u64) {
+        let since = std::mem::replace(&mut self.refilled, now);
+        if let Some(limit) = self.limit {
+            let earned = now.saturating_sub(since) as f64 * limit / HOUR;
+            self.available = (self.available + earned).min(Self::capacity(limit));
+        }
+    }
+
+    /// How long until a turn may start, in whole seconds rounded up so the
+    /// wait can't expire a hair early and spin the loop; None when one may
+    /// start right now.
+    pub fn hold(&self) -> Option<u64> {
+        let limit = self.limit?;
+        (self.available < 1.0).then(|| ((1.0 - self.available) * HOUR / limit).ceil() as u64)
+    }
+
+    /// Take one turn out of the bucket and report what is left; None when no
+    /// limit applies and there was nothing to spend. Clamped at zero: the
+    /// turn that spends the last of it leaves a hair less than none behind,
+    /// and "-0.0 of 2" reads as a bug.
+    pub fn spend(&mut self) -> Option<Allowance> {
+        self.limit?; // nothing is accounted for while turns run back to back
+        self.available = (self.available - 1.0).max(0.0);
+        self.allowance()
+    }
+
+    /// The figures the page shows, or None while turns run back to back.
+    pub fn allowance(&self) -> Option<Allowance> {
+        self.limit.map(|limit| Allowance {
+            available: self.available,
+            capacity: Self::capacity(limit),
+        })
+    }
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -159,9 +270,10 @@ pub struct Status {
     /// clears the flag when the next turn starts.
     #[serde(skip)]
     pub cancel_requested: bool,
-    /// The hourly limit's bucket, as the page shows it; None when no limit
-    /// is configured and turns run back to back.
-    pub allowance: Option<Allowance>,
+    /// The hourly limit's bucket, which the main loop spends from and the
+    /// web UI resizes; serialized as the figures the page shows, or null
+    /// when no limit is configured and turns run back to back.
+    pub allowance: Bucket,
     pub totals: Totals,
     /// Every turn finished since startup, newest first; the process owns no
     /// history across restarts, so this is the whole list the UI shows.
@@ -186,7 +298,7 @@ impl Shared {
                 activity: Activity::Starting,
                 paused: false,
                 cancel_requested: false,
-                allowance: None,
+                allowance: Bucket::new(),
                 totals: Totals::default(),
                 turns: VecDeque::new(),
                 log_tail: String::new(),
@@ -199,11 +311,15 @@ impl Shared {
 }
 
 impl Status {
-    /// Lock and mutate, then wake the web UI. The lock is released before the
-    /// wakeup so a subscriber can read the new state immediately.
-    pub fn update(shared: &Shared, f: impl FnOnce(&mut Status)) {
-        f(&mut shared.lock());
+    /// Lock and mutate, then wake the web UI, handing back whatever the
+    /// mutation worked out — the bucket's remaining hold, say, which the
+    /// caller would otherwise have to take the lock a second time to read.
+    /// The lock is released before the wakeup so a subscriber can read the
+    /// new state immediately.
+    pub fn update<T>(shared: &Shared, f: impl FnOnce(&mut Status) -> T) -> T {
+        let value = f(&mut shared.lock());
         shared.changes.send_modify(|revision| *revision += 1);
+        value
     }
 
     pub fn record_turn(&mut self, record: TurnRecord) {
@@ -267,5 +383,153 @@ mod tests {
         assert_eq!(status.totals.completed, 60);
         assert_eq!(status.totals.skipped, 1);
         assert_eq!(status.totals.tokens.input, 61 * 10);
+    }
+
+    /// A bucket whose clock starts at epoch zero, so a `refill` is a plain
+    /// "this many seconds have passed".
+    fn limited(limit: f64) -> Bucket {
+        let mut bucket = Bucket {
+            available: 0.0,
+            limit: None,
+            refilled: 0,
+        };
+        bucket.resize(Some(limit));
+        bucket
+    }
+
+    fn spendable(bucket: &Bucket) -> (f64, f64) {
+        let allowance = bucket
+            .allowance()
+            .expect("a limited bucket has an allowance");
+        (allowance.available, allowance.capacity)
+    }
+
+    #[test]
+    fn the_bucket_allows_a_burst_then_the_rate() {
+        // Two an hour: two turns in hand at once, one back every half hour.
+        let mut bucket = limited(2.0);
+        assert_eq!(spendable(&bucket), (2.0, 2.0));
+        bucket.spend();
+        bucket.spend();
+        bucket.refill(0);
+        assert_eq!(spendable(&bucket), (0.0, 2.0));
+        bucket.refill(1800);
+        assert_eq!(spendable(&bucket), (1.0, 2.0));
+        // An idle day banks an hour's worth and not a turn more.
+        bucket.refill(86_400);
+        assert_eq!(spendable(&bucket), (2.0, 2.0));
+    }
+
+    #[test]
+    fn a_fractional_limit_holds_one_turn() {
+        // Half a turn an hour still buys a bucket of one, filled over two.
+        let mut bucket = limited(0.5);
+        assert_eq!(spendable(&bucket), (1.0, 1.0));
+        bucket.spend();
+        bucket.refill(3600);
+        assert_eq!(spendable(&bucket), (0.5, 1.0));
+        bucket.refill(7200);
+        assert_eq!(spendable(&bucket), (1.0, 1.0));
+        bucket.refill(86_400);
+        assert_eq!(spendable(&bucket), (1.0, 1.0));
+    }
+
+    #[test]
+    fn a_changed_limit_resizes_the_bucket() {
+        // Spent out at one an hour, then raised to four: the three turns the
+        // new limit adds are in hand right away, not an hour from now.
+        let mut bucket = limited(1.0);
+        bucket.spend();
+        bucket.resize(Some(4.0));
+        assert_eq!(spendable(&bucket), (3.0, 4.0));
+
+        // A full bucket grows with the limit and stops at the new ceiling.
+        let mut bucket = limited(1.0);
+        bucket.resize(Some(4.0));
+        assert_eq!(spendable(&bucket), (4.0, 4.0));
+
+        // A raise too small to fit another turn hands over nothing; the wait
+        // still shortens, since the bucket refills faster.
+        let mut bucket = limited(1.0);
+        bucket.spend();
+        bucket.resize(Some(1.5));
+        assert_eq!(spendable(&bucket), (0.0, 1.0));
+
+        // Lowered: what the bucket can no longer hold spills, and what fits
+        // stays — slowing down mid-hour doesn't bank a debt.
+        let mut bucket = limited(4.0);
+        bucket.resize(Some(1.0));
+        assert_eq!(spendable(&bucket), (1.0, 1.0));
+        let mut bucket = limited(4.0);
+        for _ in 0..4 {
+            bucket.spend();
+        }
+        bucket.refill(450); // half a turn, at four an hour
+        bucket.resize(Some(1.0));
+        assert_eq!(spendable(&bucket), (0.5, 1.0));
+
+        // An unlimited stretch isn't accounted for at all, so the limit set
+        // after one starts from a full bucket however spent it was before.
+        let mut bucket = limited(4.0);
+        for _ in 0..4 {
+            bucket.spend();
+        }
+        bucket.resize(None);
+        assert!(bucket.allowance().is_none());
+        assert!(bucket.spend().is_none());
+        bucket.resize(Some(2.0));
+        assert_eq!(spendable(&bucket), (2.0, 2.0));
+    }
+
+    #[test]
+    fn an_empty_bucket_holds_until_the_next_turn_accrues() {
+        // A turn in hand is no hold at all.
+        let mut bucket = limited(2.0);
+        assert_eq!(bucket.hold(), None);
+        // Spent out at two an hour: the next turn is half an hour off, less
+        // whatever has already been waited out.
+        bucket.spend();
+        bucket.spend();
+        assert_eq!(bucket.hold(), Some(1800));
+        bucket.refill(900);
+        assert_eq!(bucket.hold(), Some(900));
+
+        // A fractional limit stretches the wait rather than denying the turn.
+        let mut slow = limited(0.5);
+        slow.spend();
+        assert_eq!(slow.hold(), Some(7200));
+
+        // No limit, no hold, whatever the bucket happens to hold.
+        slow.resize(None);
+        assert_eq!(slow.hold(), None);
+    }
+
+    /// The turn that spends the last whole turn can leave a sliver behind;
+    /// "-0.0 of 2" reads as a bug on the page.
+    #[test]
+    fn the_bucket_never_shows_a_negative_allowance() {
+        let mut bucket = Bucket {
+            available: 1.0 - f64::EPSILON,
+            limit: Some(2.0),
+            refilled: 0,
+        };
+        let left = bucket.spend().expect("a limited bucket spends a turn");
+        assert_eq!((left.available, left.capacity), (0.0, 2.0));
+        // A fractional limit still reads "1 / 1" rather than "1 / 0.25".
+        assert_eq!(spendable(&limited(0.25)), (1.0, 1.0));
+    }
+
+    /// The page reads the bucket under the name the mirror used to carry:
+    /// the figures while a limit applies, null while none does.
+    #[test]
+    fn the_bucket_serializes_as_the_pages_allowance() {
+        let shared = Shared::new();
+        let idle = serde_json::to_value(&*shared.lock()).unwrap();
+        assert!(idle["allowance"].is_null());
+
+        Status::update(&shared, |s| s.allowance.resize(Some(3.0)));
+        let limited = serde_json::to_value(&*shared.lock()).unwrap();
+        assert_eq!(limited["allowance"]["capacity"], 3.0);
+        assert_eq!(limited["allowance"]["available"], 3.0);
     }
 }

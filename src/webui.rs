@@ -25,7 +25,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::ForgeKind;
 use crate::settings::{Settings, SharedSettings};
-use crate::status::{Activity, Allowance, Shared, Status, epoch_now};
+use crate::status::{Activity, Shared, Status, epoch_now};
 
 /// How often the live log tail is re-read and the host details refreshed.
 /// Status updates are pushed the moment they happen; a log file growing or a
@@ -318,20 +318,12 @@ async fn api_put_settings(
                     })
                     .ok();
             }
-            // The main loop only mirrors the bucket into the status at the
-            // next turn boundary; reflect the new ceiling now so the page's
-            // counter doesn't lag a running turn. The bucket is resized the
-            // same way the loop resizes it — a raised limit is spendable
-            // immediately, a lowered one spills what no longer fits.
-            let capacity = settings.hourly_limit.map(crate::capacity);
-            Status::update(&state.status, |s| {
-                s.allowance = capacity.map(|capacity| Allowance {
-                    available: s.allowance.map_or(capacity, |held| {
-                        crate::resized(held.available, held.capacity, capacity)
-                    }),
-                    capacity,
-                })
-            });
+            // The main loop is inside a turn for hours at a time, so the new
+            // ceiling has to land now rather than at the next turn boundary
+            // — a raised limit is spendable immediately, a lowered one
+            // spills what no longer fits. This is the loop's own bucket, so
+            // it needs no arithmetic of its own.
+            Status::update(&state.status, |s| s.allowance.resize(settings.hourly_limit));
             Json(settings.redacted()).into_response()
         }
         Err(err) => (
