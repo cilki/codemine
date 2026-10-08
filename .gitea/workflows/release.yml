@@ -5,7 +5,7 @@ on:
     - v*
 jobs:
   docker-release:
-    runs-on: ubuntu-latest
+    runs-on: tcc-build
     env:
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
@@ -20,7 +20,7 @@ jobs:
       run: docker push cilki/codemine
     timeout-minutes: 30
   rust-release:
-    runs-on: ubuntu-latest
+    runs-on: tcc-build
     container: rust:latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
