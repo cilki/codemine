@@ -376,6 +376,19 @@ fn init_logging() {
 
 /// One-time startup work that doesn't depend on the mutable settings.
 fn setup(cli: &mut Cli) -> Result<()> {
+    // Pin one answer to "where is home" into the environment before anything
+    // reads it. Every tool the runner spawns resolves it for itself, and they
+    // do not all agree with `config::home()` when `$HOME` is unset — which is
+    // how a systemd unit without `User=` runs. `tea` then keeps the forge
+    // login in `/.config/tea`, at the filesystem root, while opencode's
+    // config directory, the agent's caches and the sandbox's write allowlist
+    // are all built from `/root`: the agent can read that login but Landlock
+    // denies writing it, and it sits outside the workspace that is supposed
+    // to hold everything durable.
+    // SAFETY: setup() runs before the web UI and agent threads exist, so no
+    // other thread can be touching the environment.
+    unsafe { std::env::set_var("HOME", config::home()) };
+
     // Install the embedded prompts where opencode resolves commands and
     // skills by name, so the binary works without the image copying them,
     // retire whatever the opencode-claude-auth era left behind (plugin
@@ -422,7 +435,7 @@ fn setup(cli: &mut Cli) -> Result<()> {
             .with_context(|| format!("failed to clear {}", logs.display()))?;
     }
 
-    let gitconfig = install_git_config(cli)?;
+    let gitconfig = install_git_config(cli, &config::home())?;
     // SAFETY: setup() runs before the web UI and agent threads exist, so no
     // other thread can be touching the environment.
     unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &gitconfig) };
@@ -436,12 +449,17 @@ fn setup(cli: &mut Cli) -> Result<()> {
 /// inherits the variable. The real global config is chained in with
 /// `include.path`, so the user's identity and everything else they set still
 /// applies; git ignores the include when the file isn't there.
-fn install_git_config(cli: &Cli) -> Result<PathBuf> {
+fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
     let path = cli.workspace.join("gitconfig");
-    let mut config = String::new();
-    if let Ok(home) = std::env::var("HOME") {
-        config.push_str(&format!("[include]\n\tpath = {home}/.gitconfig\n"));
-    }
+    // The home directory is passed in, resolved by `config::home()`, rather
+    // than read straight out of the environment here: that dropped the
+    // include altogether whenever `$HOME` was unset — silently losing the
+    // user's git identity and everything else they configured, on exactly
+    // the deployments that have no `$HOME`.
+    let mut config = format!(
+        "[include]\n\tpath = {}\n",
+        home.join(".gitconfig").display()
+    );
     config.push_str(&format!(
         "[credential]\n\thelper = store --file={}\n",
         git_credentials(cli).display()
@@ -606,6 +624,41 @@ fn iso8601(epoch: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config the runner hands every git it spawns, `opencode`'s
+    /// included, via `GIT_CONFIG_GLOBAL`: it has to carry the credential
+    /// helper (nothing can push without it) and chain in the real global
+    /// config, which is the only way the user's own git settings survive the
+    /// variable being overridden. The include used to be conditional on
+    /// `$HOME` being in the environment, so the deployments that have no
+    /// `$HOME` were the ones that silently lost it.
+    #[test]
+    fn the_git_config_chains_the_users_own() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cli = Cli::parse(
+            [
+                "codemine",
+                "--workspace",
+                &workspace.path().display().to_string(),
+            ]
+            .map(String::from)
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let path = install_git_config(&cli, std::path::Path::new("/home/bot")).unwrap();
+        assert_eq!(path, workspace.path().join("gitconfig"));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("path = /home/bot/.gitconfig"), "{written}");
+        assert!(
+            written.contains(&format!(
+                "helper = store --file={}",
+                git_credentials(&cli).display()
+            )),
+            "{written}"
+        );
+    }
 
     #[test]
     fn the_bucket_allows_a_burst_then_the_rate() {

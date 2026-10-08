@@ -258,14 +258,29 @@ impl Cli {
 }
 
 /// The current user's home directory, falling back to the container's when
-/// `$HOME` is unset (a bare `docker run` with no user).
+/// `$HOME` says nothing useful: a systemd unit without `User=` is given no
+/// `$HOME` at all, and a bare `docker run` with no user is the same story.
 pub fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()))
+    home_of(std::env::var_os("HOME"))
 }
 
-/// An XDG base directory: the value of `$var` if set, else `home()/default`.
+/// `home()`'s decision, taken apart from the environment so it can be tested
+/// without mutating it. An empty value counts as no value: taken literally it
+/// yields a relative path, and every path the runner derives from home —
+/// opencode's config directory, the sandbox's write allowlist, the default
+/// workspace — would then mean whatever directory the runner happens to be
+/// in rather than a fixed place on disk.
+fn home_of(var: Option<std::ffi::OsString>) -> PathBuf {
+    var.filter(|home| !home.is_empty())
+        .unwrap_or_else(|| "/root".into())
+        .into()
+}
+
+/// An XDG base directory: the value of `$var` if it has one, else
+/// `home()/default`. Empty is no value here too, for the same reason.
 pub fn xdg_dir(var: &str, default: &str) -> PathBuf {
     std::env::var_os(var)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(default))
 }
@@ -312,6 +327,24 @@ mod tests {
         assert!(parse(&["--listen"]).is_err());
         assert!(parse(&["--listen", "nonsense"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+    }
+
+    /// Everything the runner puts outside the workspace hangs off `home()`,
+    /// so it has to answer with an absolute path whatever the environment
+    /// says — including the two spellings of "nothing".
+    #[test]
+    fn home_is_absolute_even_with_nothing_to_go_on() {
+        assert_eq!(
+            home_of(Some("/home/bot".into())),
+            PathBuf::from("/home/bot")
+        );
+        assert_eq!(home_of(None), PathBuf::from("/root"));
+        // `HOME=` in a unit file or a compose environment block is set but
+        // empty, which as a path is relative to the current directory.
+        assert_eq!(home_of(Some("".into())), PathBuf::from("/root"));
+        for var in [None, Some("".into()), Some("/home/bot".into())] {
+            assert!(home_of(var).is_absolute());
+        }
     }
 
     #[test]
