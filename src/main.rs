@@ -128,27 +128,9 @@ fn main() -> Result<()> {
             &mut applied_generation,
             &status,
         ) {
-            Ok(cfg) => {
-                if blocked.cleared() {
-                    info!("nothing blocks turns any more");
-                }
-                cfg
-            }
+            Ok(cfg) => cfg,
             Err(problems) => {
-                // The one place a blocker is logged: the web UI shows the
-                // problems, but the runner's own output is where someone
-                // reading `docker logs` looks to find out why nothing is
-                // happening, and several of these were silent there.
-                let reasons: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
-                if blocked.news(&reasons) {
-                    for reason in &reasons {
-                        warn!("turns are blocked: {reason}");
-                    }
-                }
-                Status::update(&status, |s| {
-                    s.activity = Activity::Unconfigured { problems }
-                });
-                once_only(&cli, &reasons.join("; "))?;
+                report_blocker(&cli, &mut blocked, &status, problems)?;
                 std::thread::sleep(UNCONFIGURED_RETRY);
                 continue;
             }
@@ -209,7 +191,34 @@ fn main() -> Result<()> {
         }
 
         match turn::run(&cfg, &status, &pending, &cache) {
+            // The draw took no turn. Which of its two reasons it is decides
+            // how that is shown: a pool the forge doesn't list is a blocker
+            // like any settings problem, where a caught-up pool is simply
+            // what a runner with nothing to do looks like.
+            Ok(report) if report.idle.is_some() => match idle_problem(report.idle) {
+                Some(problem) => {
+                    report_blocker(&cli, &mut blocked, &status, vec![problem])?;
+                    // Re-asked on the turn interval rather than the settings
+                    // one: this answer costs a repository listing per forge,
+                    // where re-reading the settings costs nothing. Sliced and
+                    // cut short by an edit, so a corrected enabled set
+                    // applies at once.
+                    wait(POOL_RETRY, 5, || store.generation() != generation);
+                }
+                None => {
+                    // Said once, not once per pass: the draw is retried every
+                    // minute, and this answer stands until somebody pushes a
+                    // commit or comments on a PR.
+                    if blocked.news(&[NOTHING_TO_DO.to_owned()]) {
+                        info!("{NOTHING_TO_DO}");
+                    }
+                    sleep(&cli, Backoff::Normal, &status, &pending, true);
+                }
+            },
             Ok(report) => {
+                if blocked.cleared() {
+                    info!("taking turns again");
+                }
                 if report.auth_error {
                     let until = status::epoch_now() + AUTH_RETRY;
                     error!(
@@ -236,7 +245,7 @@ fn main() -> Result<()> {
                     // backoff still holds, since retrying early just burns
                     // the next turn on the same limit.
                     Backoff::Normal if report.canceled => {}
-                    backoff => sleep(&cli, backoff, &status, &pending),
+                    backoff => sleep(&cli, backoff, &status, &pending, false),
                 }
             }
             // A failing turn (bad token, unreachable forge, ...) must not
@@ -244,7 +253,7 @@ fn main() -> Result<()> {
             Err(err) => {
                 error!("turn failed: {err:#}");
                 Status::update(&status, |s| s.log_tail = format!("turn failed: {err:#}"));
-                sleep(&cli, Backoff::Normal, &status, &pending);
+                sleep(&cli, Backoff::Normal, &status, &pending, false);
             }
         }
         if cli.once {
@@ -260,6 +269,55 @@ const HOUR: f64 = 3600.0;
 /// a fix takes to be noticed.
 const UNCONFIGURED_RETRY: Duration = Duration::from_secs(5);
 
+/// How long the loop waits before re-asking the forges for their repository
+/// listings when not one enabled repository came back. Longer than
+/// `UNCONFIGURED_RETRY`, because this blocker costs a listing per forge to
+/// re-ask where the settings cost nothing to re-read.
+const POOL_RETRY: u64 = 60;
+
+/// Said when the draw has nothing to work with. Not a blocker — this is what
+/// a runner that has caught up with its repositories looks like — so it is
+/// reported as the runner's state rather than as something to fix.
+const NOTHING_TO_DO: &str = "every enabled task has nothing to do on any enabled repository";
+
+/// The blocker a pass that took no turn amounts to, if any. An enabled set
+/// that the forge lists none of is a misconfiguration — the repository was
+/// renamed, deleted, or has fallen out of the token's reach — and only a
+/// human can clear it, so it is tied to the repository picker that fixes it.
+/// A pool that is merely caught up is no problem at all, and mustn't flag the
+/// settings as if it were.
+fn idle_problem(idle: Option<turn::Idle>) -> Option<Problem> {
+    match idle? {
+        turn::Idle::NothingToDo => None,
+        turn::Idle::NoListedRepos => Some(Problem::new(
+            "forges",
+            "none of the enabled repositories are listed by their forge",
+        )),
+    }
+}
+
+/// Log, show, and (under `--once`) give up on whatever is keeping turns from
+/// running. The web UI shows the problems against the fields that fix them,
+/// but the runner's own output is where someone reading `docker logs` looks
+/// to find out why nothing is happening — and only once per distinct set,
+/// since a blocker needing a human stands for as long as it takes them to
+/// notice while the loop revisits it every few seconds.
+fn report_blocker(
+    cli: &Cli,
+    blocked: &mut Blocked,
+    status: &Shared,
+    problems: Vec<Problem>,
+) -> Result<()> {
+    let reasons: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
+    if blocked.news(&reasons) {
+        for reason in &reasons {
+            warn!("turns are blocked: {reason}");
+        }
+    }
+    Status::update(status, |s| s.activity = Activity::Unconfigured { problems });
+    once_only(cli, &reasons.join("; "))
+}
+
 /// What `--once` does when a turn can't start at all. The flag promises a
 /// single turn and an exit, so every hold the loop would otherwise sit out —
 /// unsound settings, an unreachable proxy, a closed schedule window, a spent
@@ -274,15 +332,17 @@ fn once_only(cli: &Cli, reason: &str) -> Result<()> {
     }
 }
 
-/// What the loop last logged as blocking turns. A blocker that needs a human
-/// stands for as long as it takes them to notice, and the loop revisits it
-/// every `UNCONFIGURED_RETRY`; without this the ones that log would repeat
-/// the identical line every few seconds for as long as they last.
+/// What the loop last said about why it isn't taking turns — unsound
+/// settings, a repository set the forge doesn't list, or a pool with nothing
+/// left to do. Every one of those stands until something outside the runner
+/// moves, and the loop revisits it every `UNCONFIGURED_RETRY` to a minute;
+/// without this the ones that log would repeat the identical line for as
+/// long as they last.
 #[derive(Default)]
 struct Blocked(Option<Vec<String>>);
 
 impl Blocked {
-    /// Whether these blockers are worth logging: the first set seen, or any
+    /// Whether these reasons are worth logging: the first set seen, or any
     /// change to the one standing. The same set again is not news.
     fn news(&mut self, reasons: &[String]) -> bool {
         if self.0.as_deref() == Some(reasons) {
@@ -292,8 +352,10 @@ impl Blocked {
         true
     }
 
-    /// Note that nothing blocks turns; true only on the pass that ends a
-    /// blocked stretch, so the recovery is logged exactly once too.
+    /// Note that a turn ran after all; true only on the pass that ends a
+    /// quiet stretch, so the recovery is logged exactly once too. Asked only
+    /// once a turn has actually run, since that — not a settings edit — is
+    /// what proves the stretch over.
     fn cleared(&mut self) -> bool {
         self.0.take().is_some()
     }
@@ -639,7 +701,13 @@ fn hold(backoff: Backoff, now: u64) -> (u64, bool) {
 /// When the usage window is exhausted, Anthropic reports the epoch at which it
 /// reopens; wait for that instead of burning turns until then. Otherwise pause
 /// just long enough to keep a failing run from spinning the loop.
-fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared, pending: &events::Pending) {
+fn sleep(
+    cli: &Cli,
+    backoff: Backoff,
+    status: &status::Shared,
+    pending: &events::Pending,
+    idle: bool,
+) {
     if cli.once {
         return;
     }
@@ -653,10 +721,7 @@ fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared, pending: &events:
         );
     }
     Status::update(status, |s| {
-        s.activity = match limited {
-            true => Activity::UsageLimit { until },
-            false => Activity::Sleeping { until },
-        };
+        s.activity = paused_as(limited, idle, until);
     });
     // Sliced, so fresh forge activity starts the next turn right away
     // instead of waiting out the pause. The usage-limit hold is slept out in
@@ -668,6 +733,18 @@ fn sleep(cli: &Cli, backoff: Backoff, status: &status::Shared, pending: &events:
         }
         activity
     });
+}
+
+/// What a pause between turns reads as on the page: an exhausted usage
+/// window, a pool the draw found nothing in, or the ordinary gap after a turn
+/// that ran. The last two used to be the same state, so a runner that had
+/// never found anything to do was indistinguishable from one taking turns.
+fn paused_as(limited: bool, idle: bool, until: u64) -> Activity {
+    match (limited, idle) {
+        (true, _) => Activity::UsageLimit { until },
+        (false, true) => Activity::Idle { until },
+        (false, false) => Activity::Sleeping { until },
+    }
 }
 
 fn iso8601(epoch: u64) -> Option<String> {
@@ -860,6 +937,44 @@ mod tests {
         assert!(!blocked.cleared());
         // Blocked again after a clear stretch: news once more.
         assert!(blocked.news(&reasons(&["no repositories are enabled"])));
+    }
+
+    /// A pass that drew nothing is reported by what caused it: an enabled
+    /// repository set the forge lists none of is a misconfiguration pinned
+    /// to the picker that fixes it, while a pool that has merely caught up
+    /// is no problem at all — reporting it as one would redden the settings
+    /// button on a perfectly healthy runner.
+    #[test]
+    fn only_an_unlisted_repository_set_is_a_problem() {
+        let problem = idle_problem(Some(turn::Idle::NoListedRepos)).expect("a blocker");
+        // The field is what the page outlines, so it has to name the
+        // repository picker rather than the forge's token or URL.
+        assert_eq!(problem.field, "forges");
+        assert!(
+            problem.message.contains("listed by their forge"),
+            "{}",
+            problem.message
+        );
+        assert!(idle_problem(Some(turn::Idle::NothingToDo)).is_none());
+        assert!(idle_problem(None).is_none());
+    }
+
+    /// "Nothing to do" and "pausing between turns" used to be the same state
+    /// on the page, so a runner that had never found anything to work on was
+    /// indistinguishable from one taking turns back to back.
+    #[test]
+    fn an_idle_pause_is_not_the_gap_between_turns() {
+        let state = |limited, idle| {
+            serde_json::to_value(paused_as(limited, idle, 42)).expect("activity serializes")
+        };
+        assert_eq!(state(false, true)["state"], "idle");
+        assert_eq!(state(false, false)["state"], "sleeping");
+        // A usage window outranks both: the pause is the limit's, and the
+        // draw never got as far as having nothing to do.
+        assert_eq!(state(true, false)["state"], "usage_limit");
+        assert_eq!(state(true, true)["state"], "usage_limit");
+        // Every one of them counts down to the same reopening.
+        assert_eq!(state(false, true)["until"], 42);
     }
 
     /// `--once` promises one turn and an exit, so a hold the long-running

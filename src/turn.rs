@@ -22,11 +22,26 @@ pub enum Backoff {
     Normal,
 }
 
+/// Why a pass took no turn at all. The two cases differ in kind, and so has
+/// to the way they are reported: one is the healthy state of a caught-up
+/// runner, the other is a misconfiguration nothing but a human can clear.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Idle {
+    /// Every enabled task has nothing to act on anywhere in the pool.
+    NothingToDo,
+    /// Not one enabled repository is listed by its forge — renamed, deleted,
+    /// or out of the token's reach — so there is nothing to draw from.
+    NoListedRepos,
+}
+
 /// A turn that never started reports exactly this: nothing to back off from,
 /// nothing spent, nothing to gate on, nothing cancelled.
 #[derive(Default)]
 pub struct Report {
     pub backoff: Backoff,
+    /// Why the draw came up empty, when it did. `None` means a turn ran —
+    /// whatever became of it.
+    pub idle: Option<Idle>,
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
     /// only these turns count toward the hourly limit.
     pub completed: bool,
@@ -60,9 +75,12 @@ pub fn run(
     if pool.is_empty() {
         // An empty enabled set is a settings problem and never reaches here;
         // what does is an enabled repository the forge no longer lists —
-        // renamed, deleted, or out of the token's reach.
-        warn!("none of the enabled repositories are listed by their forge");
-        return Ok(Report::default());
+        // renamed, deleted, or out of the token's reach. The caller reports
+        // it, since it is the one that knows how to show a blocker.
+        return Ok(Report {
+            idle: Some(Idle::NoListedRepos),
+            ..Default::default()
+        });
     }
     // Fresh forge activity jumps the queue: the watcher saw a comment land,
     // so that repository gets a feedback turn ahead of the random draw.
@@ -96,8 +114,10 @@ pub fn run(
             probe.actionable(task, forge, repo)
         })
     }) else {
-        warn!("every enabled task has nothing to do on any enabled repository");
-        return Ok(Report::default());
+        return Ok(Report {
+            idle: Some(Idle::NothingToDo),
+            ..Default::default()
+        });
     };
 
     let dir = workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo);
@@ -346,6 +366,8 @@ pub fn run(
             Some(epoch) => Backoff::UsageLimit(epoch),
             None => Backoff::Normal,
         },
+        // This pass took its turn, whatever came of it.
+        idle: None,
         completed,
         auth_error: scan::auth_error(&tail),
         canceled,
