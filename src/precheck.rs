@@ -9,12 +9,8 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info};
 
+use crate::cache::gated;
 use crate::config::{Forge, ForgeKind};
-
-/// Tasks with a precondition probe; every other task is always drawable.
-pub fn gated(task: &str) -> bool {
-    matches!(task, "feedback" | "rebase")
-}
 
 /// Open PRs examined per repository; the bot's own open PRs fit well inside
 /// one page.
@@ -63,22 +59,38 @@ pub fn draw<'a>(
     None
 }
 
+/// One GET against a forge's API, through whichever CLI speaks it: `tea` has
+/// no generic api subcommand so Gitea goes through curl, while gh and glab
+/// share the same `api` shape. Each forge spells the same question its own
+/// way, so the caller gives all three paths and only its forge's is used.
+pub fn forge_json(
+    forge: &Forge,
+    gitea: &str,
+    github: &str,
+    gitlab: &str,
+) -> Result<serde_json::Value> {
+    match forge.kind {
+        ForgeKind::Gitea => gitea_json(forge, gitea),
+        ForgeKind::Github => api_json(forge, "gh", github),
+        ForgeKind::Gitlab => api_json(forge, "glab", gitlab),
+    }
+}
+
+/// GitLab identifies a project by its URL-encoded path.
+fn project(repo: &str) -> String {
+    repo.replace('/', "%2F")
+}
+
 /// The commit the repository's default branch points at. Every forge's
 /// commit listing defaults to that branch, so one page of one commit answers
 /// it; GitHub and Gitea name the field `sha`, GitLab `id`.
 pub fn head_sha(forge: &Forge, repo: &str) -> Result<String> {
-    let commits = match forge.kind {
-        ForgeKind::Gitea => gitea_json(forge, &format!("repos/{repo}/commits?limit=1&stat=false"))?,
-        ForgeKind::Github => api_json(forge, "gh", &format!("repos/{repo}/commits?per_page=1"))?,
-        ForgeKind::Gitlab => api_json(
-            forge,
-            "glab",
-            &format!(
-                "projects/{}/repository/commits?per_page=1",
-                repo.replace('/', "%2F")
-            ),
-        )?,
-    };
+    let commits = forge_json(
+        forge,
+        &format!("repos/{repo}/commits?limit=1&stat=false"),
+        &format!("repos/{repo}/commits?per_page=1"),
+        &format!("projects/{}/repository/commits?per_page=1", project(repo)),
+    )?;
     first_sha(&commits).context("the commit listing named no commit")
 }
 
@@ -104,30 +116,31 @@ pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
         // routes through the probe's fail-closed arm instead.
         bail!("the {} login is unresolved", forge.kind.name());
     }
+    let listing = forge_json(
+        forge,
+        // Gitea's listing carries `mergeable`, which also reads false while
+        // its conflict check is still running and for draft PRs; the worst
+        // case is one dispatched turn whose skip is then remembered until
+        // the branch moves.
+        &format!("repos/{repo}/pulls?state=open&limit={PR_LIMIT}"),
+        &format!("repos/{repo}/pulls?state=open&per_page={PR_LIMIT}"),
+        // The listing's `has_conflicts` is GitLab's cached merge status; the
+        // recheck parameter schedules an async refresh so a stale answer
+        // heals by the next probe.
+        &format!(
+            "projects/{}/merge_requests?state=opened&per_page={PR_LIMIT}&with_merge_status_recheck=true",
+            project(repo)
+        ),
+    )?;
     let mut keys = match forge.kind {
-        ForgeKind::Gitea => {
-            // Gitea's listing carries `mergeable`, which also reads false
-            // while its conflict check is still running and for draft PRs;
-            // the worst case is one dispatched turn whose skip is then
-            // remembered until the branch moves.
-            let prs = gitea_json(
-                forge,
-                &format!("repos/{repo}/pulls?state=open&limit={PR_LIMIT}"),
-            )?;
-            conflict_keys(&prs, &forge.login)?
-        }
+        // GitHub's listing is the one that carries no mergeability, so each
+        // of the bot's PRs costs a GET of its own. That GET both reads
+        // mergeability and triggers GitHub's lazy computation of it, so a
+        // null (still computing) answer reads as not conflicting and a later
+        // probe sees the computed value.
         ForgeKind::Github => {
-            let prs = api_json(
-                forge,
-                "gh",
-                &format!("repos/{repo}/pulls?state=open&per_page={PR_LIMIT}"),
-            )?;
             let mut keys = Vec::new();
-            for number in owned_pr_numbers(&prs, &forge.login) {
-                // The listing carries no mergeability; the GET both reads it
-                // and triggers GitHub's lazy computation, so a null (still
-                // computing) answer reads as not conflicting and a later
-                // probe sees the computed value.
+            for number in owned_pr_numbers(&listing, &forge.login) {
                 let pr = api_json(forge, "gh", &format!("repos/{repo}/pulls/{number}"))?;
                 if conflicting(&pr) {
                     keys.extend(pr_key(&pr));
@@ -135,20 +148,7 @@ pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
             }
             keys
         }
-        ForgeKind::Gitlab => {
-            let project = repo.replace('/', "%2F");
-            // The listing's `has_conflicts` is GitLab's cached merge status;
-            // the recheck parameter schedules an async refresh so a stale
-            // answer heals by the next probe.
-            let mrs = api_json(
-                forge,
-                "glab",
-                &format!(
-                    "projects/{project}/merge_requests?state=opened&per_page={PR_LIMIT}&with_merge_status_recheck=true"
-                ),
-            )?;
-            conflict_keys(&mrs, &forge.login)?
-        }
+        _ => conflict_keys(&listing, &forge.login)?,
     };
     // Listing order isn't stable across fetches, and the skip cache compares
     // the keys as one joined string, so only a sorted set is deterministic.
@@ -273,15 +273,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[test]
-    fn gated_matches_the_probed_slugs() {
-        assert!(gated("feedback"));
-        assert!(gated("rebase"));
-        for task in ["bump", "simplify", "todo", "feature"] {
-            assert!(!gated(task));
-        }
-    }
 
     #[test]
     fn authored_by_reads_either_author_spelling() {

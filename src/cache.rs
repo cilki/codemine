@@ -14,8 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
@@ -59,6 +58,16 @@ pub fn basis(task: &str) -> Option<Basis> {
         "rebase" => Some(Basis::Prs),
         _ => None,
     }
+}
+
+/// Whether the task has a precondition probe, which is exactly the tasks
+/// whose basis is forge state rather than the tree: an empty feed or an empty
+/// conflict set is both "nothing has moved" and "there is nothing to act
+/// on", so the same read answers either question. A `Basis::Head` task reads
+/// the tree the agent is handed and can always find something there, so only
+/// its memory holds it back. Every other task is always drawable.
+pub fn gated(task: &str) -> bool {
+    matches!(basis(task), Some(Basis::Feed | Basis::Prs))
 }
 
 /// The state a skip was remembered against. Both halves have to still match
@@ -132,7 +141,7 @@ impl Cache {
     /// Write the memory back out. A failure costs a redundant turn after the
     /// next restart and nothing else, so it is logged rather than propagated.
     fn save(&self, marks: &BTreeMap<String, Mark>) {
-        if let Err(err) = persist(&self.path, marks) {
+        if let Err(err) = crate::workspace::write_json(&self.path, marks) {
             warn!("failed to save the skip cache: {err:#}");
         }
     }
@@ -142,22 +151,6 @@ impl Cache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-}
-
-/// Atomic write, like the settings store: the temp file is created next to
-/// the target so the rename can't cross filesystems.
-fn persist(path: &Path, marks: &BTreeMap<String, Mark>) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(&serde_json::to_vec_pretty(marks)?)?;
-    file.write_all(b"\n")?;
-    file.persist(path)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
 }
 
 /// One task's entry for one repository. None of the three parts can contain a
@@ -287,15 +280,10 @@ impl<'a> Probe<'a> {
     /// The repository's default-branch commit, read from the forge once per
     /// repository and remembered for the rest of the draw.
     fn head(&self, forge: &Forge, repo: &str) -> Option<String> {
-        let id = (forge.kind, repo.to_owned());
-        if let Some(head) = self.heads.borrow().get(&id) {
-            return head.clone();
-        }
-        let head = crate::precheck::head_sha(forge, repo)
-            .inspect_err(|err| warn!("failed to read {repo}'s head commit: {err:#}"))
-            .ok();
-        self.heads.borrow_mut().insert(id, head.clone());
-        head
+        once(&self.heads, (forge.kind, repo.to_owned()), || {
+            crate::precheck::head_sha(forge, repo)
+                .with_context(|| format!("failed to read {repo}'s head commit"))
+        })
     }
 
     /// The newest unread notification on the repository's feed. `None` for a
@@ -307,36 +295,41 @@ impl<'a> Probe<'a> {
     /// The bot's open conflicting PRs on the repository, read from the forge
     /// once per repository and remembered for the rest of the draw. `None`
     /// when the listing couldn't be read.
-    fn conflicting(&self, forge: &Forge, repo: &str) -> Option<Vec<String>> {
-        let id = (forge.kind, repo.to_owned());
-        if let Some(prs) = self.conflicts.borrow().get(&id) {
-            return prs.clone();
-        }
-        let prs = crate::precheck::conflicting_prs(forge, repo)
-            .inspect_err(|err| warn!("failed to read {repo}'s conflicting PRs: {err:#}"))
-            .ok();
-        self.conflicts.borrow_mut().insert(id, prs.clone());
-        prs
+    fn conflicting(&self, forge: &Forge, repo: &str) -> Option<Conflicts> {
+        once(&self.conflicts, (forge.kind, repo.to_owned()), || {
+            crate::precheck::conflicting_prs(forge, repo)
+                .with_context(|| format!("failed to read {repo}'s conflicting PRs"))
+        })
     }
 
     /// The forge's unread notifications as repository → newest stamp. The
     /// feed is account-wide, so one request per forge answers for every
     /// repository in the draw. `None` when it couldn't be read.
     fn feed(&self, forge: &Forge) -> Option<BTreeMap<String, String>> {
-        if let Some(feed) = self.feeds.borrow().get(&forge.kind) {
-            return feed.clone();
-        }
-        let feed = crate::events::unread(forge)
-            .inspect_err(|err| {
-                warn!(
-                    "failed to read {}'s activity feed: {err:#}",
-                    forge.kind.name()
-                )
-            })
-            .ok();
-        self.feeds.borrow_mut().insert(forge.kind, feed.clone());
-        feed
+        once(&self.feeds, forge.kind, || {
+            crate::events::unread(forge)
+                .with_context(|| format!("failed to read {}'s activity feed", forge.kind.name()))
+        })
     }
+}
+
+/// Ask the forge for one key's worth of state at most once per draw, handing
+/// every later caller the same answer — a failure included, since a listing
+/// the forge just refused is not worth re-asking for the next candidate. One
+/// draw asks the same question of the same repository for several tasks, and
+/// `feedback` asks the same account-wide feed for every repository in the
+/// pool.
+fn once<K: Ord, V: Clone>(
+    memo: &RefCell<BTreeMap<K, Option<V>>>,
+    key: K,
+    read: impl FnOnce() -> Result<V>,
+) -> Option<V> {
+    if let Some(answer) = memo.borrow().get(&key) {
+        return answer.clone();
+    }
+    let answer = read().inspect_err(|err| warn!("{err:#}")).ok();
+    memo.borrow_mut().insert(key, answer.clone());
+    answer
 }
 
 #[cfg(test)]
@@ -411,6 +404,18 @@ mod tests {
         assert_eq!(basis("rebase"), Some(Basis::Prs));
         for task in ["bump", "todo", "roleplay", "audit", "feature"] {
             assert_eq!(basis(task), None, "{task}");
+        }
+    }
+
+    /// The probed tasks are exactly the ones whose basis is forge state: that
+    /// read answers both "has anything moved" and "is there anything to act
+    /// on", so there is one list of them rather than two to keep in step.
+    #[test]
+    fn the_gated_tasks_are_the_ones_probed_out_of_forge_state() {
+        assert!(gated("feedback"));
+        assert!(gated("rebase"));
+        for task in ["docs", "simplify", "bump", "todo", "feature"] {
+            assert!(!gated(task), "{task}");
         }
     }
 
