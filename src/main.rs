@@ -527,17 +527,10 @@ fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
     );
     config.push_str(&format!(
         "[credential]\n\thelper = store --file={}\n",
-        git_credentials(cli).display()
+        workspace::git_credentials(&cli.workspace).display()
     ));
     std::fs::write(&path, config).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
-}
-
-/// Where the credential helper keeps forge logins. It lives in the workspace
-/// rather than at the helper's default `~/.git-credentials`, because the home
-/// directory isn't necessarily writable.
-fn git_credentials(cli: &Cli) -> PathBuf {
-    cli.workspace.join("git-credentials")
 }
 
 /// Let git and tea authenticate to every configured forge; re-run whenever
@@ -555,7 +548,7 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
             )
         })
         .collect();
-    let path = git_credentials(cli);
+    let path = workspace::git_credentials(&cli.workspace);
     OpenOptions::new()
         .write(true)
         .create(true)
@@ -734,7 +727,7 @@ mod tests {
         assert!(
             written.contains(&format!(
                 "helper = store --file={}",
-                git_credentials(&cli).display()
+                workspace::git_credentials(&cli.workspace).display()
             )),
             "{written}"
         );

@@ -26,6 +26,53 @@ pub fn repo_dir(root: &Path, forge_slug: &str, repo: &str) -> PathBuf {
     root.join(forge_slug).join(repo)
 }
 
+/// Where the credential helper keeps forge logins. It lives in the workspace
+/// rather than at the helper's default `~/.git-credentials`, because the home
+/// directory isn't necessarily writable.
+pub fn git_credentials(workspace: &Path) -> PathBuf {
+    workspace.join("git-credentials")
+}
+
+/// A `git` the runner runs itself, in `cwd`, with the clone's own `.git`
+/// metadata disarmed.
+///
+/// The assigned clone is the one place the Landlock ruleset lets the agent
+/// write, so by the time the next turn comes to update it, everything under
+/// its `.git` is whatever the last turn left behind — and the runner, unlike
+/// the agent, is not inside the sandbox. git treats a repository's hooks and
+/// local config as code, which makes a plain `git` of the runner's own in
+/// that directory the shortest way out of the confinement:
+///
+/// * `.git/hooks/post-checkout` runs on the `checkout` below, and
+///   `.git/hooks/reference-transaction` on every ref the `fetch` moves.
+/// * `core.fsmonitor` is a command git runs for any operation that reads the
+///   index — `checkout`, `reset`, and `clean` all do.
+/// * a `credential.helper` is handed the credentials git just used, so one
+///   planted here collects the forge token on the next authenticated fetch.
+///   The empty value resets the accumulated list (dropping the planted one
+///   wherever it was configured); the runner's own helper is re-added after
+///   it, so authentication still works.
+///
+/// `-c` outranks every config file, including the repository's, which is what
+/// makes pinning these here enough. Only the runner's own commands are
+/// affected: the agent's git still sees the clone it configured.
+fn git_in(workspace: &Path, cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(cwd);
+    for setting in [
+        "core.hooksPath=/dev/null".to_owned(),
+        "core.fsmonitor=false".to_owned(),
+        "credential.helper=".to_owned(),
+        format!(
+            "credential.helper=store --file={}",
+            git_credentials(workspace).display()
+        ),
+    ] {
+        command.args(["-c", &setting]);
+    }
+    command
+}
+
 /// Atomically write `value` as pretty JSON, for the state the runner keeps at
 /// the workspace root: the settings and the skip cache. The temp file is
 /// created next to the target so the rename can't cross filesystems, and it
@@ -51,19 +98,19 @@ pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
 pub fn prepare(cfg: &Config, forge: &Forge, repo: &str, log: &File) -> Result<PathBuf> {
     let dir = repo_dir(&cfg.workspace, forge.kind.name(), repo);
     if dir.join(".git").exists() {
-        if let Err(err) = update(&dir, log) {
+        if let Err(err) = update(&cfg.workspace, &dir, log) {
             warn!("update of {} failed ({err:#}); recloning", dir.display());
-            reclone(forge, repo, &dir, log)?;
+            reclone(&cfg.workspace, forge, repo, &dir, log)?;
         }
     } else {
-        reclone(forge, repo, &dir, log)?;
+        reclone(&cfg.workspace, forge, repo, &dir, log)?;
     }
     codegraph(cfg, &dir, log);
     Ok(dir)
 }
 
 /// Clone into `dir`, first clearing any half-created or broken leftovers.
-fn reclone(forge: &Forge, repo: &str, dir: &Path, log: &File) -> Result<()> {
+fn reclone(workspace: &Path, forge: &Forge, repo: &str, dir: &Path, log: &File) -> Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)
             .with_context(|| format!("failed to remove {}", dir.display()))?;
@@ -73,7 +120,7 @@ fn reclone(forge: &Forge, repo: &str, dir: &Path, log: &File) -> Result<()> {
         .with_context(|| format!("failed to create {}", parent.display()))?;
     let url = format!("{}/{repo}", forge.url.trim_end_matches('/'));
     run_logged(
-        Command::new("git").args(["clone", &url]).arg(dir),
+        git_in(workspace, parent).args(["clone", &url]).arg(dir),
         GIT_TIMEOUT,
         log,
     )
@@ -81,20 +128,14 @@ fn reclone(forge: &Forge, repo: &str, dir: &Path, log: &File) -> Result<()> {
 
 /// Bring an existing clone back to a current default branch, whatever state
 /// the previous turn left it in. Ignored files (build caches) survive.
-fn update(dir: &Path, log: &File) -> Result<()> {
+fn update(workspace: &Path, dir: &Path, log: &File) -> Result<()> {
     // A turn killed mid-operation can leave the index locked; nothing else
     // touches the repository between turns, so the lock is always stale.
     let lock = dir.join(".git/index.lock");
     if lock.exists() {
         std::fs::remove_file(&lock)?;
     }
-    let git = |args: &[&str]| {
-        run_logged(
-            Command::new("git").current_dir(dir).args(args),
-            GIT_TIMEOUT,
-            log,
-        )
-    };
+    let git = |args: &[&str]| run_logged(git_in(workspace, dir).args(args), GIT_TIMEOUT, log);
     // Every branch, spelled out rather than left to the clone's configured
     // refspec, so the agent sees all of them at their latest and a clone
     // made narrow can't quietly limit what a turn can reach.
@@ -107,6 +148,7 @@ fn update(dir: &Path, log: &File) -> Result<()> {
     // Track upstream default-branch changes.
     git(&["remote", "set-head", "origin", "--auto"])?;
     let head = git_stdout(
+        workspace,
         dir,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     )?;
@@ -120,7 +162,7 @@ fn update(dir: &Path, log: &File) -> Result<()> {
     // The branch the turn starts on is current now; the rest are brought
     // forward separately. A failure there is not worth a reclone — the
     // turn's own branch is already correct.
-    if let Err(err) = fast_forward_branches(dir, branch, log) {
+    if let Err(err) = fast_forward_branches(workspace, dir, branch, log) {
         warn!("failed to refresh branches in {}: {err:#}", dir.display());
     }
     Ok(())
@@ -130,9 +172,10 @@ fn update(dir: &Path, log: &File) -> Result<()> {
 /// left behind by an earlier turn can't hide work pushed since. Branches
 /// with no counterpart — never pushed, or merged and deleted upstream — are
 /// left alone rather than silently thrown away.
-fn fast_forward_branches(dir: &Path, current: &str, log: &File) -> Result<()> {
+fn fast_forward_branches(workspace: &Path, dir: &Path, current: &str, log: &File) -> Result<()> {
     let refs = |namespace| {
         git_stdout(
+            workspace,
             dir,
             &["for-each-ref", "--format=%(refname:short)", namespace],
         )
@@ -147,12 +190,7 @@ fn fast_forward_branches(dir: &Path, current: &str, log: &File) -> Result<()> {
             continue;
         }
         run_logged(
-            Command::new("git").current_dir(dir).args([
-                "branch",
-                "--force",
-                local,
-                &format!("origin/{local}"),
-            ]),
+            git_in(workspace, dir).args(["branch", "--force", local, &format!("origin/{local}")]),
             GIT_TIMEOUT,
             log,
         )?;
@@ -162,15 +200,16 @@ fn fast_forward_branches(dir: &Path, current: &str, log: &File) -> Result<()> {
 
 /// The commit the clone is checked out at, which the skip cache remembers an
 /// empty turn against for the tasks that read the tree.
-pub fn head_sha(dir: &Path) -> Result<String> {
-    Ok(git_stdout(dir, &["rev-parse", "HEAD"])?.trim().to_owned())
+pub fn head_sha(workspace: &Path, dir: &Path) -> Result<String> {
+    Ok(git_stdout(workspace, dir, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned())
 }
 
 /// Stdout of a git command that is run for its answer rather than its
 /// effect; anything but a clean exit is an error.
-fn git_stdout(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(dir)
+fn git_stdout(workspace: &Path, dir: &Path, args: &[&str]) -> Result<String> {
+    let output = git_in(workspace, dir)
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -306,6 +345,8 @@ fn run_logged(command: &mut Command, timeout: Duration, log: &File) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     /// git with a fixed identity, so the test doesn't depend on whatever
@@ -329,11 +370,33 @@ mod tests {
         git(dir, &["commit", "-m", name]);
     }
 
+    /// `rev-parse` neither authenticates nor reads the index, so the
+    /// workspace root it would take the credential helper from is irrelevant
+    /// here and the clone stands in for it.
     fn head_of(dir: &Path, branch: &str) -> String {
-        git_stdout(dir, &["rev-parse", branch])
+        git_stdout(dir, dir, &["rev-parse", branch])
             .unwrap()
             .trim()
             .to_owned()
+    }
+
+    /// An origin with one commit on `main` plus a clone of it, which is the
+    /// state `update` is asked to bring forward.
+    fn origin_and_clone(root: &Path) -> (PathBuf, PathBuf) {
+        let origin = root.join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-b", "main"]);
+        commit(&origin, "first");
+        let clone = root.join("clone");
+        git(
+            root,
+            &[
+                "clone",
+                &origin.display().to_string(),
+                &clone.display().to_string(),
+            ],
+        );
+        (origin, clone)
     }
 
     /// Every branch the turn might touch starts at what origin has now, not
@@ -373,7 +436,7 @@ mod tests {
         commit(&origin, "second");
 
         let log = tempfile::tempfile().unwrap();
-        update(&clone, &log).unwrap();
+        update(root.path(), &clone, &log).unwrap();
 
         assert_eq!(head_of(&clone, "main"), head_of(&origin, "main"));
         assert_eq!(head_of(&clone, "feature"), head_of(&origin, "feature"));
@@ -382,5 +445,85 @@ mod tests {
             head_of(&origin, "feature")
         );
         assert_eq!(head_of(&clone, "local-only"), local_only);
+    }
+
+    /// The clone is the agent's to write, so its `.git` is whatever the last
+    /// turn left there — and the runner updating it next turn is outside the
+    /// sandbox. None of the three things git would otherwise run out of a
+    /// repository may run: the hooks `update`'s own commands fire, the
+    /// `core.fsmonitor` command every index read consults, and a
+    /// `credential.helper` that would be handed the forge token.
+    #[test]
+    fn update_runs_nothing_the_clone_planted() {
+        let root = tempfile::tempdir().unwrap();
+        let (origin, clone) = origin_and_clone(root.path());
+        commit(&origin, "second");
+
+        // Each plant writes a file named after itself if it ever runs.
+        let fired = root.path().join("fired");
+        std::fs::create_dir(&fired).unwrap();
+        let plant = |name: &str| {
+            let script = format!("#!/bin/sh\necho ran > {}\n", fired.join(name).display());
+            let path = clone.join(".git/hooks").join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // post-checkout fires on the `checkout`, reference-transaction on
+        // every ref the `fetch` and the `reset` move.
+        plant("post-checkout");
+        plant("reference-transaction");
+        let fsmonitor = plant("fsmonitor");
+        git(
+            &clone,
+            &["config", "core.fsmonitor", &fsmonitor.display().to_string()],
+        );
+        let helper = plant("credential-thief");
+        git(
+            &clone,
+            &[
+                "config",
+                "credential.helper",
+                &format!("!{}", helper.display()),
+            ],
+        );
+
+        let log = tempfile::tempfile().unwrap();
+        update(root.path(), &clone, &log).unwrap();
+
+        // The update did its job...
+        assert_eq!(head_of(&clone, "main"), head_of(&origin, "main"));
+        // ...without running any of it.
+        let ran: Vec<String> = std::fs::read_dir(&fired)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(ran.is_empty(), "the clone's own git metadata ran: {ran:?}");
+
+        // The helper is the one plant `update` can't reach on a local origin,
+        // since nothing authenticates; ask git directly whether it would be
+        // consulted for the credentials a fetch over https would use.
+        let mut child = git_in(root.path(), &clone)
+            .args(["credential", "approve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=forge.example\nusername=bot\npassword=token\n")
+            .unwrap();
+        child.wait().unwrap();
+        assert!(
+            !fired.join("credential-thief").exists(),
+            "a credential helper in the clone was handed the forge token"
+        );
+        // The runner's own helper is still the one in effect.
+        let stored = std::fs::read_to_string(git_credentials(root.path())).unwrap();
+        assert!(stored.contains("bot:token@forge.example"), "{stored}");
     }
 }
