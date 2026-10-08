@@ -20,7 +20,8 @@ Each "turn" does one of the following on a repo:
   their base branch, resolving the conflicts and force-pushing.
 - `bump`: update dependencies, handling any migration issues.
 - `simplify`: remove dead code, simplify implementations, drop trivial tests.
-- `todo`: implement TODOs in the repo.
+- `todo`: handle a TODO comment in the code, or an item from the repo's
+  `AGENTS.md` TODO list.
 - `roleplay`: run the project like a user would, fixing what breaks along the
   way.
 - `benchmark`: run the project like a user would, searching for performance
@@ -63,6 +64,17 @@ docker run -d --name codemine \
   -v codemine:/workspace \
   codemine
 ```
+
+The image pins `TZ=America/Chicago`, and the scheduling window is read against
+the container's clock rather than your browser's, so add `-e TZ=<your zone>`
+unless that one is already yours — otherwise "22:00 to 06:00" means 22:00 in
+Chicago.
+
+The web UI is unauthenticated, and `-p 8080:8080` publishes it on every
+interface. Anyone who can reach the port can read the turn logs and rewrite the
+settings — which is how forge tokens and the proxy's URL are set — so keep the
+published port on a network you trust. `-p 127.0.0.1:8080:8080` confines it to
+the host.
 
 The container starts [CLIProxyAPI](#cliproxyapi) alongside **codemine**. Log in
 to your AI provider once; the tokens persist on the volume and refresh on their
