@@ -101,6 +101,9 @@ fn main() -> Result<()> {
     // anything it can't fix on its own needs a human either way — which the
     // health problem below surfaces independently.
     let mut auth_gated: Option<u64> = None;
+    // What was last logged as blocking turns, so a blocker that needs a
+    // human says so once instead of once per pass.
+    let mut blocked = Blocked::default();
     loop {
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
@@ -125,11 +128,27 @@ fn main() -> Result<()> {
             &mut applied_generation,
             &status,
         ) {
-            Ok(cfg) => cfg,
+            Ok(cfg) => {
+                if blocked.cleared() {
+                    info!("nothing blocks turns any more");
+                }
+                cfg
+            }
             Err(problems) => {
+                // The one place a blocker is logged: the web UI shows the
+                // problems, but the runner's own output is where someone
+                // reading `docker logs` looks to find out why nothing is
+                // happening, and several of these were silent there.
+                let reasons: Vec<String> = problems.iter().map(|p| p.message.clone()).collect();
+                if blocked.news(&reasons) {
+                    for reason in &reasons {
+                        warn!("turns are blocked: {reason}");
+                    }
+                }
                 Status::update(&status, |s| {
                     s.activity = Activity::Unconfigured { problems }
                 });
+                once_only(&cli, &reasons.join("; "))?;
                 std::thread::sleep(UNCONFIGURED_RETRY);
                 continue;
             }
@@ -142,6 +161,7 @@ fn main() -> Result<()> {
         if let Some(closed) = cfg.schedule.hold(schedule::local_second_of_day()) {
             let until = status::epoch_now() + closed;
             Status::update(&status, |s| s.activity = Activity::OffHours { until });
+            once_only(&cli, "the schedule's window is closed")?;
             // Sliced like the rate-limit wait, and cut short by an edit, so
             // a widened window applies at once instead of at the end of the
             // hold.
@@ -177,6 +197,7 @@ fn main() -> Result<()> {
                 Status::update(&status, |s| {
                     s.activity = Activity::RateLimited { until: now + left }
                 });
+                once_only(&cli, "the hourly limit is spent")?;
                 // Sleep in slices and fall back into the loop, cut short by
                 // an edit, so a limit raised in the web UI applies at once
                 // instead of at the end of the wait.
@@ -239,6 +260,45 @@ const HOUR: f64 = 3600.0;
 /// a fix takes to be noticed.
 const UNCONFIGURED_RETRY: Duration = Duration::from_secs(5);
 
+/// What `--once` does when a turn can't start at all. The flag promises a
+/// single turn and an exit, so every hold the loop would otherwise sit out —
+/// unsound settings, an unreachable proxy, a closed schedule window, a spent
+/// allowance — has to end the process rather than be waited on: all of them
+/// need either an edit in the web UI or the clock to move, and under `--once`
+/// there is nobody watching the UI. A turn that ran and found nothing to do
+/// is not this: that one took its turn, and still exits successfully.
+fn once_only(cli: &Cli, reason: &str) -> Result<()> {
+    match cli.once {
+        true => bail!("--once: no turn could start because {reason}"),
+        false => Ok(()),
+    }
+}
+
+/// What the loop last logged as blocking turns. A blocker that needs a human
+/// stands for as long as it takes them to notice, and the loop revisits it
+/// every `UNCONFIGURED_RETRY`; without this the ones that log would repeat
+/// the identical line every few seconds for as long as they last.
+#[derive(Default)]
+struct Blocked(Option<Vec<String>>);
+
+impl Blocked {
+    /// Whether these blockers are worth logging: the first set seen, or any
+    /// change to the one standing. The same set again is not news.
+    fn news(&mut self, reasons: &[String]) -> bool {
+        if self.0.as_deref() == Some(reasons) {
+            return false;
+        }
+        self.0 = Some(reasons.to_vec());
+        true
+    }
+
+    /// Note that nothing blocks turns; true only on the pass that ends a
+    /// blocked stretch, so the recovery is logged exactly once too.
+    fn cleared(&mut self) -> bool {
+        self.0.take().is_some()
+    }
+}
+
 /// Everything that has to hold before a turn can run, asked in the order
 /// that costs the least to find out: the proxy is reachable, each forge
 /// token's account is known (its login and commit email come from the forge,
@@ -267,8 +327,9 @@ fn runnable(
         .expect("settings without problems are runnable");
 
     // Cached, so resolving is a map lookup on every pass but the first.
+    // Errors are returned rather than logged here: the caller logs whatever
+    // blocks turns, once per distinct set, and this runs on every pass.
     let resolved = identity::resolve(&mut cfg.forges).map_err(|(kind, err)| {
-        error!("{err:#}");
         vec![Problem::new(
             &format!("f-{}-token", kind.name()),
             format!("{err:#}"),
@@ -285,7 +346,6 @@ fn runnable(
 
     if *applied_generation != Some(generation) {
         apply_forge_auth(cli, &cfg).map_err(|err| {
-            error!("failed to apply forge auth: {err:#}");
             vec![Problem::new(
                 "",
                 format!("failed to apply forge auth: {err:#}"),
@@ -770,6 +830,55 @@ mod tests {
             hold(Backoff::UsageLimit(u64::MAX), now),
             (MAX_USAGE_HOLD, true)
         );
+    }
+
+    /// A blocker stands until somebody edits the settings, and the loop
+    /// revisits it every few seconds meanwhile, so the same set of reasons
+    /// must only be news once — and the recovery exactly once too.
+    #[test]
+    fn a_standing_blocker_is_only_news_once() {
+        let reasons = |reasons: &[&str]| -> Vec<String> {
+            reasons.iter().map(|r| (*r).to_owned()).collect()
+        };
+        let mut blocked = Blocked::default();
+        // Nothing has blocked turns yet, so there is nothing to recover from.
+        assert!(!blocked.cleared());
+
+        assert!(blocked.news(&reasons(&["model is not set"])));
+        assert!(!blocked.news(&reasons(&["model is not set"])));
+        // The model was picked and the forge still needs repositories: a
+        // different blocker, worth saying.
+        assert!(blocked.news(&reasons(&["no repositories are enabled"])));
+        assert!(!blocked.news(&reasons(&["no repositories are enabled"])));
+        // A second blocker joining the first is news as well.
+        assert!(blocked.news(&reasons(&[
+            "no repositories are enabled",
+            "gitea needs a URL"
+        ])));
+
+        assert!(blocked.cleared());
+        assert!(!blocked.cleared());
+        // Blocked again after a clear stretch: news once more.
+        assert!(blocked.news(&reasons(&["no repositories are enabled"])));
+    }
+
+    /// `--once` promises one turn and an exit, so a hold the long-running
+    /// loop would sit out has to end the process instead: every one of them
+    /// waits on an edit in the web UI or on the clock, and under `--once`
+    /// nobody is watching either.
+    #[test]
+    fn once_refuses_to_wait_out_a_hold() {
+        let cli = |args: &[&str]| {
+            Cli::parse(
+                std::iter::once("codemine".to_owned()).chain(args.iter().map(|s| s.to_string())),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let err = once_only(&cli(&["--once"]), "model is not set").unwrap_err();
+        assert!(err.to_string().contains("model is not set"), "{err}");
+        // The long-running runner keeps going and retries instead.
+        assert!(once_only(&cli(&[]), "model is not set").is_ok());
     }
 
     #[test]
