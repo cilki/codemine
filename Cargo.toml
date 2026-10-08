@@ -5,7 +5,7 @@ edition = "2024"
 license = "Unlicense"
 name = "codemine"
 repository = "https://github.com/cilki/codemine"
-version = "0.1.0"
+version = "0.2.0"
 
 [dependencies]
 anyhow = "1"
@@ -17,8 +17,12 @@ libc = "0.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-sysinfo = { version = "0.39.6", default-features = false, features = ["component", "disk", "system"], optional = true }
+sha2 = "0.11"
+sysinfo = { version = "0.39.6", default-features = false, features = [
+  "component",
+  "disk",
+  "system",
+], optional = true }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
 tokio-stream = "0.1.19"
