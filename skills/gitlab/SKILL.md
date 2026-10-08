@@ -69,7 +69,7 @@ feedback:
 4. Reply so the reviewer knows what happened:
 
    ```sh
-   glab mr note <number> --message "<what you changed and why>"
+   glab mr note create <number> --message "<what you changed and why>"
    ```
 
 If a comment is ambiguous, or asks for something you think is wrong, say so in
