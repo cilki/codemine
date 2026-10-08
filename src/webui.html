@@ -76,6 +76,8 @@
   #stat-state.running { color: #61afef; }
   #stat-state.paused, #stat-state.rate_limited, #stat-state.off_hours,
   #stat-state.usage_limit, #stat-state.unconfigured { color: #e67e22; }
+  /* Not a problem, just nothing to do: greyed rather than flagged. */
+  #stat-state.idle { color: #9aa0a6; }
   #stat-completed { color: #2ecc71; }
   #stat-skipped { color: #9aa0a6; }
   #stat-failed { color: #e74c3c; }
@@ -423,8 +425,21 @@
   // something.
   const STATES = {
     starting: "starting", running: "running", sleeping: "sleeping",
-    usage_limit: "usage limit", rate_limited: "rate limit",
+    idle: "idle", usage_limit: "usage limit", rate_limited: "rate limit",
     off_hours: "off hours", unconfigured: "unconfigured",
+  };
+
+  // The states whose name doesn't say the whole of it, as the runner tile's
+  // tooltip. "idle" is the one that needs it most: it looks like "sleeping"
+  // but means the draw found nothing to do, which is where a runner sits
+  // once it has caught up — or when its enabled tasks never had any work.
+  const STATE_NOTES = {
+    idle: "every enabled task has nothing to do on any enabled repository",
+    sleeping: "pausing between turns",
+    off_hours: "outside the schedule's daily window",
+    rate_limited: "the hourly task limit is spent",
+    usage_limit: "the model's usage window is exhausted",
+    unconfigured: "something in the settings has to be fixed first",
   };
 
   // What the runner is doing, and for how much longer: the state names the
@@ -437,6 +452,7 @@
     const value = $("stat-state");
     $("stat-state-label").textContent = paused ? "paused" : STATES[a.state] || a.state;
     value.className = "stat-value " + (paused ? "paused" : a.state);
+    value.title = paused ? "" : STATE_NOTES[a.state] || "";
     // A rate limit counts down to the next turn, so its wait reads as
     // negative time: "-5m" means five minutes until the runner goes again.
     value.textContent = a.state === "running"

@@ -112,6 +112,14 @@ pub enum Activity {
     Sleeping {
         until: u64,
     },
+    /// Nothing in the pool is worth a turn: every enabled task has already
+    /// answered for the state the repositories are in. Kept apart from
+    /// `Sleeping`, which is the ordinary gap after a turn that did run — the
+    /// two look identical on the page otherwise, and one of them means the
+    /// runner has been doing nothing since it started.
+    Idle {
+        until: u64,
+    },
     UsageLimit {
         until: u64,
     },
