@@ -544,14 +544,29 @@ const PAGE_SIZE: usize = 50;
 /// here, which is the one chokepoint every consumer draws from.
 pub fn list_repos(forge: &Forge) -> Result<Vec<String>> {
     let listed = match forge.kind {
-        ForgeKind::Gitea => list_gitea_repos()?,
-        ForgeKind::Github => list_api_repos(forge, "gh", "user/repos", "full_name")?,
-        ForgeKind::Gitlab => list_api_repos(
-            forge,
-            "glab",
-            "projects?membership=true",
-            "path_with_namespace",
-        )?,
+        // Through the API rather than `tea repos ls`, because this is the one
+        // listing the web UI needs *before* the settings are runnable: every
+        // repository starts disabled, "no repositories are enabled" is a
+        // problem that holds the runner, and the `tea` login is only
+        // installed once nothing holds it. Shelling out to tea here left a
+        // fresh install unable to enable its first repository at all.
+        ForgeKind::Gitea => list_json_repos("full_name", |page| {
+            precheck::gitea_json(forge, &format!("user/repos?limit={PAGE_SIZE}&page={page}"))
+        })?,
+        ForgeKind::Github => list_json_repos("full_name", |page| {
+            precheck::api_json(
+                forge,
+                "gh",
+                &format!("user/repos?per_page={PAGE_SIZE}&page={page}"),
+            )
+        })?,
+        ForgeKind::Gitlab => list_json_repos("path_with_namespace", |page| {
+            precheck::api_json(
+                forge,
+                "glab",
+                &format!("projects?membership=true&per_page={PAGE_SIZE}&page={page}"),
+            )
+        })?,
     };
     let mut repos = Vec::with_capacity(listed.len());
     for repo in listed {
@@ -612,74 +627,20 @@ fn paginate<R>(mut page: impl FnMut(usize) -> Result<Vec<R>>) -> Result<Vec<R>> 
     Ok(rows)
 }
 
-/// `tea` prints the requested fields whitespace-separated with no header, so
-/// owner and name come back as two columns and are rejoined into the
-/// `<owner>/<repo>` path the rest of the runner expects.
-fn list_gitea_repos() -> Result<Vec<String>> {
-    let lines = paginate(|page| {
-        let output = Command::new("tea")
-            .args([
-                "repos",
-                "ls",
-                "--output",
-                "simple",
-                "--fields",
-                "owner,name",
-            ])
-            .args([
-                "--limit",
-                &PAGE_SIZE.to_string(),
-                "--page",
-                &page.to_string(),
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .context("failed to run tea")?;
-        if !output.status.success() {
-            bail!(
-                "tea repos ls exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        // Blank lines are tea's own padding rather than listed repositories,
-        // so they don't count toward the page either way.
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(str::to_owned)
-            .collect())
-    })?;
-    Ok(lines
-        .iter()
-        .filter_map(|line| gitea_repo_path(line))
-        .collect())
-}
-
-/// The `<owner>/<repo>` path from one `tea repos ls` line; None for the blank
-/// and malformed lines tea can emit, since neither field can contain spaces.
-fn gitea_repo_path(line: &str) -> Option<String> {
-    let mut fields = line.split_whitespace();
-    let (owner, name) = (fields.next()?, fields.next()?);
-    fields.next().is_none().then(|| format!("{owner}/{name}"))
-}
-
-/// Page through a REST listing and pluck one field per repository. gh and
-/// glab expose the same `api` subcommand shape, which `precheck::api_json`
-/// already drives — including authenticating from the forge's environment
-/// variables — so only the paging and the field belong here.
-fn list_api_repos(forge: &Forge, program: &str, path: &str, field: &str) -> Result<Vec<String>> {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    let rows = paginate(|page| {
-        let listing = precheck::api_json(
-            forge,
-            program,
-            &format!("{path}{separator}per_page={PAGE_SIZE}&page={page}"),
-        )?;
-        match listing {
-            serde_json::Value::Array(rows) => Ok(rows),
-            _ => bail!("{program} api returned unexpected output"),
-        }
+/// Page through a forge's repository listing and pluck one field per
+/// repository. `listing` fetches one page as JSON — `precheck::gitea_json`
+/// for Gitea, `precheck::api_json` for the forges with a CLI of their own —
+/// so only the paging and the field belong here. A row without the field is
+/// dropped rather than failing the listing, but a page that isn't an array
+/// at all is the forge saying something else entirely (an error object, a
+/// login prompt) and must not read as the end of the pool.
+fn list_json_repos(
+    field: &str,
+    mut listing: impl FnMut(usize) -> Result<serde_json::Value>,
+) -> Result<Vec<String>> {
+    let rows = paginate(|page| match listing(page)? {
+        serde_json::Value::Array(rows) => Ok(rows),
+        _ => bail!("the repository listing is not an array"),
     })?;
     Ok(rows
         .iter()
@@ -711,7 +672,7 @@ mod tests {
     use anyhow::{Result, bail};
 
     use super::{
-        ExitStatus, Outcome, PAGE_SIZE, Verdict, gitea_repo_path, last_lines, open_log, outcome_of,
+        ExitStatus, Outcome, PAGE_SIZE, Verdict, last_lines, list_json_repos, open_log, outcome_of,
         paginate, safe_repo_path,
     };
 
@@ -882,18 +843,36 @@ mod tests {
         }
     }
 
+    /// Every forge's listing is read the same way: the named field off each
+    /// row, pages asked for until a short one, a fieldless row dropped — and
+    /// a page that isn't an array failing the listing rather than quietly
+    /// ending it, since an error object would otherwise read as an empty
+    /// pool.
     #[test]
-    fn gitea_lines_become_owner_repo_paths() {
-        assert_eq!(
-            gitea_repo_path("cilki turbine"),
-            Some("cilki/turbine".into())
+    fn json_listings_are_paged_and_plucked_by_field() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let repos = list_json_repos("full_name", |page| {
+            asked.borrow_mut().push(page);
+            Ok(match page {
+                1 => serde_json::Value::Array(
+                    (0..PAGE_SIZE)
+                        .map(|n| serde_json::json!({"full_name": format!("cilki/repo{n}")}))
+                        .collect(),
+                ),
+                _ => serde_json::json!([{"full_name": "cilki/last"}, {"id": 7}]),
+            })
+        })
+        .unwrap();
+        assert_eq!(*asked.borrow(), [1, 2]);
+        assert_eq!(repos.len(), PAGE_SIZE + 1);
+        assert_eq!(repos[PAGE_SIZE], "cilki/last");
+
+        assert!(
+            list_json_repos("full_name", |_| Ok(
+                serde_json::json!({"message": "no available login"})
+            ))
+            .is_err()
         );
-        assert_eq!(
-            gitea_repo_path("  cilki	turbine  "),
-            Some("cilki/turbine".into())
-        );
-        assert_eq!(gitea_repo_path("turbine"), None);
-        assert_eq!(gitea_repo_path(""), None);
     }
 
     #[test]
