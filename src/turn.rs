@@ -162,13 +162,15 @@ pub fn run(
         return Ok(Report::default());
     }
 
-    // Whatever this task's answer depends on, read before the agent runs: the
-    // commit it is about to read, taken while the clone is still on a clean
-    // default branch — after the turn it could be sitting on whatever branch
-    // the agent left behind — or the notification stamp it is about to read,
-    // taken before the agent marks any of the feed read. A task that skips is
-    // remembered against it. Best-effort: without it the task is simply drawn
-    // again next time.
+    // Whatever this task's answer depends on, read before the agent runs:
+    // the commit it is about to read, taken while the clone is still on a
+    // clean default branch — after the turn it could be sitting on whatever
+    // branch the agent left behind — the notification stamp it is about to
+    // read, taken before the agent marks any of the feed read, or the
+    // conflicting PRs it is about to look at, taken before any force-push of
+    // its own moves them (the probe memoized them when it answered the
+    // draw). A task that skips is remembered against it. Best-effort:
+    // without it the task is simply drawn again next time.
     let state = match cache::basis(task) {
         Some(cache::Basis::Head) => match workspace::head_sha(&dir) {
             Ok(head) => Some(head),
@@ -177,7 +179,7 @@ pub fn run(
                 None
             }
         },
-        Some(cache::Basis::Feed) => probe.state(task, forge, repo),
+        Some(cache::Basis::Feed | cache::Basis::Prs) => probe.state(task, forge, repo),
         None => None,
     };
 

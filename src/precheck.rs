@@ -7,7 +7,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::{Forge, ForgeKind};
 
@@ -28,9 +28,9 @@ const PR_LIMIT: usize = 20;
 /// repository) pair: `check` waves most of them straight through, so this is
 /// the uniform draw it used to be, but a pair the skip cache has already
 /// answered for is passed over instead of drawn. The cache applies to the
-/// gated pass too — `feedback` is both probed and remembered — so a gated
-/// task can no longer monopolize the draw on a precondition that stays true.
-/// None when nothing at all is worth a turn.
+/// gated pass too — both gated tasks are probed out of the same state their
+/// memory is keyed on — so a gated task can no longer monopolize the draw on
+/// a precondition that stays true. None when nothing at all is worth a turn.
 pub fn draw<'a>(
     tasks: &'a [String],
     pool: &'a [(&'a Forge, String)],
@@ -63,22 +63,6 @@ pub fn draw<'a>(
     None
 }
 
-/// Whether the drawn task has anything to act on in this repository.
-/// `feedback` is answered by `cache::Probe` out of the notification feed it
-/// reads anyway, so only `rebase` needs a probe of its own here: whether any
-/// of the bot's own open PRs conflict with their base. Fail-open: a probe
-/// error is logged and treated as actionable, so a broken probe costs at
-/// most what a blind draw did — an agent turn that ends in TASK SKIPPED.
-pub fn actionable(task: &str, forge: &Forge, repo: &str) -> bool {
-    if task != "rebase" {
-        return true;
-    }
-    has_conflicting_pr(forge, repo).unwrap_or_else(|err| {
-        warn!("{task} precheck failed for {repo}: {err:#}");
-        true
-    })
-}
-
 /// The commit the repository's default branch points at. Every forge's
 /// commit listing defaults to that branch, so one page of one commit answers
 /// it; GitHub and Gitea name the field `sha`, GitLab `id`.
@@ -109,28 +93,28 @@ fn first_sha(commits: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether any open PR authored by the bot conflicts with its base branch.
-/// A branch that is merely behind but merges cleanly doesn't count: there is
-/// nothing a rebase turn would have to resolve.
-fn has_conflicting_pr(forge: &Forge, repo: &str) -> Result<bool> {
+/// The bot's open PRs that conflict with their base branch, as sorted
+/// `number@head-sha` keys. A branch that is merely behind but merges cleanly
+/// doesn't count: there is nothing a rebase turn would have to resolve. The
+/// set doubles as `rebase`'s precondition — non-empty means work — and as
+/// the state a skipped turn is remembered against.
+pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
     if forge.login.is_empty() {
         // An unresolved login would silently match no author at all; bailing
-        // routes through `actionable`'s fail-open instead.
+        // routes through the probe's fail-closed arm instead.
         bail!("the {} login is unresolved", forge.kind.name());
     }
-    match forge.kind {
+    let mut keys = match forge.kind {
         ForgeKind::Gitea => {
             // Gitea's listing carries `mergeable`, which also reads false
             // while its conflict check is still running and for draft PRs;
-            // the worst case is a dispatched turn that ends in TASK SKIPPED.
+            // the worst case is one dispatched turn whose skip is then
+            // remembered until the branch moves.
             let prs = gitea_json(
                 forge,
                 &format!("repos/{repo}/pulls?state=open&limit={PR_LIMIT}"),
             )?;
-            let prs = prs.as_array().context("expected an array of pulls")?;
-            Ok(prs
-                .iter()
-                .any(|pr| authored_by(pr, &forge.login) && conflicting(pr)))
+            conflict_keys(&prs, &forge.login)?
         }
         ForgeKind::Github => {
             let prs = api_json(
@@ -138,6 +122,7 @@ fn has_conflicting_pr(forge: &Forge, repo: &str) -> Result<bool> {
                 "gh",
                 &format!("repos/{repo}/pulls?state=open&per_page={PR_LIMIT}"),
             )?;
+            let mut keys = Vec::new();
             for number in owned_pr_numbers(&prs, &forge.login) {
                 // The listing carries no mergeability; the GET both reads it
                 // and triggers GitHub's lazy computation, so a null (still
@@ -145,10 +130,10 @@ fn has_conflicting_pr(forge: &Forge, repo: &str) -> Result<bool> {
                 // probe sees the computed value.
                 let pr = api_json(forge, "gh", &format!("repos/{repo}/pulls/{number}"))?;
                 if conflicting(&pr) {
-                    return Ok(true);
+                    keys.extend(pr_key(&pr));
                 }
             }
-            Ok(false)
+            keys
         }
         ForgeKind::Gitlab => {
             let project = repo.replace('/', "%2F");
@@ -162,14 +147,13 @@ fn has_conflicting_pr(forge: &Forge, repo: &str) -> Result<bool> {
                     "projects/{project}/merge_requests?state=opened&per_page={PR_LIMIT}&with_merge_status_recheck=true"
                 ),
             )?;
-            let mrs = mrs
-                .as_array()
-                .context("expected an array of merge requests")?;
-            Ok(mrs
-                .iter()
-                .any(|mr| authored_by(mr, &forge.login) && conflicting(mr)))
+            conflict_keys(&mrs, &forge.login)?
         }
-    }
+    };
+    // Listing order isn't stable across fetches, and the skip cache compares
+    // the keys as one joined string, so only a sorted set is deterministic.
+    keys.sort();
+    Ok(keys)
 }
 
 /// One GET via the gh/glab `api` subcommand, parsed as JSON. Unlike
@@ -246,6 +230,29 @@ fn conflicting(pr: &serde_json::Value) -> bool {
     pr["mergeable"].as_bool() == Some(false) || pr["has_conflicts"].as_bool() == Some(true)
 }
 
+/// `number@head-sha` naming the PR's current revision, under either forge
+/// spelling (`number` plus `head.sha` on Gitea and GitHub, `iid` plus `sha`
+/// on GitLab). None for a malformed entry, which is dropped rather than
+/// failing the whole probe.
+fn pr_key(pr: &serde_json::Value) -> Option<String> {
+    let number = pr["number"].as_u64().or_else(|| pr["iid"].as_u64())?;
+    let sha = pr["head"]["sha"].as_str().or_else(|| pr["sha"].as_str())?;
+    Some(format!("{number}@{sha}"))
+}
+
+/// The keys of the listed PRs authored by `login` that their forge reports
+/// as conflicting, for the listings that carry mergeability (Gitea and
+/// GitLab; GitHub's needs a GET per PR instead).
+fn conflict_keys(prs: &serde_json::Value, login: &str) -> Result<Vec<String>> {
+    Ok(prs
+        .as_array()
+        .context("expected an array of pulls")?
+        .iter()
+        .filter(|pr| authored_by(pr, login) && conflicting(pr))
+        .filter_map(pr_key)
+        .collect())
+}
+
 /// The numbers of the listed PRs authored by `login`; GitHub's listing
 /// carries no mergeability, so each costs a GET of its own.
 fn owned_pr_numbers(prs: &serde_json::Value, login: &str) -> Vec<u64> {
@@ -309,25 +316,37 @@ mod tests {
         assert!(owned_pr_numbers(&json!({"message": "oops"}), "bot").is_empty());
     }
 
-    /// The probe's listing filter: only a PR that is both the bot's and
-    /// conflicting counts.
+    /// A PR's key names its number and current head revision, under either
+    /// forge spelling, and a malformed entry yields nothing instead of a
+    /// bogus key.
     #[test]
-    fn only_an_owned_conflicting_pr_counts() {
-        let hit = |prs: &serde_json::Value| {
-            prs.as_array()
-                .unwrap()
-                .iter()
-                .any(|pr| authored_by(pr, "bot") && conflicting(pr))
-        };
-        let mut prs = json!([
-            {"user": {"login": "bot"}, "mergeable": true},
-            {"user": {"login": "someone"}, "mergeable": false},
+    fn pr_key_reads_either_forge_spelling() {
+        assert_eq!(
+            pr_key(&json!({"number": 12, "head": {"sha": "abc"}})),
+            Some("12@abc".to_owned())
+        );
+        assert_eq!(
+            pr_key(&json!({"iid": 7, "sha": "def"})),
+            Some("7@def".to_owned())
+        );
+        assert_eq!(pr_key(&json!({"head": {"sha": "abc"}})), None);
+        assert_eq!(pr_key(&json!({"number": 12})), None);
+    }
+
+    /// The listing filter: only a PR that is both the bot's and conflicting
+    /// gets a key, a keyless entry is dropped rather than fatal, and a
+    /// non-array listing is an error (which the probe fails closed on).
+    #[test]
+    fn conflict_keys_keep_only_owned_conflicting_prs() {
+        let prs = json!([
+            {"number": 15, "user": {"login": "bot"}, "mergeable": false, "head": {"sha": "eee"}},
+            {"number": 1, "user": {"login": "bot"}, "mergeable": true, "head": {"sha": "aaa"}},
+            {"number": 2, "user": {"login": "someone"}, "mergeable": false, "head": {"sha": "bbb"}},
+            {"user": {"login": "bot"}, "mergeable": false, "head": {"sha": "ddd"}},
+            {"number": 12, "user": {"login": "bot"}, "mergeable": false, "head": {"sha": "ccc"}},
         ]);
-        assert!(!hit(&prs));
-        prs.as_array_mut()
-            .unwrap()
-            .push(json!({"user": {"login": "bot"}, "mergeable": false}));
-        assert!(hit(&prs));
+        assert_eq!(conflict_keys(&prs, "bot").unwrap(), ["15@eee", "12@ccc"]);
+        assert!(conflict_keys(&json!({"message": "oops"}), "bot").is_err());
     }
 
     fn forge() -> Forge {
