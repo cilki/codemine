@@ -192,7 +192,7 @@ pub fn run(
     // draw). A task that skips is remembered against it. Best-effort:
     // without it the task is simply drawn again next time.
     let state = match cache::basis(task) {
-        Some(cache::Basis::Head) => match workspace::head_sha(&dir) {
+        Some(cache::Basis::Head) => match workspace::head_sha(&cfg.workspace, &dir) {
             Ok(head) => Some(head),
             Err(err) => {
                 warn!("failed to read {}'s head commit: {err:#}", dir.display());
