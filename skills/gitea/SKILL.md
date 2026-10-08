@@ -12,10 +12,12 @@ Use the `tea` CLI for everything on Gitea; it is already logged in. Inside a
 clone it works out the repository from the git remote, so the `--repo` flag is
 only needed when you are outside one.
 
-See the repositories your account can reach, listed as `<owner>/<repo>`:
+See the repositories your account can reach. Ask for `owner` as well as `name`:
+every `--repo` below wants an `<owner>/<repo>` slug, and `tea` prints the two as
+separate columns for you to join.
 
 ```sh
-tea repos ls --fields name,updated,description
+tea repos ls --fields owner,name,updated,description
 ```
 
 ## Opening a pull request
@@ -58,8 +60,11 @@ When a comment points at a file or line, read that spot in the diff
 (`git diff <base>...<head>`) to see what the reviewer is pointing at. To act on
 feedback:
 
-1. Check out the pull request's branch (`tea pr ls` shows it) and pull first —
-   the branch may have moved since you last saw it.
+1. Check out the pull request's branch (`tea pr ls` shows it under `head`) and
+   pull first — the branch may have moved since you last saw it. Not
+   `tea pr checkout`: it leaves a detached HEAD, or with `-b` a local
+   `pulls/<number>` branch, and pushing from either does not update the pull
+   request.
 2. Make the changes as **new commits**. Do not rewrite history on a branch that
    is under review; force-pushing invalidates the comments the reviewer left.
 3. Push. The pull request updates itself — you do not open a new one.
