@@ -823,21 +823,26 @@
     $("s-model").value = selected;
   }
 
-  function taskRow(name, description) {
-    const label = document.createElement("label");
-    // The sweep command's own instructions for the task, as a hover tooltip.
-    label.title = description;
+  // One checkbox row, for both pickers in the settings dialog: the task pool
+  // and each forge's repositories are the same control over different sets —
+  // `name` is in `set` or it isn't, ticking it moves it, and a row that is
+  // off is dimmed by the `off` class its own panel styles. `label` is
+  // whatever shows beside the box (a task badge, a repository's name) and
+  // `title` the optional tooltip.
+  function checkRow(set, name, label, title) {
+    const row = document.createElement("label");
+    if (title) row.title = title;
     const box = document.createElement("input");
     box.type = "checkbox";
-    box.checked = enabledTasks.has(name);
-    const paint = () => label.className = "check" + (box.checked ? "" : " off");
+    box.checked = set.has(name);
+    const paint = () => row.className = "check" + (box.checked ? "" : " off");
     box.onchange = () => {
-      box.checked ? enabledTasks.add(name) : enabledTasks.delete(name);
+      box.checked ? set.add(name) : set.delete(name);
       paint();
     };
     paint();
-    label.append(box, badge(name));
-    return label;
+    row.append(box, label);
+    return row;
   }
 
   function renderTasks(selected) {
@@ -846,8 +851,9 @@
     const offered = new Map(options.tasks.map(t => [t.slug, t.description]));
     const extra = selected.filter(slug => !offered.has(slug))
       .map(slug => [slug, "not in the sweep command — the runner skips it"]);
+    // The tooltip is the sweep command's own instructions for the task.
     $("s-tasks").replaceChildren(...[...offered, ...extra]
-      .map(([slug, description]) => taskRow(slug, description)));
+      .map(([slug, description]) => checkRow(enabledTasks, slug, badge(slug), description)));
   }
 
   // Niceness is presented as a priority, since the numbers in between make no
@@ -914,20 +920,6 @@
     return card;
   }
 
-  function repoRow(name, forge) {
-    const label = document.createElement("label");
-    label.className = "check" + (enabledRepos[forge].has(name) ? "" : " off");
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = enabledRepos[forge].has(name);
-    box.onchange = () => {
-      box.checked ? enabledRepos[forge].add(name) : enabledRepos[forge].delete(name);
-      label.className = "check" + (box.checked ? "" : " off");
-    };
-    label.append(box, document.createTextNode(name));
-    return label;
-  }
-
   // Hide the rows the search box's text doesn't match. Unchecking a hidden
   // row is impossible, so a filtered save can't silently drop repos.
   function applyRepoFilter(forge) {
@@ -937,7 +929,7 @@
   }
 
   function renderRepos(forge, names) {
-    const rows = names.map(name => repoRow(name, forge));
+    const rows = names.map(name => checkRow(enabledRepos[forge], name, name));
     $(`f-${forge}-repos`).replaceChildren(
       ...(rows.length ? rows : [Object.assign(document.createElement("span"),
         { className: "muted", textContent: "No repositories." })]));

@@ -131,24 +131,31 @@ pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
             project(repo)
         ),
     )?;
-    let mut keys = match forge.kind {
+    let mut keys = Vec::new();
+    for pr in owned_prs(&listing, &forge.login)? {
         // GitHub's listing is the one that carries no mergeability, so each
         // of the bot's PRs costs a GET of its own. That GET both reads
         // mergeability and triggers GitHub's lazy computation of it, so a
         // null (still computing) answer reads as not conflicting and a later
-        // probe sees the computed value.
-        ForgeKind::Github => {
-            let mut keys = Vec::new();
-            for number in owned_pr_numbers(&listing, &forge.login) {
-                let pr = api_json(forge, "gh", &format!("repos/{repo}/pulls/{number}"))?;
-                if conflicting(&pr) {
-                    keys.extend(pr_key(&pr));
+        // probe sees the computed value. The other two forges answer out of
+        // the listing entry itself.
+        let fetched = match forge.kind {
+            ForgeKind::Github => match pr["number"].as_u64() {
+                Some(number) => {
+                    let path = format!("repos/{repo}/pulls/{number}");
+                    Some(api_json(forge, "gh", &path)?)
                 }
-            }
-            keys
+                // A listed PR with no number can't be fetched or keyed, so
+                // it is dropped here as `pr_key` would have dropped it.
+                None => continue,
+            },
+            _ => None,
+        };
+        let pr = fetched.as_ref().unwrap_or(pr);
+        if conflicting(pr) {
+            keys.extend(pr_key(pr));
         }
-        _ => conflict_keys(&listing, &forge.login)?,
-    };
+    }
     // Listing order isn't stable across fetches, and the skip cache compares
     // the keys as one joined string, so only a sorted set is deterministic.
     keys.sort();
@@ -225,30 +232,20 @@ fn pr_key(pr: &serde_json::Value) -> Option<String> {
     Some(format!("{number}@{sha}"))
 }
 
-/// The keys of the listed PRs authored by `login` that their forge reports
-/// as conflicting, for the listings that carry mergeability (Gitea and
-/// GitLab; GitHub's needs a GET per PR instead).
-fn conflict_keys(prs: &serde_json::Value, login: &str) -> Result<Vec<String>> {
+/// The listed PRs authored by `login`, which is as far as every forge's
+/// listing takes the probe in common: whether one of them conflicts is
+/// either on the entry already or one GET away, depending on the forge.
+///
+/// A listing that isn't an array at all is an error rather than an empty
+/// set, so `rebase`'s probe fails closed on it — a forge that answered with
+/// something else never said the bot has no conflicting PRs.
+fn owned_prs<'a>(prs: &'a serde_json::Value, login: &str) -> Result<Vec<&'a serde_json::Value>> {
     Ok(prs
         .as_array()
         .context("expected an array of pulls")?
         .iter()
-        .filter(|pr| authored_by(pr, login) && conflicting(pr))
-        .filter_map(pr_key)
+        .filter(|pr| authored_by(pr, login))
         .collect())
-}
-
-/// The numbers of the listed PRs authored by `login`; GitHub's listing
-/// carries no mergeability, so each costs a GET of its own.
-fn owned_pr_numbers(prs: &serde_json::Value, login: &str) -> Vec<u64> {
-    prs.as_array()
-        .map(|prs| {
-            prs.iter()
-                .filter(|pr| authored_by(pr, login))
-                .filter_map(|pr| pr["number"].as_u64())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -280,16 +277,29 @@ mod tests {
         assert!(!conflicting(&json!({})));
     }
 
+    /// The one filter every forge's listing goes through. A listing that is
+    /// not an array is an error, not an empty set: `rebase`'s probe fails
+    /// closed, and GitHub's half of it used to read such a listing as "no
+    /// conflicting PRs" where the other two reported it.
     #[test]
-    fn owned_pr_numbers_keeps_only_the_bots_prs() {
+    fn owned_prs_keeps_only_the_bots_prs() {
         let prs = json!([
             {"number": 1, "user": {"login": "bot"}},
             {"number": 2, "user": {"login": "someone"}},
+            // Malformed, and the bot's: kept here and dropped where the
+            // number is needed, rather than failing the whole probe.
             {"user": {"login": "bot"}},
-            {"number": 4, "user": {"login": "bot"}},
+            {"number": 4, "author": {"username": "bot"}},
         ]);
-        assert_eq!(owned_pr_numbers(&prs, "bot"), [1, 4]);
-        assert!(owned_pr_numbers(&json!({"message": "oops"}), "bot").is_empty());
+        let owned = owned_prs(&prs, "bot").unwrap();
+        assert_eq!(owned.len(), 3);
+        let numbers: Vec<u64> = owned
+            .iter()
+            .filter_map(|pr| pr["number"].as_u64())
+            .collect();
+        assert_eq!(numbers, [1, 4]);
+        assert!(owned_prs(&json!([]), "bot").unwrap().is_empty());
+        assert!(owned_prs(&json!({"message": "oops"}), "bot").is_err());
     }
 
     /// A PR's key names its number and current head revision, under either
@@ -309,11 +319,12 @@ mod tests {
         assert_eq!(pr_key(&json!({"number": 12})), None);
     }
 
-    /// The listing filter: only a PR that is both the bot's and conflicting
-    /// gets a key, a keyless entry is dropped rather than fatal, and a
-    /// non-array listing is an error (which the probe fails closed on).
+    /// What `conflicting_prs` makes of a listing that carries mergeability
+    /// itself (Gitea and GitLab): only a PR that is both the bot's and
+    /// conflicting gets a key, and a keyless entry is dropped rather than
+    /// failing the whole probe.
     #[test]
-    fn conflict_keys_keep_only_owned_conflicting_prs() {
+    fn only_the_bots_conflicting_prs_are_keyed() {
         let prs = json!([
             {"number": 15, "user": {"login": "bot"}, "mergeable": false, "head": {"sha": "eee"}},
             {"number": 1, "user": {"login": "bot"}, "mergeable": true, "head": {"sha": "aaa"}},
@@ -321,8 +332,13 @@ mod tests {
             {"user": {"login": "bot"}, "mergeable": false, "head": {"sha": "ddd"}},
             {"number": 12, "user": {"login": "bot"}, "mergeable": false, "head": {"sha": "ccc"}},
         ]);
-        assert_eq!(conflict_keys(&prs, "bot").unwrap(), ["15@eee", "12@ccc"]);
-        assert!(conflict_keys(&json!({"message": "oops"}), "bot").is_err());
+        let keys: Vec<String> = owned_prs(&prs, "bot")
+            .unwrap()
+            .into_iter()
+            .filter(|pr| conflicting(pr))
+            .filter_map(pr_key)
+            .collect();
+        assert_eq!(keys, ["15@eee", "12@ccc"]);
     }
 
     fn forge() -> Forge {
