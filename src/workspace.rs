@@ -73,11 +73,12 @@ fn git_in(workspace: &Path, cwd: &Path) -> Command {
     command
 }
 
-/// Atomically write `value` as pretty JSON, for the state the runner keeps at
-/// the workspace root: the settings and the skip cache. The temp file is
-/// created next to the target so the rename can't cross filesystems, and it
-/// carries `tempfile`'s owner-only mode — which is what keeps the forge
-/// tokens in `config.json` out of reach of other local users.
+/// Atomically write `value` as pretty JSON: the state the runner keeps at the
+/// workspace root (the settings and the skip cache) and the opencode config it
+/// maintains all go through here. The temp file is created next to the target
+/// so the rename can't cross filesystems, and it carries `tempfile`'s
+/// owner-only mode — which is what keeps the forge tokens in `config.json`
+/// and the proxy key in `opencode.json` out of reach of other local users.
 pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     let parent = path
         .parent()
