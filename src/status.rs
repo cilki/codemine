@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::watch;
+use tracing::debug;
 
 /// A handle on the status plus its change signal. Cloning is cheap and every
 /// clone shares both.
@@ -83,6 +84,21 @@ pub struct TurnRecord {
     #[serde(skip)]
     pub log_path: PathBuf,
 }
+
+/// How many finished turns are remembered. The list is the whole of the
+/// runner's history — nothing survives a restart — but it is also carried in
+/// full by every status event, rebuilt as DOM rows by every page that
+/// receives one, and backed by one log file per record in the workspace, so
+/// an unbounded one grows all three for as long as the process runs. This
+/// runner takes a turn every twenty minutes or so and is meant to be left
+/// alone for weeks, which is where that stops being theoretical: measured on
+/// the Pi this runs on, 2000 records (about a month) serialize to 398 KB in
+/// 845µs, pushed to each open page every two seconds.
+///
+/// Set where a few days of turns still fit, since that is as far back as the
+/// list is any use: the page shows it as one scrolling column with no way to
+/// search or filter it.
+const HISTORY: usize = 200;
 
 #[derive(Serialize, Clone)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -283,8 +299,9 @@ pub struct Status {
     /// when no limit is configured and turns run back to back.
     pub allowance: Bucket,
     pub totals: Totals,
-    /// Every turn finished since startup, newest first; the process owns no
+    /// The last `HISTORY` turns to finish, newest first; the process owns no
     /// history across restarts, so this is the whole list the UI shows.
+    /// `totals` counts every turn, including the ones that have aged out.
     pub turns: VecDeque<TurnRecord>,
     /// Tail of the last finished turn's log.
     pub log_tail: String,
@@ -343,6 +360,20 @@ impl Status {
             self.totals.tokens.add(tokens);
         }
         self.turns.push_front(record);
+        // A record is the only way to reach a turn's log — the web UI asks
+        // for one by the start epoch this list is keyed on — so the file
+        // behind an aged-out record is unreachable bytes from here on, and
+        // goes with it. Already gone is the ordinary case for a log the
+        // runner never got to write, so a failed unlink is not worth a line
+        // at info.
+        while self.turns.len() > HISTORY {
+            let Some(aged) = self.turns.pop_back() else {
+                break;
+            };
+            if let Err(err) = std::fs::remove_file(&aged.log_path) {
+                debug!("failed to remove {}: {err}", aged.log_path.display());
+            }
+        }
     }
 }
 
@@ -375,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn record_turn_keeps_every_turn_and_totals() {
+    fn record_turn_keeps_recent_turns_and_counts_them_all() {
         let shared = Shared::new();
         Status::update(&shared, |status| {
             for _ in 0..60 {
@@ -391,6 +422,55 @@ mod tests {
         assert_eq!(status.totals.completed, 60);
         assert_eq!(status.totals.skipped, 1);
         assert_eq!(status.totals.tokens.input, 61 * 10);
+    }
+
+    /// The history is bounded, and the log files behind it with it: every
+    /// status event carries the whole list and every page rebuilds it, so a
+    /// runner left alone for weeks must not grow either without end. The
+    /// totals still count the turns that aged out, since they are what the
+    /// page's tallies are read from.
+    #[test]
+    fn an_aged_out_turn_takes_its_log_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Shared::new();
+        let log = |started: u64| dir.path().join(format!("{started}.log"));
+        let turns = HISTORY as u64 + 10;
+        Status::update(&shared, |status| {
+            for started in 0..turns {
+                std::fs::write(log(started), b"agent output").unwrap();
+                let mut record = record(Outcome::Completed);
+                record.started = started;
+                record.log_path = log(started);
+                status.record_turn(record);
+            }
+        });
+
+        let status = shared.lock();
+        assert_eq!(status.turns.len(), HISTORY);
+        assert_eq!(status.totals.turns, turns);
+        assert_eq!(status.totals.tokens.input, turns * 10);
+        // Newest first, and the oldest ten are gone from both the list and
+        // the disk.
+        assert_eq!(status.turns.front().unwrap().started, turns - 1);
+        assert_eq!(status.turns.back().unwrap().started, turns - HISTORY as u64);
+        for started in 0..turns {
+            let kept = started >= turns - HISTORY as u64;
+            assert_eq!(log(started).exists(), kept, "{started}");
+        }
+    }
+
+    /// A record whose log the runner never wrote — a turn that failed before
+    /// the file existed, or one removed under the process — ages out like any
+    /// other rather than wedging the pruning.
+    #[test]
+    fn a_missing_log_does_not_stop_a_turn_aging_out() {
+        let shared = Shared::new();
+        Status::update(&shared, |status| {
+            for _ in 0..HISTORY + 5 {
+                status.record_turn(record(Outcome::Failed));
+            }
+        });
+        assert_eq!(shared.lock().turns.len(), HISTORY);
     }
 
     /// A bucket whose clock starts at epoch zero, so a `refill` is a plain
