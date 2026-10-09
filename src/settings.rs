@@ -125,14 +125,48 @@ impl ForgeSettings {
             ForgeKind::Gitlab => "https://gitlab.com".into(),
         }
     }
-
-    fn trim(&mut self) {
-        self.token = self.token.trim().to_owned();
-        self.url = self.url.trim().trim_end_matches('/').to_owned();
-    }
 }
 
 const FORGE_KINDS: [ForgeKind; 3] = [ForgeKind::Gitea, ForgeKind::Github, ForgeKind::Gitlab];
+
+/// A URL as the settings keep it: no surrounding space, no trailing slash, so
+/// every caller can append a path unconditionally — which they all do, from
+/// `crate::http::get` to the clone URL `workspace::reclone` builds.
+fn normalize_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_owned()
+}
+
+/// Whether a URL names something the runner can actually address. A bare host
+/// is the likeliest way to mistype one, and neither the forge CLIs nor
+/// `crate::http` can make a request without the scheme.
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// A secret arriving from the UI: trimmed, with the stored one kept when it
+/// comes back empty. Every secret here is write-only — [`Settings::redacted`]
+/// sends a `*_set` flag in place of the value — so the browser has nothing to
+/// send back, and blank means "unchanged" rather than "cleared".
+fn keep_stored(incoming: &mut String, stored: &str) {
+    *incoming = incoming.trim().to_owned();
+    if incoming.is_empty() {
+        *incoming = stored.to_owned();
+    }
+}
+
+/// The other half of write-only: replace a secret in one serialized settings
+/// section with the `*_set` flag the UI reads in its place, so the value
+/// itself never reaches the browser.
+fn redact(section: &mut serde_json::Value, field: &str) {
+    let section = section
+        .as_object_mut()
+        .expect("settings sections are objects");
+    let set = section[field]
+        .as_str()
+        .is_some_and(|secret| !secret.is_empty());
+    section.remove(field);
+    section.insert(format!("{field}_set"), set.into());
+}
 
 /// Something that blocks turns from running, tied to the web UI element that
 /// fixes it so the page can mark that field instead of listing the message.
@@ -288,22 +322,10 @@ impl Settings {
     pub fn redacted(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(self).expect("settings serialize to JSON");
         for kind in FORGE_KINDS {
-            let forge = value[kind.name()]
-                .as_object_mut()
-                .expect("forge sections are objects");
-            let set = forge["token"]
-                .as_str()
-                .is_some_and(|token| !token.is_empty());
-            forge.remove("token");
-            forge.insert("token_set".into(), set.into());
+            redact(&mut value[kind.name()], "token");
         }
-        let proxy = value["proxy"]
-            .as_object_mut()
-            .expect("the proxy section is an object");
         for key in ["api_key", "management_key"] {
-            let set = proxy[key].as_str().is_some_and(|key| !key.is_empty());
-            proxy.remove(key);
-            proxy.insert(format!("{key}_set"), set.into());
+            redact(&mut value["proxy"], key);
         }
         value
     }
@@ -314,25 +336,20 @@ impl Settings {
     pub fn apply_update(&mut self, mut incoming: Settings) -> Result<()> {
         incoming.model = incoming.model.trim().to_owned();
         for kind in FORGE_KINDS {
+            let stored = &self.forge(kind).token;
             let forge = incoming.forge_mut(kind);
-            forge.trim();
-            if forge.token.is_empty() {
-                forge.token = self.forge(kind).token.clone();
-            }
+            forge.url = normalize_url(&forge.url);
+            keep_stored(&mut forge.token, stored);
         }
         let proxy = &mut incoming.proxy;
-        proxy.base_url = proxy.base_url.trim().trim_end_matches('/').to_owned();
+        proxy.base_url = normalize_url(&proxy.base_url);
         if proxy.base_url.is_empty() {
+            // The URL is no secret, so an emptied one has no stored value to
+            // fall back on — only the address the proxy normally listens at.
             proxy.base_url = ProxySettings::default().base_url;
         }
-        proxy.api_key = proxy.api_key.trim().to_owned();
-        if proxy.api_key.is_empty() {
-            proxy.api_key = self.proxy.api_key.clone();
-        }
-        proxy.management_key = proxy.management_key.trim().to_owned();
-        if proxy.management_key.is_empty() {
-            proxy.management_key = self.proxy.management_key.clone();
-        }
+        keep_stored(&mut proxy.api_key, &self.proxy.api_key);
+        keep_stored(&mut proxy.management_key, &self.proxy.management_key);
         incoming.validate()?;
         *self = incoming;
         Ok(())
@@ -357,13 +374,14 @@ impl Settings {
         }
         self.schedule.validate()?;
         for kind in FORGE_KINDS {
+            // Empty is how a forge asks for its default instance; Gitea has
+            // none, which `problems` reports instead.
             let url = &self.forge(kind).url;
-            if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+            if !url.is_empty() && !is_http_url(url) {
                 bail!("{} URL must start with http:// or https://", kind.name());
             }
         }
-        let base = &self.proxy.base_url;
-        if !base.starts_with("http://") && !base.starts_with("https://") {
+        if !is_http_url(&self.proxy.base_url) {
             bail!("the CLIProxyAPI URL must start with http:// or https://");
         }
         Ok(())
@@ -637,6 +655,30 @@ mod tests {
             enabled_repos: ["owner/repo".to_owned()].into(),
         };
         assert!(settings.problems().is_empty());
+    }
+
+    /// Every URL the settings hold is stored the same way, so a caller can
+    /// append a path without having to know whose URL it has. The forge URLs
+    /// used to be normalized by one copy of that rule and the proxy's by
+    /// another, and neither copy was covered here.
+    #[test]
+    fn every_url_is_stored_without_its_trailing_slash() {
+        let mut settings = configured();
+        let mut incoming = configured();
+        incoming.gitea.url = "  https://git.example.com/  ".into();
+        incoming.github.url = "https://github.example.com//".into();
+        incoming.proxy.base_url = " http://box:9000/ ".into();
+        settings.apply_update(incoming).unwrap();
+        assert_eq!(settings.gitea.url, "https://git.example.com");
+        assert_eq!(settings.github.url, "https://github.example.com");
+        assert_eq!(settings.proxy.base_url, "http://box:9000");
+
+        // The scheme is required of all of them too, and the message names
+        // which one is wrong.
+        let mut bad = configured();
+        bad.gitlab.url = "gitlab.example.com".into();
+        let err = settings.apply_update(bad).unwrap_err();
+        assert!(err.to_string().contains("gitlab"), "{err}");
     }
 
     #[test]
