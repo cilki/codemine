@@ -122,8 +122,11 @@ async fn favicon() -> impl IntoResponse {
     )
 }
 
-async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(status_value(&state.status))
+async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stamped(&status_json(&state.status)),
+    )
 }
 
 /// A fresh host-details snapshot; the event stream pushes the same shape.
@@ -173,9 +176,8 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             // Status is compared without the server timestamp, which moves on
             // its own and would make every state look new, but sent with it;
             // the log, host, and proxy events compare and send the same JSON.
-            let snapshot = serde_json::to_string(&*state.status.lock()).unwrap_or_default();
-            let status =
-                serde_json::to_string(&status_value(&state.status)).unwrap_or_else(|_| "{}".into());
+            let snapshot = status_json(&state.status);
+            let status = stamped(&snapshot);
             let log =
                 serde_json::to_string(&log_tail(&state.status)).unwrap_or_else(|_| "\"\"".into());
             #[cfg(feature = "hostinfo")]
@@ -230,14 +232,33 @@ async fn send(
         .map_err(|_| ())
 }
 
+/// The status as JSON, which is what both its readers start from: the event
+/// stream compares it to tell a real change from the clock ticking, and
+/// `stamped` turns it into what the page consumes.
+fn status_json(status: &Shared) -> String {
+    serde_json::to_string(&*status.lock()).unwrap_or_else(|_| "{}".into())
+}
+
 /// The status as the page consumes it, stamped with server time so elapsed
 /// and remaining are computed without trusting the browser clock.
-fn status_value(status: &Shared) -> serde_json::Value {
-    let mut value = serde_json::to_value(&*status.lock()).unwrap_or_default();
-    if let Some(object) = value.as_object_mut() {
-        object.insert("now".into(), epoch_now().into());
-    }
-    value
+///
+/// The stamp is spliced into the JSON rather than serialized alongside the
+/// status, because the event stream wants the status both ways — with the
+/// stamp to send, without it to compare — and the stamp is just one more
+/// member of the object a status already serializes as. Building the stamped
+/// copy through a `serde_json::Value` instead cost a second full
+/// serialization plus the whole value tree, which on a runner with a few
+/// hundred turns behind it was the most expensive thing on the stream's
+/// tick.
+fn stamped(status: &str) -> String {
+    let now = epoch_now();
+    let Some(fields) = status.strip_prefix('{') else {
+        return status.to_owned();
+    };
+    // A status always has fields, but an empty object would otherwise come
+    // back with a trailing comma in it.
+    let separator = if fields.starts_with('}') { "" } else { "," };
+    format!("{{\"now\":{now}{separator}{fields}")
 }
 
 /// The running turn's log tail, else the last finished turn's.
@@ -818,5 +839,37 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
         let response = request(addr, "GET", "/api/repos/github", "");
         assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    }
+
+    /// Stamping has to leave JSON behind whatever it is handed, since the
+    /// page parses the result: the stamp joins the members a status already
+    /// has, and a status that somehow serialized to something else is passed
+    /// through rather than corrupted into a half-object.
+    #[test]
+    fn stamping_adds_a_clock_without_breaking_the_json() {
+        let json = stamped(r#"{"activity":{"state":"starting"},"paused":false}"#);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["now"].as_u64().unwrap() > 1_700_000_000);
+        assert_eq!(value["activity"]["state"], "starting");
+        assert_eq!(value["paused"], false);
+
+        // An object with no members of its own takes the stamp alone.
+        let value: serde_json::Value = serde_json::from_str(&stamped("{}")).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 1);
+        assert!(value["now"].is_u64());
+
+        // Not an object: nothing to stamp, and nothing is invented.
+        assert_eq!(stamped("null"), "null");
+    }
+
+    /// The stream sends a status event only when the status itself moved, so
+    /// the JSON it compares must not carry the clock the one it sends does.
+    #[test]
+    fn the_compared_status_carries_no_clock() {
+        let status = Shared::new();
+        let snapshot = status_json(&status);
+        assert!(!snapshot.contains("\"now\""), "{snapshot}");
+        assert_eq!(snapshot, status_json(&status));
+        assert!(stamped(&snapshot).contains("\"now\""));
     }
 }
