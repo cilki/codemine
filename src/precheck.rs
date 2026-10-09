@@ -3,7 +3,6 @@
 //! probes decide priority: a gated task with work waiting outranks whatever a
 //! blind draw would have picked.
 
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -60,7 +59,7 @@ pub fn draw<'a>(
 }
 
 /// One GET against a forge's API, through whichever CLI speaks it: `tea` has
-/// no generic api subcommand so Gitea goes through curl, while gh and glab
+/// no generic api subcommand so Gitea goes over HTTP, while gh and glab
 /// share the same `api` shape. Each forge spells the same question its own
 /// way, so the caller gives all three paths and only its forge's is used.
 pub fn forge_json(
@@ -180,36 +179,22 @@ pub fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::
 /// accepts the connection and then says nothing hangs the caller forever,
 /// and the callers are the activity watcher and the draw's probes — the
 /// runner would stop taking turns at all.
-const API_TIMEOUT_SECS: u32 = 30;
+const API_TIMEOUT_SECS: u64 = 30;
 
-/// One GET against the Gitea API via curl; `tea` has no generic api
-/// subcommand. The auth header goes through `--config -` on stdin so the
-/// token never lands in argv.
+/// One GET against the Gitea API; `tea` has no generic api subcommand, so it
+/// goes over HTTP directly like the proxy's management calls do.
 pub fn gitea_json(forge: &Forge, path: &str) -> Result<serde_json::Value> {
     let url = format!("{}/api/v1/{path}", forge.url.trim_end_matches('/'));
-    let mut child = Command::new("curl")
-        .args(["-sf", "--max-time", &API_TIMEOUT_SECS.to_string()])
-        .args(["--config", "-", &url])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to run curl")?;
-    let config = format!("header = \"Authorization: token {}\"\n", forge.token);
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(config.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "curl {url} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let auth = format!("token {}", forge.token);
+    let (status, body) = crate::http::get(
+        &url,
+        Some(("Authorization", auth.as_str())),
+        API_TIMEOUT_SECS,
+    )?;
+    if !(200..300).contains(&status) {
+        bail!("the gitea api answered HTTP {status} for {url}");
     }
-    serde_json::from_slice(&output.stdout).context("gitea api returned unexpected output")
+    serde_json::from_str(&body).context("gitea api returned unexpected output")
 }
 
 /// Whether the PR was authored by `login`, under either forge spelling of
