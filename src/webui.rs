@@ -183,8 +183,8 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                 .unwrap_or_else(|_| "{}".into());
             // Re-derived each tick, like the host snapshot: the main loop is
             // inside a turn for hours at a time, so proxy health can't ride
-            // the status it owns. The probe shells out to curl (behind a
-            // short cache), so it runs off this current-thread runtime.
+            // the status it owns. The probe makes a blocking request (behind
+            // a short cache), so it runs off this current-thread runtime.
             let proxy_settings = state.settings.snapshot().0.proxy;
             let proxy = tokio::task::spawn_blocking(move || {
                 serde_json::to_string(&crate::proxy::health(&proxy_settings))

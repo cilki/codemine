@@ -4,12 +4,9 @@
 //! --claude-login` on the host); this module only asks the proxy how the
 //! account it holds is doing, for the web UI's card and the main loop's gate.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::settings::ProxySettings;
@@ -65,8 +62,8 @@ pub fn problem(proxy: &ProxySettings) -> Option<String> {
 }
 
 /// How long a health reading stands before the proxy is asked again: the 5s
-/// main loop and the 2s event stream both read it, and each probe shells out
-/// to curl.
+/// main loop and the 2s event stream both read it, and each probe is a
+/// blocking request.
 const HEALTH_TTL: Duration = Duration::from_secs(10);
 
 static HEALTH: Mutex<Option<(Instant, String, AuthHealth)>> = Mutex::new(None);
@@ -89,11 +86,15 @@ pub fn health(proxy: &ProxySettings) -> AuthHealth {
     health
 }
 
+/// How long the proxy has to answer a probe. It is normally a loopback
+/// service, and the probe sits on the event stream's tick.
+const PROBE_TIMEOUT_SECS: u64 = 5;
+
 fn probe(proxy: &ProxySettings) -> AuthHealth {
     if proxy.management_key.is_empty() {
         // Any HTTP answer at all proves the proxy is there; whether a login
         // is installed can't be known without the management API.
-        let up = curl_get(&proxy.base_url, None).is_ok();
+        let up = crate::http::get(&proxy.base_url, None, PROBE_TIMEOUT_SECS).is_ok();
         return AuthHealth {
             proxy_up: up,
             managed: false,
@@ -107,7 +108,8 @@ fn probe(proxy: &ProxySettings) -> AuthHealth {
         };
     }
     let url = format!("{}/v0/management/auth-files", proxy.base_url);
-    match curl_get(&url, Some(&proxy.management_key)) {
+    let header = ("X-Management-Key", proxy.management_key.as_str());
+    match crate::http::get(&url, Some(header), PROBE_TIMEOUT_SECS) {
         Ok((200, body)) => match serde_json::from_str(&body) {
             Ok(files) => health_from(&files),
             Err(_) => unmanaged(true, "the management API returned unexpected output"),
@@ -190,70 +192,9 @@ fn is_claude_entry(entry: &serde_json::Value) -> bool {
     })
 }
 
-/// GET a URL through curl, returning the HTTP status and body; Err means no
-/// HTTP conversation happened at all. The management key goes over stdin via
-/// curl's config syntax rather than argv, where it would be readable in the
-/// process listing.
-fn curl_get(url: &str, management_key: Option<&str>) -> Result<(u16, String)> {
-    let mut command = Command::new("curl");
-    command.args(["-sS", "--max-time", "5", "-w", "\n%{http_code}", url]);
-    let mut child = match management_key {
-        Some(_) => command.args(["--config", "-"]),
-        None => &mut command,
-    }
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .context("failed to run curl")?;
-    if let Some(key) = management_key {
-        child
-            .stdin
-            .take()
-            .expect("stdin was piped")
-            .write_all(format!("header = \"X-Management-Key: {key}\"\n").as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "curl exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    split_status(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// Split curl's output into body and the trailing status line its -w format
-/// appends. Kept pure for tests.
-fn split_status(stdout: &str) -> Result<(u16, String)> {
-    let (body, status) = stdout
-        .trim_end()
-        .rsplit_once('\n')
-        .unwrap_or(("", stdout.trim_end()));
-    let status: u16 = status
-        .trim()
-        .parse()
-        .context("curl reported no HTTP status")?;
-    Ok((status, body.to_owned()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn split_status_separates_body_and_code() {
-        assert_eq!(
-            split_status("{\"files\":[]}\n200").unwrap(),
-            (200, "{\"files\":[]}".into())
-        );
-        assert_eq!(split_status("\n404").unwrap(), (404, "".into()));
-        // curl reports 000 when the connection never happened.
-        assert_eq!(split_status("000").unwrap().0, 0);
-        assert!(split_status("").is_err());
-        assert!(split_status("not a status").is_err());
-    }
 
     #[test]
     fn health_reads_a_live_claude_entry() {

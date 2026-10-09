@@ -10,6 +10,7 @@ mod emblem;
 mod events;
 #[cfg(feature = "hostinfo")]
 mod host;
+mod http;
 mod identity;
 mod precheck;
 mod prompts;
@@ -575,8 +576,8 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
         // an option carries the token to every local user for as long as
         // the command runs, where an environment variable is readable only
         // by the owning user. This is how gh and glab are already given
-        // theirs (`Forge::env`), and why the Gitea API calls pipe the
-        // header through curl's stdin instead of argv.
+        // theirs (`Forge::env`), and why the Gitea API calls make their own
+        // request (`crate::http`) instead of handing a token to a child.
         run(Command::new("tea")
             .args(["login", "add", "--name", "gitea", "--url", &gitea.url])
             .env("GITEA_SERVER_TOKEN", &gitea.token))?;
