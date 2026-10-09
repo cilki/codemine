@@ -31,7 +31,6 @@ Each "turn" does one of the following on a repo:
 - `mutation`: mutate load-bearing code to find gaps the test suite misses.
 - `feature`: propose a new feature as an issue, leaving the call to you rather
   than implementing it.
-- `lint`: fix any results thrown by common linters.
 
 ### Motivation
 

@@ -144,12 +144,6 @@ the user decide what to do.
 - Open an issue describing the feature, why it's worth having, and a sketch of
   how it could be built rather than implementing it directly
 
-## "lint"
-
-- Use a linter to find and fix "code smells"
-- When fixing clippy lints, always attempt to use the --fix option before
-  handling them manually
-
 # General information
 
 Prefer each repo's nix shell when it has one, so wrap build and test commands in

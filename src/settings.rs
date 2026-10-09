@@ -234,7 +234,29 @@ impl Settings {
         if self.model.is_empty() {
             problems.push(Problem::new("s-model", "model is not set"));
         }
+        if self.runnable_tasks().is_empty() {
+            // Reachable from a stored pool alone: a task the sweep command
+            // used to define stays in config.json after it is dropped from
+            // the command. Without this the runner drew it anyway and spent a
+            // turn on a task with no instructions.
+            problems.push(Problem::new(
+                "s-tasks",
+                "no task in the pool is one the sweep command defines",
+            ));
+        }
         problems
+    }
+
+    /// The pool slugs the sweep command still defines, in pool order. The
+    /// turn passes the slug to the command and the command looks up the
+    /// section named by it, so a slug with no section reaches the agent as a
+    /// bare word with nothing to do — dropped here rather than drawn.
+    fn runnable_tasks(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter(|task| crate::prompts::defines(task))
+            .cloned()
+            .collect()
     }
 
     /// The runnable snapshot for a turn; None while `problems` is nonempty.
@@ -248,7 +270,7 @@ impl Settings {
                 .filter_map(|&kind| self.runtime_forge(kind))
                 .collect(),
             model: self.model.clone(),
-            tasks: self.tasks.clone(),
+            tasks: self.runnable_tasks(),
             hourly_limit: self.hourly_limit,
             // Commits are attributed to the model that authored them; the
             // email comes from each forge's account via identity::resolve.
@@ -502,6 +524,28 @@ mod tests {
         // Commits are authored as the model, prettified.
         assert_eq!(config.author_name, "Claude");
         assert_eq!(config.workspace, PathBuf::from("/tmp/ws"));
+    }
+
+    /// A stored pool outlives the sweep command that defined it: dropping a
+    /// task from the command leaves its slug in config.json, and a turn drawn
+    /// on a slug with no section reaches the agent with no instructions. The
+    /// snapshot the runner draws from carries only slugs the command still
+    /// defines, and a pool with nothing left says so on the field that fixes
+    /// it instead of running empty turns.
+    #[test]
+    fn a_pool_slug_the_sweep_command_dropped_is_not_drawn() {
+        let mut settings = configured();
+        settings.tasks = vec!["lint".into(), "docs".into()];
+        assert!(settings.problems().is_empty());
+        assert_eq!(settings.to_config(&cli()).unwrap().tasks, ["docs"]);
+        // The stored pool is left alone, so a hand-edited config.json isn't
+        // rewritten behind the user's back.
+        assert_eq!(settings.tasks, ["lint", "docs"]);
+
+        settings.tasks = vec!["lint".into()];
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert_eq!(fields, ["s-tasks"]);
+        assert!(settings.to_config(&cli()).is_none());
     }
 
     #[test]

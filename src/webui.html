@@ -182,6 +182,8 @@
   /* Unrunnable settings are marked on the field that fixes them, so the
      collapsed panel has to advertise that there is something to fix. */
   .field input.invalid, .field select.invalid { border-color: #e74c3c; }
+  /* The task pool is a checkbox grid rather than a control with a border. */
+  .tasks .checks-grid.invalid { outline: 1px solid #e74c3c; outline-offset: 6px; }
   .forges.invalid { outline: 1px solid #e74c3c; outline-offset: 8px; }
   /* The settings live in a modal so they never overlap the main content.
      Dialogs don't inherit the body's color (the UA default is black), so
@@ -843,7 +845,7 @@
     for (const task of selected) enabledTasks.add(task);
     const offered = new Map(options.tasks.map(t => [t.slug, t.description]));
     const extra = selected.filter(slug => !offered.has(slug))
-      .map(slug => [slug, "not in the sweep command"]);
+      .map(slug => [slug, "not in the sweep command — the runner skips it"]);
     $("s-tasks").replaceChildren(...[...offered, ...extra]
       .map(([slug, description]) => taskRow(slug, description)));
   }

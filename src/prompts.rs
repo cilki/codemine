@@ -1,10 +1,12 @@
 //! Starter prompts baked into the binary and installed into opencode's config
 //! directory at startup, so the binary works without the image copying them.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -351,6 +353,18 @@ pub fn default_tasks() -> Vec<String> {
     tasks().into_iter().map(|task| task.slug).collect()
 }
 
+/// Whether the sweep command defines this task. A pool slug it doesn't define
+/// — a task that has since been removed, or a typo in a hand-edited
+/// config.json — carries no instructions, so drawing it would spend a whole
+/// agent session on a bare word. Parsed once: this is asked on the status
+/// poll, not just at the turn boundary.
+pub fn defines(slug: &str) -> bool {
+    static SLUGS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    SLUGS
+        .get_or_init(|| default_tasks().into_iter().collect())
+        .contains(slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +402,17 @@ mod tests {
             "{}",
             by_slug("roleplay")
         );
+    }
+
+    /// What the stored task pool is filtered through, so it has to answer for
+    /// exactly the sections the command has.
+    #[test]
+    fn defines_answers_for_the_sweep_sections_only() {
+        for slug in default_tasks() {
+            assert!(defines(&slug), "{slug}");
+        }
+        assert!(!defines("no-such-task"));
+        assert!(!defines(""));
     }
 
     #[test]
