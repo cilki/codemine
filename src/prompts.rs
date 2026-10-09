@@ -2,8 +2,6 @@
 //! directory at startup, so the binary works without the image copying them.
 
 use std::collections::BTreeSet;
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -24,6 +22,56 @@ pub const GITLAB_SKILL: &[u8] = include_bytes!("../skills/gitlab/SKILL.md");
 /// else `~/.config/opencode`.
 pub fn opencode_config_dir() -> PathBuf {
     crate::config::xdg_dir("XDG_CONFIG_HOME", ".config").join("opencode")
+}
+
+/// opencode's config file. Three separate pieces of startup work edit it and
+/// a fourth reads it, so the name lives here rather than in each of them.
+fn opencode_json(dir: &Path) -> PathBuf {
+    dir.join("opencode.json")
+}
+
+/// A JSON file as a `Value`. A file that isn't there — or is there and
+/// holds nothing but whitespace, which is what a `touch` or an interrupted
+/// write leaves — reads as an empty object: every caller only ever adds to
+/// or subtracts from what it finds, so there is nothing to tell apart. Any
+/// other unparseable file is an error naming it, because somebody wrote that
+/// file and the alternative is `edit_json` answering a typo in it by
+/// replacing the lot.
+fn read_json(path: &Path) -> Result<serde_json::Value> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(serde_json::json!({}));
+    };
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_slice(&bytes).with_context(|| format!("{} is not valid JSON", path.display()))
+}
+
+/// Read a JSON file, let `edit` change what it found, and write it back when
+/// — and only when — the edit changed something.
+///
+/// Nothing here owns a whole file: opencode's config carries the user's own
+/// settings alongside the provider options and MCP entry codemine maintains,
+/// and its auth.json is entirely theirs but for one dead entry. So an
+/// already-correct file is left as it is, which is what lets it be mounted
+/// read-only — the shape every deployment that configures opencode itself
+/// has, and the reason `install_mcp` gives for not touching the file at all
+/// when codegraph is missing.
+///
+/// The write goes through the same writer the settings and the skip cache
+/// use: a temp file beside the target, created owner-only and renamed into
+/// place. Writing in place left the client key in a file the umask had made
+/// world-readable, and a half-written config behind if the write failed
+/// partway; neither window exists here, for any of the callers rather than
+/// just the one that happens to carry the key.
+fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<()> {
+    let before = read_json(path)?;
+    let mut after = before.clone();
+    edit(&mut after);
+    if after == before {
+        return Ok(());
+    }
+    crate::workspace::write_json(path, &after)
 }
 
 /// Write the embedded prompts under `dir`, overwriting whatever is there; the
@@ -51,7 +99,7 @@ pub fn install(dir: &Path) -> Result<()> {
 /// read-only; a leftover entry is reported instead of removed, because
 /// opencode would try to spawn a binary that isn't there.
 pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
-    let path = dir.join("opencode.json");
+    let path = opencode_json(dir);
     if !codegraph {
         if configures_codegraph(&path) {
             tracing::warn!(
@@ -61,38 +109,33 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let mut config: serde_json::Value = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("{} is not valid JSON", path.display()))?,
-        Err(_) => serde_json::json!({}),
-    };
-    // opencode's config maps server names directly under `mcp`; an earlier
-    // version nested them under `mcp.servers`, which opencode reads as a
-    // server named "servers" and rejects the whole config over, so drop the
-    // leftover on the way through. Accessed via get_mut, not indexing:
-    // IndexMut on Value inserts null for missing keys, and a written-out
-    // `"servers": null` (which one buggy version did leave behind, hence the
-    // Null arm) fails opencode's schema just the same.
-    let drop_servers = match config.get_mut("mcp").and_then(|mcp| mcp.get_mut("servers")) {
-        Some(serde_json::Value::Object(servers)) => {
-            servers.remove("codegraph");
-            servers.is_empty()
+    edit_json(&path, |config| {
+        // opencode's config maps server names directly under `mcp`; an
+        // earlier version nested them under `mcp.servers`, which opencode
+        // reads as a server named "servers" and rejects the whole config
+        // over, so drop the leftover on the way through. Accessed via
+        // get_mut, not indexing: IndexMut on Value inserts null for missing
+        // keys, and a written-out `"servers": null` (which one buggy version
+        // did leave behind, hence the Null arm) fails opencode's schema just
+        // the same.
+        let drop_servers = match config.get_mut("mcp").and_then(|mcp| mcp.get_mut("servers")) {
+            Some(serde_json::Value::Object(servers)) => {
+                servers.remove("codegraph");
+                servers.is_empty()
+            }
+            Some(serde_json::Value::Null) => true,
+            _ => false,
+        };
+        if drop_servers && let Some(mcp) = config.get_mut("mcp").and_then(|mcp| mcp.as_object_mut())
+        {
+            mcp.remove("servers");
         }
-        Some(serde_json::Value::Null) => true,
-        _ => false,
-    };
-    if drop_servers && let Some(mcp) = config.get_mut("mcp").and_then(|mcp| mcp.as_object_mut()) {
-        mcp.remove("servers");
-    }
-    config["mcp"]["codegraph"] = serde_json::json!({
-        "type": "local",
-        "command": ["codegraph", "serve", "--mcp"],
-        "enabled": true,
-    });
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+        config["mcp"]["codegraph"] = serde_json::json!({
+            "type": "local",
+            "command": ["codegraph", "serve", "--mcp"],
+            "enabled": true,
+        });
+    })
 }
 
 /// Hand the opencode plugin install to rtk itself: `rtk init -g --opencode`
@@ -170,40 +213,21 @@ const UNUSED_API_KEY: &str = "cliproxyapi";
 /// Point opencode's anthropic provider at CLIProxyAPI: base URL and client
 /// key merged into `opencode.json`, everything else preserved. The proxy
 /// speaks Anthropic's own API shape, so the stock provider works against it
-/// with no auth.json entry and no plugin. The file is made owner-only since
-/// it may carry the key.
+/// with no auth.json entry and no plugin. The file is written owner-only
+/// since it carries the key — see [`edit_json`].
 pub fn install_provider(dir: &Path, proxy: &crate::settings::ProxySettings) -> Result<()> {
-    let path = dir.join("opencode.json");
-    let mut config: serde_json::Value = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("{} is not valid JSON", path.display()))?,
-        Err(_) => serde_json::json!({}),
-    };
-    config["provider"]["anthropic"]["options"] = serde_json::json!({
-        // The provider's default is https://api.anthropic.com/v1, so the
-        // version segment belongs to the base URL.
-        "baseURL": format!("{}/v1", proxy.base_url),
-        "apiKey": if proxy.api_key.is_empty() {
-            UNUSED_API_KEY
-        } else {
-            &proxy.api_key
-        },
-    });
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    // Written through a temp file beside the target and renamed into place,
-    // the way the settings store writes config.json. Writing the file and
-    // narrowing it afterwards left the key in a file the umask had made
-    // world-readable until the chmod landed, and left a half-written config
-    // behind if the write failed partway; a temp file is created 0600 from
-    // the start and the rename is atomic, so neither window exists.
-    let mut file = tempfile::NamedTempFile::new_in(dir)
-        .with_context(|| format!("failed to create a temp file in {}", dir.display()))?;
-    file.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(&serde_json::to_vec_pretty(&config)?)?;
-    file.persist(&path)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    edit_json(&opencode_json(dir), |config| {
+        config["provider"]["anthropic"]["options"] = serde_json::json!({
+            // The provider's default is https://api.anthropic.com/v1, so the
+            // version segment belongs to the base URL.
+            "baseURL": format!("{}/v1", proxy.base_url),
+            "apiKey": if proxy.api_key.is_empty() {
+                UNUSED_API_KEY
+            } else {
+                &proxy.api_key
+            },
+        });
+    })
 }
 
 /// One-time migration from the opencode-claude-auth era: drop the plugin
@@ -222,17 +246,11 @@ pub fn remove_claude_plugin(dir: &Path, auth_json: &Path) -> Result<()> {
         }
     }
     scrub_plugin_config(dir)?;
-    if let Some(mut auth) = std::fs::read(auth_json)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        && auth
-            .as_object_mut()
-            .is_some_and(|auth| auth.remove("anthropic").is_some())
-    {
-        std::fs::write(auth_json, serde_json::to_vec_pretty(&auth)?)
-            .with_context(|| format!("failed to write {}", auth_json.display()))?;
-    }
-    Ok(())
+    edit_json(auth_json, |auth| {
+        if let Some(auth) = auth.as_object_mut() {
+            auth.remove("anthropic");
+        }
+    })
 }
 
 /// Where opencode stores provider credentials; only touched to scrub the
@@ -242,47 +260,32 @@ pub fn opencode_auth_json() -> PathBuf {
 }
 
 /// Drop npm references to the retired plugin (under its current or previous
-/// name) from opencode's config. The config is only rewritten when something
-/// was actually dropped, because it is often mounted read-only.
+/// name) from opencode's config.
 fn scrub_plugin_config(dir: &Path) -> Result<()> {
-    let path = dir.join("opencode.json");
-    let Some(mut config) = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-    else {
-        return Ok(());
-    };
-    let Some(plugins) = config["plugin"].as_array() else {
-        return Ok(());
-    };
-    let kept: Vec<serde_json::Value> = plugins
-        .iter()
-        .filter(|entry| {
-            !entry.as_str().is_some_and(|entry| {
-                entry.contains("opencode-claude-auth") || entry.contains("opencode-auth-plugin")
-            })
-        })
-        .cloned()
-        .collect();
-    if kept.len() == plugins.len() {
-        return Ok(());
-    }
-    config["plugin"] = kept.into();
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("failed to write {}", path.display()))
+    edit_json(&opencode_json(dir), |config| {
+        // get_mut rather than indexing: IndexMut would plant a null `plugin`
+        // key in a config that never had one, and that alone counts as a
+        // change worth writing back.
+        if let Some(plugins) = config
+            .get_mut("plugin")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            plugins.retain(|entry| {
+                !entry.as_str().is_some_and(|entry| {
+                    entry.contains("opencode-claude-auth") || entry.contains("opencode-auth-plugin")
+                })
+            });
+        }
+    })
 }
 
-/// Whether opencode's config already names the codegraph MCP server; an
-/// unreadable or malformed file is treated as not configuring it, so this
-/// never turns into a startup failure.
+/// Whether opencode's config already names the codegraph MCP server. This is
+/// the one arm that runs when the config may be untouchable, so an
+/// unparseable file is treated as not configuring it rather than becoming a
+/// startup failure.
 fn configures_codegraph(path: &Path) -> bool {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|config| {
-            !config["mcp"]["codegraph"].is_null()
-                || !config["mcp"]["servers"]["codegraph"].is_null()
-        })
+    let config = read_json(path).unwrap_or_default();
+    !config["mcp"]["codegraph"].is_null() || !config["mcp"]["servers"]["codegraph"].is_null()
 }
 
 /// One task the runner can draw: the slug passed to the sweep prompt, plus
@@ -541,9 +544,8 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
 
-        // install_mcp writes the same file first and has no key to protect,
-        // so the real sequence hands install_provider a config at whatever
-        // the umask allowed; the key must not inherit that.
+        // An operator's own config arrives at whatever their umask allowed;
+        // the key must not inherit that.
         std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         install_provider(dir.path(), &proxy).unwrap();
@@ -629,6 +631,101 @@ mod tests {
             install_mcp(dir.path(), false).unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         }
+    }
+
+    /// A rename gives the file a new inode, so this tells a file that was
+    /// rewritten with identical bytes from one that was never written at all.
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().ino()
+    }
+
+    /// A config that already says everything codemine needs is left alone
+    /// rather than rewritten. The arm that runs without codegraph refuses to
+    /// touch the file at all on the grounds that it is often mounted
+    /// read-only; the arms that maintain the entries used to rewrite exactly
+    /// such a file on every startup and every settings save, which is a
+    /// startup failure on a config nobody can write.
+    #[test]
+    fn an_unchanged_config_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = opencode_json(dir.path());
+        let auth = dir.path().join("auth.json");
+        let proxy = crate::settings::ProxySettings::default();
+
+        install_mcp(dir.path(), true).unwrap();
+        install_provider(dir.path(), &proxy).unwrap();
+        let before = (std::fs::read(&path).unwrap(), inode(&path));
+
+        install_mcp(dir.path(), true).unwrap();
+        install_provider(dir.path(), &proxy).unwrap();
+        remove_claude_plugin(dir.path(), &auth).unwrap();
+        assert_eq!((std::fs::read(&path).unwrap(), inode(&path)), before);
+        // There was no stale entry to subtract, so auth.json isn't conjured
+        // up to hold the absence of one.
+        assert!(!auth.exists());
+
+        // A real change still lands.
+        install_provider(
+            dir.path(),
+            &crate::settings::ProxySettings {
+                api_key: "k2".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(inode(&path), before.1);
+    }
+
+    /// Every write of the config is owner-only, not just the one that
+    /// happens to carry the client key: `install_mcp` runs first and creates
+    /// the file, and the key lands in it moments later.
+    #[test]
+    fn the_config_is_owner_only_whichever_write_created_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let dir = tempfile::tempdir().unwrap();
+        install_mcp(dir.path(), true).unwrap();
+        assert_eq!(mode(&opencode_json(dir.path())), 0o600);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            opencode_json(dir.path()),
+            r#"{"plugin":["opencode-claude-auth"]}"#,
+        )
+        .unwrap();
+        remove_claude_plugin(dir.path(), &dir.path().join("auth.json")).unwrap();
+        assert_eq!(mode(&opencode_json(dir.path())), 0o600);
+    }
+
+    /// An empty config is what a `touch` or an interrupted write leaves, and
+    /// there is nothing in it to preserve — reading it as an empty object
+    /// beats failing startup over it. A file with something in it that isn't
+    /// JSON is a different thing: somebody wrote that, and the alternative
+    /// to an error is replacing their typo.
+    #[test]
+    fn an_empty_config_is_not_a_malformed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = opencode_json(dir.path());
+        let proxy = crate::settings::ProxySettings::default();
+
+        std::fs::write(&path, "\n  \n").unwrap();
+        install_provider(dir.path(), &proxy).unwrap();
+        install_mcp(dir.path(), true).unwrap();
+        let config = read_json(&path).unwrap();
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            format!("{}/v1", crate::proxy::DEFAULT_BASE_URL)
+        );
+        assert_eq!(config["mcp"]["codegraph"]["type"], "local");
+
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = install_provider(dir.path(), &proxy).unwrap_err();
+        assert!(format!("{err:#}").contains("is not valid JSON"), "{err:#}");
+        assert!(install_mcp(dir.path(), true).is_err());
+        // Left exactly as it was found, rather than replaced.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
     }
 
     /// rtk's own config is ours to create but not to own: the exclusions land
