@@ -7,12 +7,22 @@
 //! None rather than failing the turn.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::status::TokenUsage;
 
 const MAX_DEPTH: usize = 8;
 const MAX_FILES: usize = 10_000;
+
+/// How far past the turn's start the backwards walk keeps reading before it
+/// accepts that every remaining row is older still. The walk relies on the
+/// `message` table being append-only — a row's rowid is assigned when the
+/// message is first recorded, so rowids and `time_created` ascend together —
+/// and this is the slack in that: a wall clock stepping backwards mid-turn
+/// (an NTP correction, say) is the one thing that can put an older stamp on
+/// a later row, and anything larger than this would have moved the turn's
+/// own `since` too.
+const CLOCK_SLACK: Duration = Duration::from_secs(5 * 60);
 
 /// opencode's data dir: `$XDG_DATA_HOME/opencode`, else
 /// `$HOME/.local/share/opencode`.
@@ -50,20 +60,42 @@ fn databases(data: &Path) -> Vec<PathBuf> {
 /// Sum the `tokens` objects of the messages recorded in opencode's database
 /// since `since`; its `time_created` column is epoch milliseconds and `data`
 /// holds the message JSON.
+///
+/// Read by walking the table backwards and stopping at the first row older
+/// than the window rather than by asking for `time_created >= since`.
+/// opencode indexes `message` by id alone, so the filtered query is a scan
+/// of every message it ever recorded — and this is sampled every few seconds
+/// for the whole of a turn, so the cost of reporting one turn's tokens grew
+/// with the entire history behind it. Walking back from the newest row costs
+/// the turn's own messages plus `CLOCK_SLACK`, whatever the table's size.
 fn from_database(path: &Path, since: SystemTime) -> Option<TokenUsage> {
     let since_ms = since.duration_since(UNIX_EPOCH).ok()?.as_millis() as i64;
+    let stop_ms = since_ms - CLOCK_SLACK.as_millis() as i64;
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()?;
+    // Descending rowid is a reverse walk of the table's own b-tree, not a
+    // sort: rowid *is* the key, so nothing is materialized and the walk can
+    // be abandoned as soon as it reads past the window.
     let mut query = db
-        .prepare("SELECT data FROM message WHERE time_created >= ?1")
+        .prepare("SELECT time_created, data FROM message ORDER BY rowid DESC")
         .ok()?;
     let rows = query
-        .query_map([since_ms], |row| row.get::<_, String>(0))
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .ok()?;
     let mut sum = TokenUsage::default();
     let mut found = false;
-    for data in rows.flatten() {
+    for (created, data) in rows.flatten() {
+        if created < stop_ms {
+            break;
+        }
+        // Inside the slack but still before the turn: not this turn's cost,
+        // and not far enough back to end the walk either.
+        if created < since_ms {
+            continue;
+        }
         let Ok(value) = serde_json::from_str(&data) else {
             continue;
         };
@@ -229,6 +261,53 @@ mod tests {
         let late = UNIX_EPOCH + std::time::Duration::from_millis(since_ms as u64 + 60_000);
         assert!(from_database(&path, late).is_none());
         assert!(from_database(&dir.path().join("missing.db"), since).is_none());
+    }
+
+    /// The backwards walk ends on the first row older than the window, so
+    /// the slack is what keeps a stamp that steps backward mid-turn — and
+    /// every message recorded after it — from being dropped off the sum.
+    /// The far side of the slack is the bound on that tolerance, pinned here
+    /// so it can't be narrowed without noticing.
+    #[test]
+    fn database_tolerates_a_stamp_that_steps_back_within_the_slack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let insert = |id: &str, at: i64, input: u64| {
+            let data = serde_json::json!({ "tokens": { "input": input } }).to_string();
+            db.execute(
+                "INSERT INTO message VALUES (?1, 'ses', ?2, ?2, ?3)",
+                rusqlite::params![id, at, data],
+            )
+            .unwrap();
+        };
+        let since_ms = 1_700_000_000_000i64;
+        let slack_ms = CLOCK_SLACK.as_millis() as i64;
+        let since = UNIX_EPOCH + Duration::from_millis(since_ms as u64);
+
+        // Recorded in order, but the clock stepped back between the first
+        // message and the second, putting a pre-turn stamp on a mid-turn row.
+        insert("first", since_ms + 1_000, 100);
+        insert("stepped", since_ms - 1_000, 7);
+        insert("third", since_ms + 2_000, 20);
+        // The stepped-back row is neither counted nor allowed to end the
+        // walk, so the message behind it still lands.
+        assert_eq!(from_database(&path, since).unwrap().input, 120);
+
+        // A row from before the slack does end it: the walk takes the table
+        // to be ordered by `time_created` from there on, and anything behind
+        // such a row goes unseen.
+        insert("ancient", since_ms - slack_ms - 1, 999);
+        insert("fourth", since_ms + 3_000, 5);
+        assert_eq!(from_database(&path, since).unwrap().input, 5);
     }
 
     #[test]
