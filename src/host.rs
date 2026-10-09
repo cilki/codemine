@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sysinfo::{
-    Components, CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System,
+    Component, Components, CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, RefreshKind,
+    System,
 };
 
 #[derive(Serialize)]
@@ -120,21 +121,107 @@ fn disk_info(path: &Path) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
-/// The CPU's sensor if one is labeled as such, else any sensor at all.
+/// The host's sensors, and which of them the page is shown, kept across
+/// calls. Process wide like `CPU`: every open event stream asks for a
+/// temperature on its own tick, and both halves of the work are wasted on
+/// repeat. Listing the sensors walks `/sys/class/hwmon` and reads every
+/// one's name, label, and thresholds, and reading them all out costs a file
+/// read each — some of them, an NVMe drive's among them, served by the
+/// device rather than the kernel and slow in proportion.
+static SENSORS: Mutex<Option<Sensors>> = Mutex::new(None);
+
+struct Sensors {
+    components: Components,
+    /// Where in `components` the sensor that speaks for the CPU sits,
+    /// settled when the list was built; None when the host exposes no
+    /// readable sensor at all. Only this one is ever read again, so a host
+    /// with a dozen drive sensors costs no more than one with none.
+    chosen: Option<usize>,
+    /// When the list itself was built, as opposed to re-read.
+    listed: Instant,
+}
+
+/// How long a sensor list stands before it is built again, so a sensor that
+/// appears or disappears is still noticed.
+const SENSOR_LIST_TTL: Duration = Duration::from_secs(60);
+
+/// The CPU's temperature in degrees Celsius; None when the host exposes no
+/// sensor to read it from.
 fn cpu_temp() -> Option<f32> {
+    let mut cached = SENSORS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let sensors = match &mut *cached {
+        Some(sensors) if sensors.listed.elapsed() < SENSOR_LIST_TTL => {
+            // A freshly built list carries its first reading already; a
+            // standing one needs the chosen sensor read out again.
+            if let Some(index) = sensors.chosen {
+                sensors.components.list_mut()[index].refresh();
+            }
+            sensors
+        }
+        _ => {
+            let components = Components::new_with_refreshed_list();
+            let chosen = choose_sensor(components.list());
+            cached.insert(Sensors {
+                components,
+                chosen,
+                listed: Instant::now(),
+            })
+        }
+    };
+    let index = sensors.chosen?;
+    sensors.components.list()[index].temperature()
+}
+
+/// Which of the host's sensors speaks for the CPU: one labeled as such, else
+/// any readable sensor at all, so a board that labels nothing still shows a
+/// figure. Sensors with no temperature to give are skipped, since a chosen
+/// one has to stay readable on every later tick.
+fn choose_sensor(components: &[Component]) -> Option<usize> {
     let mut fallback = None;
-    for component in Components::new_with_refreshed_list().list() {
-        let Some(temp) = component.temperature() else {
+    for (index, component) in components.iter().enumerate() {
+        if component.temperature().is_none() {
             continue;
-        };
+        }
         let label = component.label().to_lowercase();
         if ["cpu", "pkg", "core", "soc"]
             .iter()
             .any(|k| label.contains(k))
         {
-            return Some(temp);
+            return Some(index);
         }
-        fallback.get_or_insert(temp);
+        fallback.get_or_insert(index);
     }
     fallback
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reading back one remembered sensor has to answer what scanning every
+    /// sensor does, since the full scan is what the page was shown before.
+    /// A host that exposes no sensor at all — a container with no
+    /// `/sys/class/hwmon` — agrees trivially, on None.
+    #[test]
+    fn the_remembered_sensor_answers_like_a_full_scan() {
+        let all = Components::new_with_refreshed_list();
+        let scanned = choose_sensor(all.list()).and_then(|at| all.list()[at].temperature());
+
+        // Twice, so the second reading goes through the remembered list
+        // rather than building one.
+        assert_eq!(scanned.is_some(), cpu_temp().is_some());
+        let cached = cpu_temp();
+        assert_eq!(scanned.is_some(), cached.is_some());
+        // Both readings are live, so the figure may have moved between them;
+        // what must not differ is which sensor was read, and a different
+        // sensor on the same host reads tens of degrees apart.
+        if let (Some(scanned), Some(cached)) = (scanned, cached) {
+            assert!(
+                (scanned - cached).abs() < 5.0,
+                "read {cached}, a full scan reads {scanned}"
+            );
+        }
+    }
 }
