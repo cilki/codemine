@@ -93,35 +93,32 @@ const PROBE_TIMEOUT_SECS: u64 = 5;
 fn probe(proxy: &ProxySettings) -> AuthHealth {
     if proxy.management_key.is_empty() {
         // Any HTTP answer at all proves the proxy is there; whether a login
-        // is installed can't be known without the management API.
+        // is installed can't be known without the management API. Nothing
+        // went wrong, so there is no error to carry.
         let up = crate::http::get(&proxy.base_url, None, PROBE_TIMEOUT_SECS).is_ok();
-        return AuthHealth {
-            proxy_up: up,
-            managed: false,
-            connected: up,
-            email: None,
-            last_refresh: None,
-            refresh_ok: true,
-            success: None,
-            failed: None,
-            error: None,
-        };
+        return unmanaged(up, None);
     }
     let url = format!("{}/v0/management/auth-files", proxy.base_url);
     let header = ("X-Management-Key", proxy.management_key.as_str());
     match crate::http::get(&url, Some(header), PROBE_TIMEOUT_SECS) {
         Ok((200, body)) => match serde_json::from_str(&body) {
             Ok(files) => health_from(&files),
-            Err(_) => unmanaged(true, "the management API returned unexpected output"),
+            Err(_) => unmanaged(true, Some("the management API returned unexpected output")),
         },
-        Ok((status, _)) => unmanaged(true, &format!("the management API answered HTTP {status}")),
-        Err(_) => unmanaged(false, "the proxy is unreachable"),
+        Ok((status, _)) => unmanaged(
+            true,
+            Some(&format!("the management API answered HTTP {status}")),
+        ),
+        Err(_) => unmanaged(false, Some("the proxy is unreachable")),
     }
 }
 
-/// Health when the management API couldn't be read: reachability is all
-/// that's known, so the account is assumed fine and the error is surfaced.
-fn unmanaged(proxy_up: bool, error: &str) -> AuthHealth {
+/// Health when the management API said nothing usable — or was never asked,
+/// there being no key for it: reachability is all that's known, so the
+/// account is assumed fine and whatever went wrong is surfaced. An error on
+/// an unreachable proxy is dropped, since "unreachable" is already the whole
+/// of what the card has to say.
+fn unmanaged(proxy_up: bool, error: Option<&str>) -> AuthHealth {
     AuthHealth {
         proxy_up,
         managed: false,
@@ -131,7 +128,7 @@ fn unmanaged(proxy_up: bool, error: &str) -> AuthHealth {
         refresh_ok: true,
         success: None,
         failed: None,
-        error: proxy_up.then(|| error.to_owned()),
+        error: error.filter(|_| proxy_up).map(str::to_owned),
     }
 }
 
@@ -179,17 +176,17 @@ fn health_from(files: &serde_json::Value) -> AuthHealth {
 
 /// Whether an auth-files entry belongs to the Claude provider. The listing
 /// covers every provider the proxy holds; Claude entries are recognized by
-/// an explicit provider field or a claude-prefixed file name.
+/// an explicit provider field (`provider`, `type`, `channel`) or a
+/// claude-prefixed file name (`id`, `name`) — whichever of the five this
+/// proxy version spells, since the same test answers for all of them.
 fn is_claude_entry(entry: &serde_json::Value) -> bool {
-    ["provider", "type", "channel"].iter().any(|key| {
-        entry[key]
-            .as_str()
-            .is_some_and(|value| value.contains("claude") || value.contains("anthropic"))
-    }) || ["id", "name"].iter().any(|key| {
-        entry[key]
-            .as_str()
-            .is_some_and(|value| value.contains("claude") || value.contains("anthropic"))
-    })
+    ["provider", "type", "channel", "id", "name"]
+        .iter()
+        .any(|key| {
+            entry[key]
+                .as_str()
+                .is_some_and(|value| value.contains("claude") || value.contains("anthropic"))
+        })
 }
 
 #[cfg(test)]
@@ -263,6 +260,34 @@ mod tests {
             "disabled": false,
         }]});
         assert!(health_from(&files).refresh_ok);
+    }
+
+    /// Every reading that stops short of the management API comes out of one
+    /// place, so they can't drift: nothing is claimed about the account, the
+    /// proxy is taken at its reachability, and an error is shown only when
+    /// there is a reachable proxy for it to be about.
+    #[test]
+    fn an_unmanaged_reading_claims_nothing_about_the_account() {
+        // No key configured: reachable and nothing went wrong.
+        let keyless = unmanaged(true, None);
+        assert!(keyless.proxy_up && keyless.connected && keyless.refresh_ok);
+        assert!(!keyless.managed);
+        assert_eq!(keyless.error, None);
+        assert_eq!(keyless.email, None);
+        assert_eq!((keyless.success, keyless.failed), (None, None));
+
+        // A key that got a useless answer: the reason shows on the card.
+        let refused = unmanaged(true, Some("the management API answered HTTP 401"));
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("the management API answered HTTP 401")
+        );
+
+        // Nothing there at all: "unreachable" is the whole story, so the
+        // card isn't given a second line saying the same thing.
+        let down = unmanaged(false, Some("the proxy is unreachable"));
+        assert!(!down.proxy_up && !down.connected);
+        assert_eq!(down.error, None);
     }
 
     #[test]
