@@ -6,6 +6,9 @@ with pkgs;
 [
   bash
   coreutils
+  diffutils
+  gawk
+  which
   gnugrep
   gnused
   findutils
@@ -22,7 +25,10 @@ with pkgs;
   rustc
   clippy
   rustfmt
+  gcc
   gnumake
+  python3
+  hyperfine
 ]
 # Some packages landed after the 26.05 branch-off and are missing from the
 # pin; pull those from nixos-unstable until they reach a stable release.

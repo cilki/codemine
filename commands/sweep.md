@@ -155,7 +155,13 @@ the user decide what to do.
 
 # General information
 
-Prefer each repo's nix shell when it has one, so wrap build and test commands in
-`nix develop` or `nix-shell`. Prefer `cargo check` over `cargo build` when you
-only need to know whether something compiles; always check the compilation
-succeeds except for trivial changes.
+Everything you need to build and test is already on the PATH: the Rust
+toolchain with a working `cc`, `make`, `python3`, and `hyperfine` for
+benchmarking. There is no `nix` command in this environment — do not try
+`nix develop` or `nix-shell`, and never go hunting through `/nix/store` for
+tools. If a command is missing, note it in your report and work with what is
+on the PATH instead.
+
+Prefer `cargo check` over `cargo build` when you only need to know whether
+something compiles; always check the compilation succeeds except for trivial
+changes.
