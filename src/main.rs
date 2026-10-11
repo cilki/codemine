@@ -52,6 +52,13 @@ fn main() -> Result<()> {
     }
 
     let Some(mut cli) = Cli::parse(std::env::args())? else {
+        // The emblem above the usage text, in block letters in the project
+        // color. Nothing is drawn when the output is a pipe or a file, or when
+        // the user has asked for no color, so `codemine --help | ...` is the
+        // text alone. The `USAGE` that error messages carry is never adorned.
+        if let Some(emblem) = cilki::terminal::banner(&cilki::emblem::CODEMINE, 56, 7) {
+            println!("{emblem}");
+        }
         println!("{USAGE}");
         return Ok(());
     };
