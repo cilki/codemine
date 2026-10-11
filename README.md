@@ -117,3 +117,38 @@ select what repos **codemine** is enabled for (none by default).
 You can view and manage the **codemine** instance via a simple web UI on
 port 8080. This is where you configure your forge settings, rate limits, select
 a model, choose what task types are run, view agent logs, etc.
+
+#### Skip caching
+
+A turn that reports nothing to do remembers the state it answered for, and the
+task isn't drawn for that repository again until the state moves — or until the
+task's own instructions change in a **codemine** upgrade — so a quiet repo
+stops costing a session per task to rediscover that it has nothing to do. What
+counts as the state is whatever the task reads:
+
+- `simplify`, `benchmark`, `docs`, `coverage`, and `mutation` answer out of the
+  code alone, so they remember the default-branch commit they last found
+  nothing at.
+- `feedback` answers out of the forge's notification feed, so it remembers the
+  newest unread thread it read. The feed doubles as the task's precondition: a
+  repository with nothing unread on it isn't drawn for `feedback` at all.
+- `rebase` answers out of the bot's own open PRs, so it remembers the set of
+  conflicting ones. That set is its precondition too — no conflicting PR of its
+  own, no turn.
+
+Any other outcome retires the memory instead, since the turn either changed
+something (and the state it would be remembered against is stale) or never got
+to answer. `bump`, `todo`, `roleplay`, `audit`, and `feature` can become
+actionable with nothing observable moving, so they are never cached. The
+memory lives in `skips.json` in the workspace and survives restarts.
+
+#### Prioritization
+
+On low-resource machines, the CPU priority and I/O class settings throttle the
+agent by spawning it through `nice`/`ionice`; the whole process tree (cargo,
+rustc, test runs, codegraph's indexing) inherits the reduced priorities. Both
+default to spawning the agent unthrottled (`high` CPU priority, full I/O
+priority); `normal` is `nice -n 10`, `low` is `nice -n 19`, and the two I/O
+classes are `ionice -c 2 -n 7` (best-effort) and `ionice -c 3` (idle). I/O
+priorities only take effect on schedulers that honor them (e.g. bfq); CPU
+niceness works everywhere.
