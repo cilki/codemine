@@ -411,6 +411,52 @@ pub fn codegraph_available() -> bool {
     })
 }
 
+/// The index itself, inside codegraph's directory: the SQLite database and
+/// the sidecars that belong to it. This — not the directory around it — is
+/// what decides whether there is an index to sync, and what has to go before
+/// one can be rebuilt.
+///
+/// The directory is no answer to either question. `codegraph init` writes a
+/// `.gitignore` there listing the data files, which projects are meant to
+/// commit, so a fresh clone of any repository that did has `.codegraph/`
+/// with no index in it; and the rest of what lands there is the daemon's
+/// (its socket, pid and log), which no more makes an index than the
+/// `.gitignore` does.
+const INDEX_PREFIX: &str = "codegraph.db";
+
+/// Whether `dir` holds an index for `codegraph sync` to bring forward.
+fn codegraph_indexed(dir: &Path) -> bool {
+    dir.join(".codegraph").join(INDEX_PREFIX).exists()
+}
+
+/// Throw away the index so `codegraph init` rebuilds it: with the database
+/// in place init reports the repository already initialized and does
+/// nothing, so a corrupt index would otherwise survive every attempt to
+/// replace it.
+///
+/// Only the index goes. The directory holding it used to be removed whole,
+/// which took the `.gitignore` codegraph puts there with it — a tracked file
+/// in the repositories that commit it, deleted out of the very clone the
+/// agent is about to be told is checked out clean.
+fn remove_codegraph_index(dir: &Path) -> Result<()> {
+    let dir = dir.join(".codegraph");
+    let entries =
+        std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("failed to read {}", dir.display()))?
+            .path();
+        let index = path
+            .file_name()
+            .is_some_and(|name| name.as_encoded_bytes().starts_with(INDEX_PREFIX.as_bytes()));
+        if index {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Keep the repository's codegraph index current so the agent can explore it
 /// through the `codegraph_explore` tool instead of reading files. On failure
 /// the turn still runs; the agent falls back to normal exploration.
@@ -428,14 +474,14 @@ fn codegraph(cfg: &Config, dir: &Path, log: &File) {
             log,
         )
     };
-    if dir.join(".codegraph").exists() {
+    if codegraph_indexed(dir) {
         match run(&["sync"], CODEGRAPH_SYNC_TIMEOUT) {
             Ok(()) => return,
             // A failing sync usually means a corrupt or outdated index;
             // rebuild it from scratch.
             Err(err) => {
                 warn!("codegraph sync failed ({err:#}); reindexing");
-                if let Err(err) = std::fs::remove_dir_all(dir.join(".codegraph")) {
+                if let Err(err) = remove_codegraph_index(dir) {
                     warn!("failed to remove stale index: {err:#}");
                     return;
                 }
@@ -544,6 +590,44 @@ mod tests {
         std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
         private_dir(&old).unwrap();
         assert_eq!(mode_of(&old), 0o700);
+    }
+
+    /// What counts as an index to sync, and what a rebuild is allowed to
+    /// delete. `codegraph init` writes a `.gitignore` under `.codegraph`
+    /// naming the data files, and projects commit it, so the directory on its
+    /// own says nothing: a fresh clone of such a repository has it with no
+    /// index inside. Reading the directory as the answer sent the first turn
+    /// on every one of them through a `codegraph sync` that could only fail,
+    /// and the "reindex" that followed removed the directory whole — taking a
+    /// tracked file out of the clone the agent is then told is checked out
+    /// clean.
+    #[test]
+    fn an_index_is_the_database_and_only_that_is_rebuilt() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("clone");
+        let codegraph = dir.join(".codegraph");
+        std::fs::create_dir_all(&codegraph).unwrap();
+        // A fresh clone of a repository that committed codegraph's ignore
+        // file: the directory is there, an index is not.
+        std::fs::write(codegraph.join(".gitignore"), "codegraph.db*\n").unwrap();
+        assert!(!codegraph_indexed(&dir));
+
+        // Indexed once codegraph has written its database. The daemon's own
+        // scratch files are no index either.
+        std::fs::write(codegraph.join("daemon.log"), "listening").unwrap();
+        assert!(!codegraph_indexed(&dir));
+        std::fs::write(codegraph.join("codegraph.db"), "index").unwrap();
+        std::fs::write(codegraph.join("codegraph.db-wal"), "pending").unwrap();
+        assert!(codegraph_indexed(&dir));
+
+        // A rebuild takes the database and its sidecars — `codegraph init`
+        // reports the repository already initialized while they are there —
+        // and nothing else.
+        remove_codegraph_index(&dir).unwrap();
+        assert!(!codegraph_indexed(&dir));
+        assert!(!codegraph.join("codegraph.db-wal").exists());
+        assert!(codegraph.join(".gitignore").exists());
+        assert!(codegraph.join("daemon.log").exists());
     }
 
     /// git with a fixed identity, so the test doesn't depend on whatever
