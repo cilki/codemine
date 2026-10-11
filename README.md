@@ -17,7 +17,8 @@ Each "turn" does one of the following on a repo:
 - `feedback`: responds to reviewer comments on its open PRs, and opens a PR for
   an issue it's assigned.
 - `rebase`: rebases its own open PR branches that have merge conflicts with
-  their base branch, resolving the conflicts and force-pushing.
+  their base branch, resolving the conflicts and force-pushing — or closes the
+  PR and deletes the branch when the change has gone obsolete.
 - `bump`: update dependencies, handling any migration issues.
 - `simplify`: remove dead code, simplify implementations, drop trivial tests.
 - `todo`: implement TODOs in the repo.

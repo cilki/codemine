@@ -30,9 +30,10 @@ glab repo list --member --per-page 100
    ```
 
    Each is marked open, merged, or closed. A merged one already landed on the
-   default branch. A closed one was turned down — read it with
-   `glab mr view <number> --comments` to find out why before you go near the
-   same ground again. Never reopen a closed MR and never make duplicate MRs.
+   default branch. A closed one was either turned down or closed by you as
+   obsolete — read it with `glab mr view <number> --comments` to find out
+   which before you go near the same ground again, rather than assuming it was
+   rejected. Never reopen a closed MR and never make duplicate MRs.
 
 2. Branch before you touch anything: `git checkout -b <short-topic>`.
 3. Commit with a message that explains why the change is being made, not just
@@ -75,6 +76,24 @@ feedback:
 If a comment is ambiguous, or asks for something you think is wrong, say so in
 the reply instead of guessing. Address every comment: either make the change or
 explain why you didn't.
+
+## Closing a merge request of your own
+
+A merge request whose change no longer applies — the target branch already
+carries an equivalent change, the code it touched is gone, or the problem it
+fixed no longer exists — is worth less than the reviewer's attention it is
+holding. Close it. Say why first, so the next look at it reads as "this went
+stale" and not "this was turned down":
+
+```sh
+glab mr note create <number> --message "<why the change no longer applies>"
+glab mr close <number>
+git push origin --delete <source-branch>   # glab's close leaves the branch behind
+```
+
+Only your own merge requests, and only on that test: another author's is never
+yours to close, and a change that still applies is never obsolete however
+awkward it has become to land.
 
 ## Clearing todos you have handled
 

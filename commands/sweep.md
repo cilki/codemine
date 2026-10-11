@@ -42,10 +42,10 @@ skip the turn.
 
 Always end your final message with exactly one of these two marker lines: a line
 starting with exactly `TASK COMPLETED` if you changed anything on the forge
-(pushed commits, opened or updated a PR or issue), or a line starting with
-exactly `TASK SKIPPED` otherwise. Never claim `TASK COMPLETED` without a real
-forge change; a turn that ends without a `TASK COMPLETED` marker is counted as
-skipped.
+(pushed commits, opened, updated, or closed a PR or issue), or a line starting
+with exactly `TASK SKIPPED` otherwise. Never claim `TASK COMPLETED` without a
+real forge change; a turn that ends without a `TASK COMPLETED` marker is counted
+as skipped.
 
 If the task is too complicated for a single PR, open an issue instead and let
 the user decide what to do.
@@ -57,10 +57,19 @@ the user decide what to do.
 
 ## "rebase"
 
-- If any of your own open PR branches have merge conflicts with their base
-  branch, rebase them onto the base, resolve the conflicts, and force-push
-- Leave branches that merge cleanly alone, even when they are behind their
-  base, and leave other authors' PRs alone entirely
+- Work only on branches that have an open PR your own forge account authored. A
+  branch with no such PR is not yours: do not rebase it and do not delete it
+- If one of those PRs has merge conflicts with its base branch, rebase it onto
+  the base, resolve the conflicts, and force-push
+- Unless the change is obsolete — the base already carries an equivalent change,
+  the code it touched is gone, or the problem it fixed no longer exists. Then
+  comment on the PR saying why it is obsolete, close it, and delete its branch
+  instead of rebasing. See the `$3` skill for how
+- Conflict size is never the test: a change that still applies gets rebased
+  however messy the conflicts are
+- Leave branches that merge cleanly alone, even when they are behind their base,
+  and leave other authors' PRs alone entirely
+- Delete branches you've created that don't have an open PR
 
 ## "bump"
 
