@@ -5,6 +5,7 @@
 //! configured through the always-on web UI and persisted in the workspace.
 
 mod cache;
+mod child;
 mod config;
 mod emblem;
 mod events;
@@ -588,29 +589,11 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
         // by the owning user. This is how gh and glab are already given
         // theirs (`Forge::env`), and why the Gitea API calls make their own
         // request (`crate::http`) instead of handing a token to a child.
-        run(Command::new("tea")
-            .args(["login", "add", "--name", "gitea", "--url", &gitea.url])
-            .env("GITEA_SERVER_TOKEN", &gitea.token))?;
-    }
-    Ok(())
-}
-
-/// Run `command`, failing with whatever it complained about. The caller's
-/// error reaches the web UI as the reason turns can't run, and a bare exit
-/// status there says nothing about what the user has to fix — a mistyped
-/// token is the likely cause and only the command knows it.
-fn run(command: &mut Command) -> Result<()> {
-    let program = command.get_program().to_string_lossy().into_owned();
-    let output = command
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to run {program}"))?;
-    if !output.status.success() {
-        let said = String::from_utf8_lossy(&output.stderr);
-        match said.trim() {
-            "" => bail!("{program} exited with {}", output.status),
-            said => bail!("{program} exited with {}: {said}", output.status),
-        }
+        child::output(
+            Command::new("tea")
+                .args(["login", "add", "--name", "gitea", "--url", &gitea.url])
+                .env("GITEA_SERVER_TOKEN", &gitea.token),
+        )?;
     }
     Ok(())
 }
@@ -695,14 +678,9 @@ fn paused_as(limited: bool, idle: bool, until: u64) -> Activity {
 }
 
 fn iso8601(epoch: u64) -> Option<String> {
-    let output = Command::new("date")
-        .args(["-d", &format!("@{epoch}"), "-Iseconds"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    let stdout =
+        child::output(Command::new("date").args(["-d", &format!("@{epoch}"), "-Iseconds"])).ok()?;
+    Some(String::from_utf8_lossy(&stdout).trim().to_owned())
 }
 
 #[cfg(test)]

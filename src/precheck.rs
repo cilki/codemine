@@ -3,7 +3,7 @@
 //! probes decide priority: a gated task with work waiting outranks whatever a
 //! blind draw would have picked.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info};
@@ -165,20 +165,8 @@ pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
 /// One GET via the gh/glab `api` subcommand, parsed as JSON. Unlike
 /// `turn::list_api_repos` there is no pagination: one page decides the answer.
 pub fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Value> {
-    let output = Command::new(program)
-        .args(["api", path])
-        .envs(forge.env())
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to run {program}"))?;
-    if !output.status.success() {
-        bail!(
-            "{program} api exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    serde_json::from_slice(&output.stdout)
+    let stdout = crate::child::output(Command::new(program).args(["api", path]).envs(forge.env()))?;
+    serde_json::from_slice(&stdout)
         .with_context(|| format!("{program} api returned unexpected output"))
 }
 

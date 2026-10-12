@@ -378,17 +378,13 @@ pub fn head_sha(workspace: &Path, dir: &Path) -> Result<String> {
 }
 
 /// Stdout of a git command that is run for its answer rather than its
-/// effect; anything but a clean exit is an error.
+/// effect; anything but a clean exit is an error, carrying what git said
+/// about it — `reset_local_config` and `update` both fail the turn through
+/// here, and a bare exit status leaves nothing to go on.
 fn git_stdout(workspace: &Path, dir: &Path, args: &[&str]) -> Result<String> {
-    let output = git_in(workspace, dir)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
-    if !output.status.success() {
-        bail!("git {} exited with {}", args.join(" "), output.status);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let stdout = crate::child::output(git_in(workspace, dir).args(args))
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 /// Whether the codegraph CLI is on the PATH, checked once at first use;
@@ -397,13 +393,10 @@ fn git_stdout(workspace: &Path, dir: &Path, args: &[&str]) -> Result<String> {
 pub fn codegraph_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        let available = Command::new("codegraph")
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        // Its own output is of no interest, and `child::output` captures
+        // both streams rather than letting a version banner land on the
+        // runner's stderr.
+        let available = crate::child::output(Command::new("codegraph").arg("--version")).is_ok();
         if !available {
             warn!("codegraph is not installed; running without indexes");
         }

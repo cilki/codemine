@@ -583,34 +583,26 @@ fn paginate<R>(mut page: impl FnMut(usize) -> Result<Vec<R>>) -> Result<Vec<R>> 
 /// `<owner>/<repo>` path the rest of the runner expects.
 fn list_gitea_repos() -> Result<Vec<String>> {
     let lines = paginate(|page| {
-        let output = Command::new("tea")
-            .args([
-                "repos",
-                "ls",
-                "--output",
-                "simple",
-                "--fields",
-                "owner,name",
-            ])
-            .args([
-                "--limit",
-                &PAGE_SIZE.to_string(),
-                "--page",
-                &page.to_string(),
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .context("failed to run tea")?;
-        if !output.status.success() {
-            bail!(
-                "tea repos ls exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        let stdout = crate::child::output(
+            Command::new("tea")
+                .args([
+                    "repos",
+                    "ls",
+                    "--output",
+                    "simple",
+                    "--fields",
+                    "owner,name",
+                ])
+                .args([
+                    "--limit",
+                    &PAGE_SIZE.to_string(),
+                    "--page",
+                    &page.to_string(),
+                ]),
+        )?;
         // Blank lines are tea's own padding rather than listed repositories,
         // so they don't count toward the page either way.
-        Ok(String::from_utf8_lossy(&output.stdout)
+        Ok(String::from_utf8_lossy(&stdout)
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(str::to_owned)

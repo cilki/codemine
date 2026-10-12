@@ -80,25 +80,15 @@ fn lock(
 /// the first turn. An unrunnable listing is logged and treated as no models
 /// on offer.
 fn available_models() -> Vec<String> {
-    let output = std::process::Command::new("opencode")
-        .arg("models")
-        .env("NO_COLOR", "1")
-        .stdin(std::process::Stdio::null())
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            parse_models(&String::from_utf8_lossy(&output.stdout))
-        }
-        Ok(output) => {
-            tracing::warn!(
-                "opencode models failed with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            Vec::new()
-        }
+    let listing = crate::child::output(
+        std::process::Command::new("opencode")
+            .arg("models")
+            .env("NO_COLOR", "1"),
+    );
+    match listing {
+        Ok(stdout) => parse_models(&String::from_utf8_lossy(&stdout)),
         Err(err) => {
-            tracing::warn!("failed to run opencode models: {err}");
+            tracing::warn!("opencode models failed: {err:#}");
             Vec::new()
         }
     }
