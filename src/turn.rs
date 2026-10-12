@@ -468,8 +468,9 @@ struct Verdict {
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
     /// only these turns count toward the hourly limit.
     completed: bool,
-    /// opencode printed an error report, which it does while still exiting 0.
-    errored: bool,
+    /// The session ended on an opencode error report rather than on the
+    /// agent's own marker, which it does while still exiting 0.
+    died: bool,
     /// The epoch an exhausted usage window reopens at, if the log named one.
     usage_limit: Option<u64>,
     /// The turn died on proxy authentication.
@@ -478,14 +479,14 @@ struct Verdict {
 
 impl Verdict {
     fn read(tail: &str) -> Verdict {
-        // The markers and the error report are the agent's last word, so they
-        // are looked for in the closing lines; the usage notice and the auth
-        // failure are whatever went wrong mid-turn and can sit anywhere in
-        // the tail.
+        // The markers and how the session ended are the agent's last word, so
+        // they are looked for in the closing lines; the usage notice and the
+        // auth failure are whatever went wrong mid-turn and can sit anywhere
+        // in the tail.
         let closing = last_lines(tail, 50);
         Verdict {
             completed: scan::reported_completed(closing),
-            errored: scan::has_error_report(closing),
+            died: scan::died_on_error(closing),
             usage_limit: scan::usage_limit_epoch(tail),
             auth_error: scan::auth_error(tail),
         }
@@ -495,8 +496,8 @@ impl Verdict {
 /// What the finished turn amounts to, and the one line the runner says about
 /// it. How it ended outranks what it said: a turn killed by the cancel button
 /// or the timeout is that, whatever markers its log carries, and a nonzero
-/// exit (or an error report behind a zero one) is a failure before it is
-/// anything else.
+/// exit (or a session that died on an error report behind a zero one) is a
+/// failure before it is anything else.
 fn outcome_of(
     exit: Option<ExitStatus>,
     canceled: bool,
@@ -513,7 +514,7 @@ fn outcome_of(
             warn!("timed out after {elapsed}s");
             Outcome::Timeout
         }
-        Some(exit) if !exit.success() || verdict.errored => {
+        Some(exit) if !exit.success() || verdict.died => {
             warn!(
                 "failed with status {} in {elapsed}s:\n{}",
                 exit.code().unwrap_or(-1),
@@ -715,10 +716,10 @@ mod tests {
         paginate, safe_repo_path,
     };
 
-    fn verdict(completed: bool, errored: bool) -> Verdict {
+    fn verdict(completed: bool, died: bool) -> Verdict {
         Verdict {
             completed,
-            errored,
+            died,
             usage_limit: None,
             auth_error: false,
         }
@@ -741,9 +742,9 @@ mod tests {
         assert_eq!(outcome_of(None, true, &completed, 1, ""), Outcome::Canceled);
         assert_eq!(outcome_of(None, false, &completed, 1, ""), Outcome::Timeout);
 
-        // A nonzero exit is a failure, and so is a clean exit that reported
-        // an error: opencode exits 0 on an unknown command or a missing
-        // model, which is the whole reason the log is scanned at all.
+        // A nonzero exit is a failure, and so is a clean exit whose session
+        // died on an error: opencode exits 0 on an unknown command or a
+        // missing model, which is the whole reason the log is scanned at all.
         assert_eq!(
             outcome_of(exited(1), false, &completed, 1, ""),
             Outcome::Failed
@@ -783,13 +784,65 @@ mod tests {
 
         let verdict = Verdict::read(&format!("{filler}TASK COMPLETED\n"));
         assert!(verdict.completed);
-        assert!(!verdict.errored);
+        assert!(!verdict.died);
         assert_eq!(verdict.usage_limit, None);
         assert!(!verdict.auth_error);
 
         let verdict = Verdict::read(&format!("{filler}Error: unknown command\n"));
-        assert!(verdict.errored);
+        assert!(verdict.died);
         assert!(!verdict.completed);
+    }
+
+    /// A tool call the agent recovered from is not how the turn ended. Every
+    /// session is full of them — a path that isn't there, a CLI given a flag
+    /// it doesn't take — and opencode reports each one with the same `Error:`
+    /// line it uses for the failures that stop a session dead. An error
+    /// anywhere in the closing lines used to outrank the agent's own
+    /// sign-off, so turns that opened a PR and said so were recorded as
+    /// failures, and skips that an error line happened to precede were not
+    /// remembered by the skip cache.
+    #[test]
+    fn an_error_the_agent_recovered_from_is_not_a_failed_turn() {
+        let exited = |code: i32| Some(ExitStatus::from_raw(code << 8));
+        let session = |ending: &str| {
+            format!(
+                "\x1b[0m$ \x1b[0mgit grep nothing\n\
+                 \x1b[91m\x1b[1mError: \x1b[0mpath does not exist: md5sum.test/testHello\n\
+                 I'll try that another way.\n\
+                 {ending}"
+            )
+        };
+
+        // Recovered from, then signed off: the marker is the last word.
+        let completed = Verdict::read(&session("TASK COMPLETED — opened PR #63\n"));
+        assert!(completed.completed);
+        assert!(!completed.died);
+        assert_eq!(
+            outcome_of(exited(0), false, &completed, 1, ""),
+            Outcome::Completed
+        );
+
+        // The same for a skip, which is what the skip cache remembers.
+        let skipped = Verdict::read(&session("TASK SKIPPED\n"));
+        assert!(!skipped.completed);
+        assert!(!skipped.died);
+        assert_eq!(
+            outcome_of(exited(0), false, &skipped, 1, ""),
+            Outcome::Skipped
+        );
+
+        // Nothing after the error: the session died on it, marker or no
+        // marker. The second case is a turn that reported and was then cut
+        // off mid-sentence by the API.
+        let died = Verdict::read(&session("still trying\n"));
+        assert!(died.died);
+        assert_eq!(outcome_of(exited(0), false, &died, 1, ""), Outcome::Failed);
+        let died = Verdict::read(&session(
+            "TASK COMPLETED\nError: {\"type\":\"api_error\",\"message\":\"unexpected EOF\"}\n",
+        ));
+        assert!(died.completed);
+        assert!(died.died);
+        assert_eq!(outcome_of(exited(0), false, &died, 1, ""), Outcome::Failed);
     }
 
     /// Paging is driven by what the forge sent, not by what survives the

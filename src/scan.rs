@@ -3,12 +3,34 @@
 //! scanned for its error reports, task markers, and usage-limit notices.
 //! opencode colors its output, so every scan strips ANSI escapes first.
 
-/// Whether the tail contains an opencode error report: a line starting with
-/// "Error:" or a `"name": "<Something>Error"` JSON field.
-pub fn has_error_report(tail: &str) -> bool {
-    strip_ansi(tail)
-        .lines()
-        .any(|line| line.starts_with("Error:") || has_error_name(line))
+/// Whether the session ended on an opencode error report instead of on the
+/// agent's own sign-off.
+///
+/// opencode prints a report for every tool call that fails, and a turn is
+/// full of calls the agent recovers from: a path that isn't there, a CLI
+/// invoked with a flag it doesn't take, a command that exits nonzero on
+/// purpose. So an error report says nothing on its own about how the turn
+/// went — what tells a session that died from one that carried on is whether
+/// the agent reached its closing marker afterwards. Reports and markers are
+/// therefore read in order and the last one wins: an error with a marker
+/// after it was recovered from, an error with nothing after it is what the
+/// turn died of.
+pub fn died_on_error(tail: &str) -> bool {
+    let mut died = false;
+    for line in strip_ansi(tail).lines() {
+        if is_marker(line) {
+            died = false;
+        } else if is_error_report(line) {
+            died = true;
+        }
+    }
+    died
+}
+
+/// Whether one line is an opencode error report: a line starting with
+/// "Error:" or carrying a `"name": "<Something>Error"` JSON field.
+fn is_error_report(line: &str) -> bool {
+    line.starts_with("Error:") || has_error_name(line)
 }
 
 fn has_error_name(line: &str) -> bool {
@@ -21,13 +43,26 @@ fn has_error_name(line: &str) -> bool {
     })
 }
 
+/// The two markers the sweep command has the agent end its final message
+/// with. One of them is the last thing a session that reached a conclusion of
+/// its own printed, whichever conclusion that was.
+const COMPLETED: &str = "TASK COMPLETED";
+const SKIPPED: &str = "TASK SKIPPED";
+
 /// Whether the agent reported real forge changes: a `TASK COMPLETED` marker
 /// line. Only this marker counts as completed, so a turn that skipped, forgot
 /// the marker, or died halfway can't eat into the hourly limit.
 pub fn reported_completed(tail: &str) -> bool {
     strip_ansi(tail)
         .lines()
-        .any(|line| line.trim_start().starts_with("TASK COMPLETED"))
+        .any(|line| line.trim_start().starts_with(COMPLETED))
+}
+
+/// Whether one line is either marker — the agent signing off, having either
+/// changed something or decided there was nothing to change.
+fn is_marker(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with(COMPLETED) || line.starts_with(SKIPPED)
 }
 
 /// Whether the turn died on authentication somewhere between opencode and
@@ -119,20 +154,46 @@ mod tests {
 
     #[test]
     fn error_line_at_start_only() {
-        assert!(has_error_report(
-            "some output\nError: unknown command\nmore"
-        ));
-        assert!(!has_error_report("some output\n  Error: indented\nmore"));
-        assert!(!has_error_report("an Error: mid-line mention"));
+        assert!(died_on_error("some output\nError: unknown command\nmore"));
+        assert!(!died_on_error("some output\n  Error: indented\nmore"));
+        assert!(!died_on_error("an Error: mid-line mention"));
     }
 
     #[test]
     fn error_name_json() {
-        assert!(has_error_report(r#"{"name": "AuthError", "data": {}}"#));
-        assert!(!has_error_report(r#"{"name": "Error"}"#)); // no leading letters
-        assert!(!has_error_report(r#"{"name": "AuthErrorFoo"}"#)); // not terminal
-        assert!(!has_error_report(r#"{"name": "notanerror"}"#));
-        assert!(!has_error_report(r#"{"label": "AuthError"}"#));
+        assert!(died_on_error(r#"{"name": "AuthError", "data": {}}"#));
+        assert!(!died_on_error(r#"{"name": "Error"}"#)); // no leading letters
+        assert!(!died_on_error(r#"{"name": "AuthErrorFoo"}"#)); // not terminal
+        assert!(!died_on_error(r#"{"name": "notanerror"}"#));
+        assert!(!died_on_error(r#"{"label": "AuthError"}"#));
+    }
+
+    /// Errors and markers are weighed by position, because opencode reports a
+    /// tool call that failed exactly the way it reports a session that died.
+    /// A turn is full of the former — a path that isn't there, a flag a CLI
+    /// doesn't take — and the agent carries on past them to its own sign-off,
+    /// which is what settles how the turn went.
+    #[test]
+    fn the_last_of_the_error_and_the_marker_wins() {
+        let recovered = "Error: NotFound: FileSystem.access (/w/gitea/me/rep)\n\
+                         I'll try that another way.\n";
+        assert!(died_on_error(recovered));
+        assert!(!died_on_error(&format!("{recovered}TASK COMPLETED\n")));
+        assert!(!died_on_error(&format!("{recovered}TASK SKIPPED\n")));
+        // An error after the sign-off is the session dying on its way out,
+        // which is a failure however the agent meant to end.
+        assert!(died_on_error(&format!(
+            "{recovered}TASK COMPLETED\nError: {{\"type\":\"api_error\"}}\n"
+        )));
+        // Several recovered calls in a row still end up recovered from.
+        assert!(!died_on_error(&format!(
+            "{recovered}{recovered}TASK SKIPPED\n"
+        )));
+        // The markers are read through opencode's styling, like everything
+        // else here, and are allowed the indentation the renderer gives them.
+        assert!(!died_on_error(&format!(
+            "{recovered}\x1b[0m  \x1b[1mTASK COMPLETED\x1b[0m — opened PR #5\n"
+        )));
     }
 
     #[test]
@@ -152,7 +213,7 @@ mod tests {
         assert!(reported_completed(
             "\x1b[0m \x1b[1mTASK COMPLETED\x1b[0m — opened PR #5\n"
         ));
-        assert!(has_error_report(
+        assert!(died_on_error(
             "\x1b[91m\x1b[1mError:\x1b[0m the user rejected permission\n"
         ));
         assert_eq!(
