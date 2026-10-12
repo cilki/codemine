@@ -39,7 +39,7 @@ use anyhow::{Context, Result, bail};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Cli, Config, ForgeKind, USAGE};
+use crate::config::{Cli, Config, Forge, ForgeKind, USAGE};
 use crate::settings::{Problem, Settings, SettingsStore};
 use crate::status::{Activity, Shared, Status};
 use crate::turn::Backoff;
@@ -548,18 +548,7 @@ fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
 /// Let git and tea authenticate to every configured forge; re-run whenever
 /// the settings change so new tokens and URLs take effect on the next turn.
 fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
-    let credentials: String = cfg
-        .forges
-        .iter()
-        .map(|forge| {
-            format!(
-                "{}\n",
-                forge
-                    .url
-                    .replacen("://", &format!("://{}:{}@", forge.user, forge.token), 1)
-            )
-        })
-        .collect();
+    let credentials: String = cfg.forges.iter().map(credential_line).collect();
     let path = workspace::git_credentials(&cli.workspace);
     OpenOptions::new()
         .write(true)
@@ -596,6 +585,66 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// One line of git's credential store: the forge's URL with the account's
+/// user and token inserted as its userinfo, which is how every git the runner
+/// spawns authenticates to that forge.
+///
+/// Both halves are percent-encoded, because git reads this file as URLs and
+/// neither half is text the runner chose. The token arrives over the settings
+/// API as arbitrary JSON, or straight out of a hand-edited `config.json`,
+/// which `SettingsStore::load` deserializes without going through the UI's
+/// validation at all — the same reason `crate::http::get` sends a secret as a
+/// typed `HeaderValue` rather than as assembled text. Gitea's user is no more
+/// trusted: it is the account login the forge itself reported, filled in by
+/// `identity::resolve`.
+///
+/// Written raw, the delimiters of the format the value lands in were the
+/// value's to choose, and git's own decoding of this file made that two
+/// different failures:
+///
+/// - A `%` was read as the start of an escape, so the secret git authenticated
+///   with was not the secret that was configured: a token `pct%41bc` reached
+///   the forge as `pctAbc`. Every push and fetch failed its authentication
+///   while `tea`, `gh` and `glab` — which are handed the token through their
+///   environment, not through this file — kept working, so nothing on the page
+///   pointed at the token.
+/// - A `/`, `@`, `#`, `?` or newline ended the authority early, leaving a line
+///   git could not read a credential out of at all. It then fell through to
+///   asking for a username on a terminal the runner does not have, and every
+///   clone, fetch and push on that forge died with `could not read Username`.
+fn credential_line(forge: &Forge) -> String {
+    format!(
+        "{}\n",
+        forge.url.replacen(
+            "://",
+            &format!(
+                "://{}:{}@",
+                encode_userinfo(&forge.user),
+                encode_userinfo(&forge.token)
+            ),
+            1,
+        )
+    )
+}
+
+/// Percent-encode one userinfo component of a URL. Everything outside the
+/// unreserved set goes, which is more than the format strictly reserves: the
+/// point is that git decodes the component back to exactly the bytes it was
+/// given, so what the value may contain stops being a question anyone has to
+/// answer.
+fn encode_userinfo(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 /// The longest a usage-limit notice may hold the runner. The epoch it names
@@ -720,6 +769,118 @@ mod tests {
             )),
             "{written}"
         );
+    }
+
+    fn forge(user: &str, token: &str) -> Forge {
+        Forge {
+            kind: ForgeKind::Gitea,
+            token: token.to_owned(),
+            user: user.to_owned(),
+            login: String::new(),
+            email: String::new(),
+            url: "https://forge.example.com".to_owned(),
+            enabled_repos: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Ask git itself what credential it reads back out of a store holding
+    /// one line for `forge.example.com`. The runner's own git config is
+    /// pushed out of the way: this has to be the line's answer and not the
+    /// developer's credential helper.
+    fn git_credential(line: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("credentials");
+        std::fs::write(&store, line).unwrap();
+        let mut child = Command::new("git")
+            .args([
+                "-c",
+                &format!("credential.helper=store --file={}", store.display()),
+                "credential",
+                "fill",
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=forge.example.com\n\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git could not read {line:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// The credential store is the only way any git the runner spawns
+    /// authenticates, and git reads the file as URLs. So the secret has to
+    /// come back out of git as exactly the secret that went in, whatever
+    /// bytes a token or a forge-reported login happens to hold — a `%` used
+    /// to be decoded into a different secret entirely, and a delimiter used
+    /// to leave a line no credential could be read from at all.
+    #[test]
+    fn a_token_reaches_git_as_the_secret_it_was() {
+        // An ordinary token is unreserved throughout, so the line reads as it
+        // always did and an existing store stays valid across the change.
+        assert_eq!(
+            credential_line(&forge("x-access-token", "ghp_0123456789abcdef")),
+            "https://x-access-token:ghp_0123456789abcdef@forge.example.com\n"
+        );
+
+        for (user, token) in [
+            ("x-access-token", "pct%41bc"),  // was decoded into "pctAbc"
+            ("x-access-token", "sl/ash"),    // ended the authority
+            ("x-access-token", "at@sign"),   // renamed the host
+            ("x-access-token", "hash#frag"), // ended the URL
+            ("x-access-token", "q?uery"),    // likewise
+            ("x-access-token", "pad \t"),    // a paste that kept its spacing
+            ("bot/login", "ghp_plain"),      // the forge named the user
+            ("bot@host", "ghp_plain"),
+        ] {
+            let answer = git_credential(&credential_line(&forge(user, token)));
+            assert!(
+                answer.contains(&format!("\nusername={user}\n")),
+                "{user:?} came back as {answer:?}"
+            );
+            assert!(
+                answer.contains(&format!("\npassword={token}\n")),
+                "{token:?} came back as {answer:?}"
+            );
+        }
+    }
+
+    /// The store holds one line per forge, and a line is a credential for the
+    /// host it names. So a secret must not be able to write lines of its own
+    /// into it — a second line naming a host of the secret's choosing is a
+    /// credential the runner would hand to whatever that host turned out to
+    /// be, and a secret that split the line its own forge was on left that
+    /// forge with no credential at all.
+    ///
+    /// A newline is the one byte that cannot survive the round trip whatever
+    /// is done to it: git's credential protocol is itself newline-delimited,
+    /// so it refuses to pass a value holding one on to the transport. Encoded
+    /// it costs that one forge its lookup, which is the failure it should be;
+    /// raw it was everyone else's problem too.
+    #[test]
+    fn a_secret_cannot_add_a_line_of_its_own() {
+        let line = credential_line(&forge(
+            "x-access-token",
+            "tok\nhttps://x-access-token:tok@attacker.example",
+        ));
+        assert_eq!(
+            line,
+            "https://x-access-token:tok%0Ahttps%3A%2F%2Fx-access-token%3Atok%40attacker.example@forge.example.com\n"
+        );
+        assert_eq!(line.lines().count(), 1);
     }
 
     /// Every hold the runner takes goes through `wait`, so both halves of it
