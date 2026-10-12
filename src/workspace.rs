@@ -343,28 +343,63 @@ fn quote(value: &str) -> String {
 /// left behind by an earlier turn can't hide work pushed since. Branches
 /// with no counterpart — never pushed, or merged and deleted upstream — are
 /// left alone rather than silently thrown away.
+///
+/// Branch names are the agent's, so none of them is spelled out to git as a
+/// bare word. `refs/heads` sits inside the assigned clone — the one place
+/// the Landlock ruleset lets the agent write — and git reads a ref written
+/// straight into it whatever it is called, including names no `git branch`
+/// would create: `git update-ref refs/heads/-x HEAD` makes a branch called
+/// `-x`. Passed positionally that name was an option rather than a branch
+/// (`git branch --force -x origin/-x` is `error: unknown switch 'x'`), and
+/// because `-` sorts ahead of the characters a branch normally starts with,
+/// the planted ref came first and the failure ended the pass before a single
+/// real branch had been brought forward — which is the one thing this
+/// function exists to prevent. `update-ref` takes two fully qualified refs
+/// and no positional name, so there is nothing for a name to be read as.
+///
+/// A whole refname is also the only unambiguous spelling of one.
+/// `%(refname:short)` abbreviates only as far as it can without colliding,
+/// so a branch sharing its name with a tag comes back as `heads/<name>` —
+/// which, handed back as a branch name, names a different branch.
+///
+/// A branch that still fails costs only itself: the remaining ones are what
+/// the refresh is for, and one of them is the branch the next turn works
+/// from.
 fn fast_forward_branches(workspace: &Path, dir: &Path, current: &str, log: &File) -> Result<()> {
-    let refs = |namespace| {
-        git_stdout(
+    let names = |namespace: &str| -> Result<BTreeSet<String>> {
+        let prefix = format!("{namespace}/");
+        let listing = git_stdout(
             workspace,
             dir,
-            &["for-each-ref", "--format=%(refname:short)", namespace],
-        )
+            &["for-each-ref", "--format=%(refname)", namespace],
+        )?;
+        Ok(listing
+            .lines()
+            .filter_map(|refname| refname.strip_prefix(prefix.as_str()))
+            .map(str::to_owned)
+            .collect())
     };
-    let remote: BTreeSet<String> = refs("refs/remotes/origin")?
-        .lines()
-        .filter_map(|name| name.strip_prefix("origin/"))
-        .map(str::to_owned)
-        .collect();
-    for local in refs("refs/heads")?.lines() {
-        if local == current || !remote.contains(local) {
+    // `refs/remotes/origin/HEAD` is the symref naming the default branch,
+    // not a branch of its own; the short spelling hid it (it abbreviates to
+    // `origin`, which carries no branch name to strip).
+    let mut remote = names("refs/remotes/origin")?;
+    remote.remove("HEAD");
+    for local in names("refs/heads")? {
+        if local == current || !remote.contains(&local) {
             continue;
         }
-        run_logged(
-            git_in(workspace, dir).args(["branch", "--force", local, &format!("origin/{local}")]),
+        let moved = run_logged(
+            git_in(workspace, dir).args([
+                "update-ref",
+                &format!("refs/heads/{local}"),
+                &format!("refs/remotes/origin/{local}"),
+            ]),
             GIT_TIMEOUT,
             log,
-        )?;
+        );
+        if let Err(err) = moved {
+            warn!("failed to refresh {local} in {}: {err:#}", dir.display());
+        }
     }
     Ok(())
 }
@@ -726,6 +761,64 @@ mod tests {
             head_of(&origin, "feature")
         );
         assert_eq!(head_of(&clone, "local-only"), local_only);
+    }
+
+    /// The pass exists so a branch an earlier turn left behind cannot hide
+    /// work pushed since, which makes one branch stopping it the worst thing
+    /// that can happen to it. A ref named like an option used to: no `git
+    /// branch` will create `-x`, but git reads one written straight into
+    /// `refs/heads` — and `refs/heads` is inside the clone, the one place
+    /// the sandbox lets the agent write. Passed positionally the name was a
+    /// flag rather than a branch, and since `-` sorts ahead of the
+    /// characters branches normally start with, the command failed before a
+    /// single real branch had been brought forward.
+    #[test]
+    fn a_branch_named_like_an_option_holds_up_no_other() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-b", "main"]);
+        commit(&origin, "first");
+        git(&origin, &["checkout", "-b", "feature"]);
+        commit(&origin, "feature-one");
+        git(&origin, &["checkout", "main"]);
+        let clone = root.path().join("clone");
+        git(
+            root.path(),
+            &[
+                "clone",
+                &origin.display().to_string(),
+                &clone.display().to_string(),
+            ],
+        );
+        // A branch an earlier turn left pinned to the old commit, plus the
+        // ref no `git branch` would have made. Both sides need it: the
+        // fetch's `--prune` drops a remote-tracking ref origin doesn't have.
+        git(&clone, &["branch", "feature", "origin/feature"]);
+        git(&origin, &["update-ref", "refs/heads/-x", "refs/heads/main"]);
+        git(&clone, &["update-ref", "refs/heads/-x", "refs/heads/main"]);
+
+        // Upstream moves on everything while the clone sits idle.
+        git(&origin, &["checkout", "feature"]);
+        commit(&origin, "feature-two");
+        git(&origin, &["checkout", "main"]);
+        commit(&origin, "second");
+        git(
+            &origin,
+            &["update-ref", "refs/heads/-x", "refs/heads/feature"],
+        );
+
+        let log = tempfile::tempfile().unwrap();
+        update(root.path(), &url_of(&origin), &clone, &log).unwrap();
+
+        assert_eq!(head_of(&clone, "main"), head_of(&origin, "main"));
+        // The ordinary branch sorted behind it came forward...
+        assert_eq!(head_of(&clone, "feature"), head_of(&origin, "feature"));
+        // ...and so did the awkwardly named one itself.
+        assert_eq!(
+            head_of(&clone, "refs/heads/-x"),
+            head_of(&origin, "refs/heads/-x")
+        );
     }
 
     /// The clone is the agent's to write, so its `.git` is whatever the last
