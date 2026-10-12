@@ -13,7 +13,7 @@ use wait_timeout::ChildExt;
 use crate::cache;
 use crate::config::{Config, Forge, ForgeKind};
 use crate::precheck;
-use crate::scan;
+use crate::scan::{Verdict, last_lines};
 use crate::status::{Activity, Outcome, Shared, Status, TokenUsage, TurnRecord, epoch_now};
 use crate::workspace;
 
@@ -458,41 +458,6 @@ fn supervise(
     Ok((exit, canceled, sampled))
 }
 
-/// What the turn's log says about how it went. opencode exits 0 even when the
-/// turn died on an error, so its exit status settles almost nothing and the
-/// log is the witness for all four of these — read once, here, rather than
-/// scanned again wherever one of the answers is wanted. Three of the four
-/// were read in two different places apiece, and two of those re-sliced the
-/// same closing lines to do it.
-struct Verdict {
-    /// The agent reported real forge changes with a `TASK COMPLETED` marker;
-    /// only these turns count toward the hourly limit.
-    completed: bool,
-    /// The session ended on an opencode error report rather than on the
-    /// agent's own marker, which it does while still exiting 0.
-    died: bool,
-    /// The epoch an exhausted usage window reopens at, if the log named one.
-    usage_limit: Option<u64>,
-    /// The turn died on proxy authentication.
-    auth_error: bool,
-}
-
-impl Verdict {
-    fn read(tail: &str) -> Verdict {
-        // The markers and how the session ended are the agent's last word, so
-        // they are looked for in the closing lines; the usage notice and the
-        // auth failure are whatever went wrong mid-turn and can sit anywhere
-        // in the tail.
-        let closing = last_lines(tail, 50);
-        Verdict {
-            completed: scan::reported_completed(closing),
-            died: scan::died_on_error(closing),
-            usage_limit: scan::usage_limit_epoch(tail),
-            auth_error: scan::auth_error(tail),
-        }
-    }
-}
-
 /// What the finished turn amounts to, and the one line the runner says about
 /// it. How it ended outranks what it said: a turn killed by the cancel button
 /// or the timeout is that, whatever markers its log carries, and a nonzero
@@ -697,14 +662,6 @@ pub fn read_tail(file: &mut std::fs::File, limit: u64) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn last_lines(text: &str, count: usize) -> &str {
-    let trimmed = text.strip_suffix('\n').unwrap_or(text);
-    match trimmed.rmatch_indices('\n').nth(count.saturating_sub(1)) {
-        Some((at, _)) => &text[at + 1..],
-        None => text,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt;
@@ -712,8 +669,8 @@ mod tests {
     use anyhow::{Result, bail};
 
     use super::{
-        ExitStatus, Outcome, PAGE_SIZE, Verdict, gitea_repo_path, last_lines, open_log, outcome_of,
-        paginate, safe_repo_path,
+        ExitStatus, Outcome, PAGE_SIZE, Verdict, gitea_repo_path, open_log, outcome_of, paginate,
+        safe_repo_path,
     };
 
     fn verdict(completed: bool, died: bool) -> Verdict {
@@ -764,33 +721,6 @@ mod tests {
             outcome_of(exited(0), false, &verdict(false, false), 1, ""),
             Outcome::Skipped
         );
-    }
-
-    /// The log is read once, and where each thing is looked for matters. The
-    /// agent's markers are its last word, so a `TASK COMPLETED` left far
-    /// above the end — by a turn that reported and then ran on for pages — is
-    /// not its answer. A usage notice or an auth failure is whatever went
-    /// wrong mid-turn, so those are looked for in the whole tail.
-    #[test]
-    fn the_log_is_read_for_markers_at_the_end_and_failures_anywhere() {
-        let filler = "filler\n".repeat(60);
-
-        let verdict = Verdict::read(&format!(
-            "TASK COMPLETED\nusage limit reached|1757000000\nauthentication_error\n{filler}"
-        ));
-        assert_eq!(verdict.usage_limit, Some(1_757_000_000));
-        assert!(verdict.auth_error);
-        assert!(!verdict.completed, "a buried marker is not the answer");
-
-        let verdict = Verdict::read(&format!("{filler}TASK COMPLETED\n"));
-        assert!(verdict.completed);
-        assert!(!verdict.died);
-        assert_eq!(verdict.usage_limit, None);
-        assert!(!verdict.auth_error);
-
-        let verdict = Verdict::read(&format!("{filler}Error: unknown command\n"));
-        assert!(verdict.died);
-        assert!(!verdict.completed);
     }
 
     /// A tool call the agent recovered from is not how the turn ended. Every
@@ -947,14 +877,5 @@ mod tests {
         );
         assert_eq!(gitea_repo_path("turbine"), None);
         assert_eq!(gitea_repo_path(""), None);
-    }
-
-    #[test]
-    fn last_lines_counts_like_tail() {
-        assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc\n");
-        assert_eq!(last_lines("a\nb\nc", 2), "b\nc");
-        assert_eq!(last_lines("a\nb\nc\n", 1), "c\n");
-        assert_eq!(last_lines("a\nb", 50), "a\nb");
-        assert_eq!(last_lines("", 50), "");
     }
 }

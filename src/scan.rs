@@ -1,7 +1,64 @@
-//! Heuristics over the opencode log. opencode exits 0 even when the turn died
-//! on an error (unknown command, missing auth, bad model), so the log tail is
-//! scanned for its error reports, task markers, and usage-limit notices.
-//! opencode colors its output, so every scan strips ANSI escapes first.
+//! What the tail of a turn's log says about how the turn went. opencode exits
+//! 0 even when the turn died on an error (unknown command, missing auth, bad
+//! model), so its exit status settles almost nothing and the log is the
+//! witness: it is scanned for opencode's error reports, the agent's own task
+//! markers, usage-limit notices, and proxy authentication failures.
+//!
+//! opencode colors its output, so the tail has to be read through ANSI
+//! escapes. That stripping — and the slice of closing lines the markers are
+//! looked for in — happens once, in [`Verdict::read`], and every answer below
+//! comes off that one copy. Each answer used to strip the text for itself,
+//! and the only caller wants all four: two strips of the closing lines and
+//! two of the whole tail, to say four things about one piece of text.
+
+/// What the turn's log says about how it went: the four things the log is the
+/// only witness to, read together because they are read from one text.
+pub struct Verdict {
+    /// The agent reported real forge changes with a `TASK COMPLETED` marker;
+    /// only these turns count toward the hourly limit.
+    pub completed: bool,
+    /// The session ended on an opencode error report rather than on the
+    /// agent's own marker, which it does while still exiting 0.
+    pub died: bool,
+    /// The epoch an exhausted usage window reopens at, if the log named one.
+    pub usage_limit: Option<u64>,
+    /// The turn died on proxy authentication.
+    pub auth_error: bool,
+}
+
+/// How much of the tail counts as the agent's last word. A `TASK COMPLETED`
+/// left further back than this — by a turn that reported and then ran on for
+/// pages — is not how the session ended.
+const CLOSING_LINES: usize = 50;
+
+impl Verdict {
+    /// Read the log tail once and answer all four questions off it, rather
+    /// than scanning it again wherever one of the answers is wanted.
+    pub fn read(tail: &str) -> Verdict {
+        let tail = strip_ansi(tail);
+        // The markers and how the session ended are the agent's last word, so
+        // they are looked for in the closing lines; the usage notice and the
+        // auth failure are whatever went wrong mid-turn and can sit anywhere
+        // in the tail.
+        let closing = last_lines(&tail, CLOSING_LINES);
+        Verdict {
+            completed: reported_completed(closing),
+            died: died_on_error(closing),
+            usage_limit: usage_limit_epoch(&tail),
+            auth_error: auth_error(&tail),
+        }
+    }
+}
+
+/// The last `count` lines of `text`, counted the way `tail` counts them: a
+/// trailing newline ends the last line rather than opening an empty one.
+pub fn last_lines(text: &str, count: usize) -> &str {
+    let trimmed = text.strip_suffix('\n').unwrap_or(text);
+    match trimmed.rmatch_indices('\n').nth(count.saturating_sub(1)) {
+        Some((at, _)) => &text[at + 1..],
+        None => text,
+    }
+}
 
 /// Whether the session ended on an opencode error report instead of on the
 /// agent's own sign-off.
@@ -15,9 +72,9 @@
 /// therefore read in order and the last one wins: an error with a marker
 /// after it was recovered from, an error with nothing after it is what the
 /// turn died of.
-pub fn died_on_error(tail: &str) -> bool {
+fn died_on_error(closing: &str) -> bool {
     let mut died = false;
-    for line in strip_ansi(tail).lines() {
+    for line in closing.lines() {
         if is_marker(line) {
             died = false;
         } else if is_error_report(line) {
@@ -52,8 +109,8 @@ const SKIPPED: &str = "TASK SKIPPED";
 /// Whether the agent reported real forge changes: a `TASK COMPLETED` marker
 /// line. Only this marker counts as completed, so a turn that skipped, forgot
 /// the marker, or died halfway can't eat into the hourly limit.
-pub fn reported_completed(tail: &str) -> bool {
-    strip_ansi(tail)
+fn reported_completed(closing: &str) -> bool {
+    closing
         .lines()
         .any(|line| line.trim_start().starts_with(COMPLETED))
 }
@@ -73,8 +130,7 @@ fn is_marker(line: &str) -> bool {
 /// credential knows no claude models and answers `unknown provider for model
 /// ...`, and a dead login upstream passes Anthropic's own
 /// `authentication_error` through.
-pub fn auth_error(tail: &str) -> bool {
-    let tail = strip_ansi(tail);
+fn auth_error(tail: &str) -> bool {
     [
         "authentication_error",
         "Invalid API key",
@@ -95,8 +151,7 @@ pub fn auth_error(tail: &str) -> bool {
 /// when they are the length of one: nine or ten. Fewer is the noise the lower
 /// bound always rejected; more is a number that reached the log some other
 /// way, and eleven digits already name a date past the year 5000.
-pub fn usage_limit_epoch(tail: &str) -> Option<u64> {
-    let tail = strip_ansi(tail);
+fn usage_limit_epoch(tail: &str) -> Option<u64> {
     tail.split("usage limit reached|").skip(1).find_map(|rest| {
         let digits = &rest[..rest
             .find(|c: char| !c.is_ascii_digit())
@@ -191,9 +246,12 @@ mod tests {
         )));
         // The markers are read through opencode's styling, like everything
         // else here, and are allowed the indentation the renderer gives them.
-        assert!(!died_on_error(&format!(
-            "{recovered}\x1b[0m  \x1b[1mTASK COMPLETED\x1b[0m — opened PR #5\n"
-        )));
+        assert!(
+            !Verdict::read(&format!(
+                "{recovered}\x1b[0m  \x1b[1mTASK COMPLETED\x1b[0m — opened PR #5\n"
+            ))
+            .died
+        );
     }
 
     #[test]
@@ -208,18 +266,54 @@ mod tests {
         assert!(!reported_completed("opened a PR and wandered off\n"));
     }
 
+    /// Every answer is read through opencode's styling, off the one stripped
+    /// copy `Verdict::read` makes: an escape sequence between the words of a
+    /// marker, or in the middle of a usage-limit epoch, must not hide it.
     #[test]
     fn markers_survive_ansi_styling() {
-        assert!(reported_completed(
-            "\x1b[0m \x1b[1mTASK COMPLETED\x1b[0m — opened PR #5\n"
-        ));
-        assert!(died_on_error(
-            "\x1b[91m\x1b[1mError:\x1b[0m the user rejected permission\n"
-        ));
+        assert!(Verdict::read("\x1b[0m \x1b[1mTASK COMPLETED\x1b[0m — opened PR #5\n").completed);
+        assert!(Verdict::read("\x1b[91m\x1b[1mError:\x1b[0m the user rejected permission\n").died);
         assert_eq!(
-            usage_limit_epoch("\x1b[33musage limit reached|\x1b[1m1757000000\x1b[0m"),
-            Some(1757000000)
+            Verdict::read("\x1b[33musage limit reached|\x1b[1m1757000000\x1b[0m").usage_limit,
+            Some(1_757_000_000)
         );
+        assert!(Verdict::read("\x1b[91mauthentication_error\x1b[0m").auth_error);
+    }
+
+    /// The log is read once, and where each thing is looked for matters. The
+    /// agent's markers are its last word, so a `TASK COMPLETED` left far
+    /// above the end — by a turn that reported and then ran on for pages — is
+    /// not its answer. A usage notice or an auth failure is whatever went
+    /// wrong mid-turn, so those are looked for in the whole tail.
+    #[test]
+    fn markers_are_read_at_the_end_and_failures_anywhere() {
+        let filler = "filler\n".repeat(CLOSING_LINES + 10);
+
+        let verdict = Verdict::read(&format!(
+            "TASK COMPLETED\nusage limit reached|1757000000\nauthentication_error\n{filler}"
+        ));
+        assert_eq!(verdict.usage_limit, Some(1_757_000_000));
+        assert!(verdict.auth_error);
+        assert!(!verdict.completed, "a buried marker is not the answer");
+
+        let verdict = Verdict::read(&format!("{filler}TASK COMPLETED\n"));
+        assert!(verdict.completed);
+        assert!(!verdict.died);
+        assert_eq!(verdict.usage_limit, None);
+        assert!(!verdict.auth_error);
+
+        let verdict = Verdict::read(&format!("{filler}Error: unknown command\n"));
+        assert!(verdict.died);
+        assert!(!verdict.completed);
+    }
+
+    #[test]
+    fn last_lines_counts_like_tail() {
+        assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc\n");
+        assert_eq!(last_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(last_lines("a\nb\nc\n", 1), "c\n");
+        assert_eq!(last_lines("a\nb", 50), "a\nb");
+        assert_eq!(last_lines("", 50), "");
     }
 
     #[test]
@@ -250,7 +344,6 @@ mod tests {
         assert!(auth_error(
             r#"{"type":"error","error":{"type":"api_error","message":"auth_unavailable: no auth available (providers=claude, model=claude-sonnet-4-6; last upstream error: token: [REDACTED]); check Claude auth/key session and cooldown state via /v0/management/auth-files"}}"#
         ));
-        assert!(auth_error("\x1b[91mauthentication_error\x1b[0m"));
         assert!(!auth_error("all quiet"));
         assert!(!auth_error("Error: something else entirely"));
     }
