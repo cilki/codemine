@@ -1,8 +1,14 @@
 //! CLIProxyAPI health, as reported by its management API. The proxy owns the
 //! subscription OAuth login and refreshes it continuously on its own —
-//! codemine never touches tokens. Logins happen out-of-band (`cliproxyapi
-//! --claude-login` on the host); this module only asks the proxy how the
-//! account it holds is doing, for the web UI's card and the main loop's gate.
+//! codemine never touches tokens. Logins happen out-of-band, but they have to
+//! happen where the proxy runs and against the config it was started with:
+//! the login writes its tokens into that config's `oauth.auth-dir`, and a
+//! login run anywhere else fills an auth directory this proxy never reads. In
+//! the Docker image the proxy is the container's own, so the login is
+//! `docker exec -it codemine cliproxyapi -config
+//! /workspace/cliproxyapi/config.yaml -claude-login -no-browser` — the form
+//! the README gives. This module only asks the proxy how the account it holds
+//! is doing, for the web UI's card and the main loop's gate.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -53,8 +59,10 @@ pub fn problem(proxy: &ProxySettings) -> Option<String> {
     }
     if health.managed && !health.connected {
         return Some(
-            "no Claude account is logged into CLIProxyAPI; \
-             run `cliproxyapi --claude-login` on the host"
+            "no Claude account is logged into CLIProxyAPI; log in where the proxy \
+             runs, against the config it was started with — for the Docker image, \
+             `docker exec -it codemine cliproxyapi -config \
+             /workspace/cliproxyapi/config.yaml -claude-login -no-browser`"
                 .into(),
         );
     }

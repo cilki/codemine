@@ -50,7 +50,8 @@ in [
   # refresh; codemine and opencode are only clients.
   (fromUnstable "cliproxyapi")
 ])
-# rtk is missing from some nixpkgs pins too; the agent's commands run
-# unrewritten when the CLI is absent, and the Dockerfile falls back to the
-# upstream installer.
+# rtk is missing from some nixpkgs pins too, and unlike codegraph and
+# cliproxyapi it has no fallback: nothing else in the tree installs it. So on
+# a pin without rtk the image simply ships without it, `prompts::install_rtk`
+# finds no binary, and the agent's commands run unrewritten.
 ++ lib.optional (pkgs ? rtk) rtk

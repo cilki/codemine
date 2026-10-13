@@ -1116,8 +1116,11 @@
   // ---- CLIProxyAPI ----
   // The account itself lives in CLIProxyAPI, which owns the subscription
   // login and refresh; the card only shows what the proxy's management API
-  // reports. Logging in happens on the host (`cliproxyapi --claude-login`),
-  // so there is no login flow here.
+  // reports. Logging in happens out of band, wherever the proxy runs and
+  // against the config it was started with (in the Docker image, through
+  // `docker exec`; see the README), so there is no login flow here. The
+  // command itself is in the blocking problem the settings button carries,
+  // where there is room for it.
 
   let proxyHealth = null;
 
@@ -1134,11 +1137,11 @@
       text = "reachable — add the management key for account status";
       cls = "warn";
     } else if (!h.connected) {
-      text = "reachable, but no account is logged in — "
-        + "run cliproxyapi --claude-login on the host";
+      text = "reachable, but no account is logged in — log in to CLIProxyAPI "
+        + "where it runs; the README has the command";
       cls = "err";
     } else if (!h.refresh_ok) {
-      text = "reachable; refresh failing — log in again on the host";
+      text = "reachable; refresh failing — log in to CLIProxyAPI again";
       cls = "err";
     } else {
       // Connected: the dot's tooltip is the only place the account's own
