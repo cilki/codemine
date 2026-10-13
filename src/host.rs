@@ -261,26 +261,37 @@ fn cpu_temp() -> Option<f32> {
     sensors.components.list()[index].temperature()
 }
 
+/// Label fragments that mark a sensor as the CPU's, best first: a
+/// package-wide reading (Intel's `Package id 0`, AMD's `Tctl`/`Tdie`) beats
+/// a generic CPU or SoC zone, which beats one die or core of it.
+/// `k10temp` and `zenpower` are AMD's drivers, whose labels never say "cpu".
+const CPU_SENSOR_KEYS: &[&str] = &[
+    "pkg", "package", "tctl", "tdie", "cpu", "soc", "k10temp", "zenpower", "core",
+];
+
 /// Which of the host's sensors speaks for the CPU: one labeled as such, else
 /// any readable sensor at all, so a board that labels nothing still shows a
 /// figure. Sensors with no temperature to give are skipped, since a chosen
 /// one has to stay readable on every later tick.
+///
+/// The pick depends only on the labels, never on where a sensor sits in the
+/// list: sysinfo gathers each device's sensors through a HashMap, so their
+/// order differs from one listing to the next, and a first-match pick would
+/// show a different sensor every time the list is rebuilt.
 fn choose_sensor(components: &[Component]) -> Option<usize> {
-    let mut fallback = None;
-    for (index, component) in components.iter().enumerate() {
-        if component.temperature().is_none() {
-            continue;
-        }
-        let label = component.label().to_lowercase();
-        if ["cpu", "pkg", "core", "soc"]
-            .iter()
-            .any(|k| label.contains(k))
-        {
-            return Some(index);
-        }
-        fallback.get_or_insert(index);
-    }
-    fallback
+    components
+        .iter()
+        .enumerate()
+        .filter(|(_, component)| component.temperature().is_some())
+        .min_by_key(|(_, component)| {
+            let label = component.label().to_lowercase();
+            let rank = CPU_SENSOR_KEYS
+                .iter()
+                .position(|key| label.contains(key))
+                .unwrap_or(CPU_SENSOR_KEYS.len());
+            (rank, component.label())
+        })
+        .map(|(index, _)| index)
 }
 
 #[cfg(test)]
@@ -294,22 +305,26 @@ mod tests {
     #[test]
     fn the_remembered_sensor_answers_like_a_full_scan() {
         let all = Components::new_with_refreshed_list();
-        let scanned = choose_sensor(all.list()).and_then(|at| all.list()[at].temperature());
+        let scanned = choose_sensor(all.list()).map(|at| &all.list()[at]);
 
         // Twice, so the second reading goes through the remembered list
         // rather than building one.
         assert_eq!(scanned.is_some(), cpu_temp().is_some());
-        let cached = cpu_temp();
-        assert_eq!(scanned.is_some(), cached.is_some());
-        // Both readings are live, so the figure may have moved between them;
-        // what must not differ is which sensor was read, and a different
-        // sensor on the same host reads tens of degrees apart.
-        if let (Some(scanned), Some(cached)) = (scanned, cached) {
-            assert!(
-                (scanned - cached).abs() < 5.0,
-                "read {cached}, a full scan reads {scanned}"
-            );
-        }
+        assert_eq!(scanned.is_some(), cpu_temp().is_some());
+        // Both readings are live, and a busy host's CPU can move several
+        // degrees between them, so the figures themselves aren't compared;
+        // what must not differ is which sensor was read.
+        let cached = SENSORS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remembered = cached
+            .as_ref()
+            .and_then(|sensors| sensors.chosen.map(|at| &sensors.components.list()[at]));
+        assert_eq!(
+            scanned.map(Component::label),
+            remembered.map(Component::label),
+            "the remembered sensor is not the one a full scan picks"
+        );
     }
 
     /// The same contract for the mount list: measuring the one remembered
@@ -344,11 +359,19 @@ mod tests {
             scan(root).1
         );
 
-        // A path under /proc belongs to no listed mount on Linux (sysinfo
-        // leaves the pseudo-filesystems out), where / has one, so the two
-        // must not answer alike; whatever each is, it has to be its own.
+        // A path under /proc may belong to no listed mount (sysinfo leaves
+        // the pseudo-filesystems out), or fall through to / on a host where
+        // /proc isn't listed as its own mount; whatever it resolves to, the
+        // remembered answer has to be its own. Free space is live, so it
+        // gets the same tolerance as above.
         let other = Path::new("/proc/self");
-        assert_eq!(disk_info(other), scan(other));
+        let (other_total, other_free) = disk_info(other);
+        let (scan_total, scan_free) = scan(other);
+        assert_eq!(other_total, scan_total);
+        assert!(
+            other_free.abs_diff(scan_free) < scan_total / 100 + 1,
+            "free space moved from {scan_free} to {other_free}"
+        );
         assert_eq!(disk_info(root).0, total, "the first path still answers");
     }
 }
