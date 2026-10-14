@@ -691,6 +691,13 @@
   let liveLog = "";
   let viewing = null;
 
+  // How much of a running turn's log the live view keeps, matching the
+  // window the server restates from. The stream sends only what the agent
+  // appended, so the trailing edge is grown here and the leading edge
+  // dropped; without the trim a page left open for a long turn would hold
+  // the whole thing.
+  const LOG_WINDOW = 16 * 1024;
+
   // Stay pinned to the bottom unless the reader has scrolled up to look at
   // something.
   function setLog(text) {
@@ -760,9 +767,11 @@
     }));
   }
 
-  // The server pushes status on every change, and the log tail and host
-  // details as they move; EventSource reconnects on its own, so a dropped
-  // stream only shows up as the disconnected marker until it comes back.
+  // The server pushes status on every change, and the log and host details
+  // as they move; EventSource reconnects on its own, so a dropped stream
+  // only shows up as the disconnected marker until it comes back — and the
+  // reconnected stream opens with a `log` event, so a tail that drifted
+  // while the connection was down is replaced rather than appended to.
   function listen() {
     const events = new EventSource("/api/events");
     events.addEventListener("status", event => {
@@ -771,6 +780,8 @@
       render();
     });
     events.addEventListener("log", event => setLog(JSON.parse(event.data)));
+    events.addEventListener("log-append", event =>
+      setLog((liveLog + JSON.parse(event.data)).slice(-LOG_WINDOW)));
     events.addEventListener("host", event => renderHost(JSON.parse(event.data)));
     events.addEventListener("proxy", event => renderProxy(JSON.parse(event.data)));
     events.onopen = () => $("disconnected").hidden = true;

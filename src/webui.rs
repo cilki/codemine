@@ -32,6 +32,11 @@ use crate::status::{Activity, Shared, Status, epoch_now};
 /// temperature moving signals nothing, so they need a timer.
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How much of a log the live view shows. The page keeps the same window, so
+/// a reader who joins mid-turn and one who has been watching since it started
+/// see the same thing.
+const LOG_WINDOW: u64 = 16 * 1024;
+
 static INDEX_HTML: &str = include_str!("webui.html");
 
 #[derive(Clone)]
@@ -160,26 +165,29 @@ async fn api_turn_log(State(state): State<AppState>, Path(started): Path<u64>) -
 }
 
 /// Push state to the page so it never has to poll: a `status` event on every
-/// change to the shared state, a `log` event whenever the tail moves, and a
-/// `host` event as the host details drift. All carry JSON, which keeps a log
-/// line's own newlines and carriage returns out of the SSE framing.
+/// change to the shared state, a `log` or `log-append` event whenever the
+/// tail moves, and a `host` event as the host details drift. All carry JSON,
+/// which keeps a log line's own newlines and carriage returns out of the SSE
+/// framing.
 async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
         let mut changes = state.status.subscribe();
         // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
-        let (mut sent_status, mut sent_log, mut sent_proxy) = (None, None, None);
+        let (mut sent_status, mut sent_proxy) = (None, None);
+        let mut log_cursor = None;
         #[cfg(feature = "hostinfo")]
         let mut sent_host = None;
         loop {
             // Status is compared without the server timestamp, which moves on
             // its own and would make every state look new, but sent with it;
-            // the log, host, and proxy events compare and send the same JSON.
+            // the host and proxy events compare and send the same JSON. The
+            // log carries its own memory of what the page has been told, so
+            // it can send what was appended rather than the window again.
             let snapshot = status_json(&state.status);
             let status = stamped(&snapshot);
-            let log =
-                serde_json::to_string(&log_tail(&state.status)).unwrap_or_else(|_| "\"\"".into());
+            let log = log_update(&state.status, &mut log_cursor);
             #[cfg(feature = "hostinfo")]
             let host = serde_json::to_string(&crate::host::snapshot(&state.workspace))
                 .unwrap_or_else(|_| "{}".into());
@@ -197,7 +205,6 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             #[cfg_attr(not(feature = "hostinfo"), allow(unused_mut))]
             let mut channels = vec![
                 ("status", &snapshot, &status, &mut sent_status),
-                ("log", &log, &log, &mut sent_log),
                 ("proxy", &proxy, &proxy, &mut sent_proxy),
             ];
             #[cfg(feature = "hostinfo")]
@@ -210,6 +217,12 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                     return;
                 }
                 *sent = Some(key.clone());
+            }
+            if let Some((name, text)) = log.event() {
+                let data = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
+                if send(&tx, name, &data).await.is_err() {
+                    return;
+                }
             }
             // Wake on the next state change, or on the log timer.
             tokio::select! {
@@ -263,20 +276,142 @@ fn stamped(status: &str) -> String {
 
 /// The running turn's log tail, else the last finished turn's.
 fn log_tail(status: &Shared) -> String {
-    let (log_path, fallback) = {
-        let status = status.lock();
-        let path = match &status.activity {
-            Activity::Running { log_path, .. } => Some(log_path.clone()),
-            _ => None,
-        };
-        (path, status.log_tail.clone())
-    };
+    let (log_path, fallback) = live_log(status);
     log_path
         .and_then(|path| {
             let mut file = std::fs::File::open(path).ok()?;
-            crate::turn::read_tail(&mut file, 16 * 1024).ok()
+            crate::turn::read_tail(&mut file, LOG_WINDOW).ok()
         })
         .unwrap_or(fallback)
+}
+
+/// Where the live log is being read from right now: the running turn's log
+/// file if there is one, and the last finished turn's stored tail to fall
+/// back on when there isn't (or when the file can't be opened).
+fn live_log(status: &Shared) -> (Option<PathBuf>, String) {
+    let status = status.lock();
+    let path = match &status.activity {
+        Activity::Running { log_path, .. } => Some(log_path.clone()),
+        _ => None,
+    };
+    (path, status.log_tail.clone())
+}
+
+/// How far the page has been told the log goes, so the next tick can send
+/// what was added instead of the whole window again.
+enum LogCursor {
+    /// Tailing a running turn's log: which file, and the offset the page has
+    /// been sent everything up to.
+    Live { path: PathBuf, offset: u64 },
+    /// No turn running: the stored tail, as it was last sent.
+    Idle(String),
+}
+
+/// What to tell the page about the log on this tick.
+///
+/// A log only ever grows while the turn that owns it runs, so resending the
+/// whole window every two seconds sent the same sixteen kilobytes over and
+/// over for the handful of bytes the agent had actually written. Only the
+/// new bytes go now, and the window is restated solely when the page cannot
+/// append to what it has: the first tick of a stream, a turn starting or
+/// ending, a log replaced by the next turn's, or one that shrank.
+enum LogUpdate {
+    /// The whole window; the page shows this instead of what it had.
+    Replace(String),
+    /// What was appended since the last tick; the page adds it to the end.
+    Append(String),
+    Unchanged,
+}
+
+impl LogUpdate {
+    /// The SSE event name and payload, or None when there is nothing to say.
+    fn event(self) -> Option<(&'static str, String)> {
+        match self {
+            LogUpdate::Replace(text) => Some(("log", text)),
+            LogUpdate::Append(text) => Some(("log-append", text)),
+            LogUpdate::Unchanged => None,
+        }
+    }
+}
+
+fn log_update(status: &Shared, cursor: &mut Option<LogCursor>) -> LogUpdate {
+    let (log_path, fallback) = live_log(status);
+    let open = log_path.and_then(|path| {
+        let file = std::fs::File::open(&path).ok()?;
+        let len = file.metadata().ok()?.len();
+        Some((path, file, len))
+    });
+    let Some((path, mut file, len)) = open else {
+        // Nothing running: the idle page shows the last turn's stored tail,
+        // restated only when it changes.
+        if matches!(cursor, Some(LogCursor::Idle(sent)) if *sent == fallback) {
+            return LogUpdate::Unchanged;
+        }
+        *cursor = Some(LogCursor::Idle(fallback.clone()));
+        return LogUpdate::Replace(fallback);
+    };
+    // Appending is only possible against this very file, read no further
+    // than it now reaches, and only while what was added still fits in the
+    // window — a turn that dumped more than that in one tick would have
+    // every byte of the overflow trimmed off the page the moment it landed,
+    // so the window itself is the cheaper thing to send. Anything else and
+    // the page starts over.
+    let appendable = match cursor {
+        Some(LogCursor::Live { path: seen, offset }) => {
+            (*seen == path && *offset <= len && len - *offset <= LOG_WINDOW).then_some(*offset)
+        }
+        _ => None,
+    };
+    match appendable {
+        Some(offset) if offset == len => LogUpdate::Unchanged,
+        Some(offset) => match appended(&mut file, offset) {
+            // A read that produced nothing usable (a lone continuation byte
+            // mid-write) leaves the cursor where it was for the next tick.
+            Ok((text, _)) if text.is_empty() => LogUpdate::Unchanged,
+            Ok((text, reached)) => {
+                *cursor = Some(LogCursor::Live {
+                    path,
+                    offset: reached,
+                });
+                LogUpdate::Append(text)
+            }
+            Err(_) => LogUpdate::Unchanged,
+        },
+        None => match crate::turn::read_tail(&mut file, LOG_WINDOW) {
+            Ok(tail) => {
+                *cursor = Some(LogCursor::Live { path, offset: len });
+                LogUpdate::Replace(tail)
+            }
+            Err(_) => LogUpdate::Unchanged,
+        },
+    }
+}
+
+/// The text appended to `file` past `offset`, and the offset it was read up
+/// to. A tick can land in the middle of a multi-byte character the agent is
+/// still writing, so an incomplete one at the end is left behind for the
+/// next read rather than decoded into a replacement character the page would
+/// then be stuck with.
+fn appended(file: &mut std::fs::File, offset: u64) -> std::io::Result<(String, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let consumed = match std::str::from_utf8(&buf) {
+        Ok(_) => buf.len(),
+        // `error_len` is None only for a sequence cut short by the end of
+        // the buffer, which is the half-written character; anything else is
+        // a byte the log will never make valid, decoded lossily like the
+        // whole-window read does.
+        Err(err) if err.error_len().is_none() => err.valid_up_to(),
+        Err(_) => buf.len(),
+    };
+    buf.truncate(consumed);
+    Ok((
+        String::from_utf8_lossy(&buf).into_owned(),
+        offset + consumed as u64,
+    ))
 }
 
 /// The choices the settings form renders: the models opencode can actually
@@ -871,5 +1006,101 @@ mod tests {
         assert!(!snapshot.contains("\"now\""), "{snapshot}");
         assert_eq!(snapshot, status_json(&status));
         assert!(stamped(&snapshot).contains("\"now\""));
+    }
+
+    /// What the page is told about the log, tick by tick. A running turn's
+    /// log only grows, so after the window has been stated once only what
+    /// was added goes out; the window is restated solely when there is
+    /// nothing for the page to append to.
+    #[test]
+    fn the_log_window_is_stated_once_and_then_only_grown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turn.log");
+        std::fs::write(&path, "first\n").unwrap();
+        let status = Shared::new();
+        let running = |path: &std::path::Path| Activity::Running {
+            task: "benchmark".into(),
+            repo: "o/r".into(),
+            forge: "gitea".into(),
+            workspace: "/w".into(),
+            log_path: path.to_path_buf(),
+            pgid: 0,
+            started: 0,
+            tokens: None,
+        };
+        let append = |path: &std::path::Path, text: &str| {
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        let mut cursor = None;
+        let update = |cursor: &mut Option<LogCursor>| log_update(&status, cursor).event();
+
+        // Idle: the last finished turn's stored tail, stated once.
+        Status::update(&status, |s| s.log_tail = "from the last turn".into());
+        assert_eq!(
+            update(&mut cursor),
+            Some(("log", "from the last turn".to_owned()))
+        );
+        assert_eq!(update(&mut cursor), None);
+
+        // A turn starts: the window it has so far, then only what it adds.
+        Status::update(&status, |s| s.activity = running(&path));
+        assert_eq!(update(&mut cursor), Some(("log", "first\n".to_owned())));
+        assert_eq!(update(&mut cursor), None);
+        append(&path, "second\n");
+        assert_eq!(
+            update(&mut cursor),
+            Some(("log-append", "second\n".to_owned()))
+        );
+        assert_eq!(update(&mut cursor), None);
+
+        // A character the agent is halfway through writing is left for the
+        // next tick rather than sent as a replacement character.
+        let snowman = "☃".as_bytes();
+        append(&path, "x");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&snowman[..2])
+            .unwrap();
+        assert_eq!(update(&mut cursor), Some(("log-append", "x".to_owned())));
+        assert_eq!(update(&mut cursor), None);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&snowman[2..])
+            .unwrap();
+        assert_eq!(update(&mut cursor), Some(("log-append", "☃".to_owned())));
+
+        // The next turn's log is a different file, so there is nothing to
+        // append to and the window is stated again.
+        let next = dir.path().join("next.log");
+        std::fs::write(&next, "next turn\n").unwrap();
+        Status::update(&status, |s| s.activity = running(&next));
+        assert_eq!(update(&mut cursor), Some(("log", "next turn\n".to_owned())));
+
+        // And so is a log that shrank under the page: whatever it holds is
+        // no longer a prefix of what it was sent.
+        std::fs::write(&next, "cut\n").unwrap();
+        assert_eq!(update(&mut cursor), Some(("log", "cut\n".to_owned())));
+
+        // A burst longer than the window is sent as the window: everything
+        // before its last bytes would be trimmed off the page anyway.
+        append(&next, &"z".repeat(LOG_WINDOW as usize + 10));
+        let Some((name, text)) = update(&mut cursor) else {
+            panic!("the burst went unreported")
+        };
+        assert_eq!(name, "log");
+        assert_eq!(text.len(), LOG_WINDOW as usize);
+
+        // The turn ends: back to the stored tail.
+        Status::update(&status, |s| {
+            s.activity = Activity::Sleeping { until: 0 };
+            s.log_tail = "cut\n".into();
+        });
+        assert_eq!(update(&mut cursor), Some(("log", "cut\n".to_owned())));
+        assert_eq!(update(&mut cursor), None);
     }
 }
