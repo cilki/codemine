@@ -105,6 +105,9 @@ fn main() -> Result<()> {
     // What was last logged as blocking turns, so a blocker that needs a
     // human says so once instead of once per pass.
     let mut blocked = Blocked::default();
+    // How many draws in a row have found nothing, which is what lengthens the
+    // gap before the next one — see `idle_gap`.
+    let mut idle_draws: u32 = 0;
     loop {
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
@@ -183,6 +186,9 @@ fn main() -> Result<()> {
             // what a runner with nothing to do looks like.
             Ok(report) if report.idle.is_some() => match idle_problem(report.idle) {
                 Some(problem) => {
+                    // The pool is broken rather than caught up, so the next
+                    // draw after it is fixed is a first draw again.
+                    idle_draws = 0;
                     report_blocker(&cli, &mut blocked, &status, vec![problem])?;
                     // Re-asked on the turn interval rather than the settings
                     // one: this answer costs a repository listing per forge,
@@ -192,16 +198,24 @@ fn main() -> Result<()> {
                     wait(POOL_RETRY, 5, || store.generation() != generation);
                 }
                 None => {
-                    // Said once, not once per pass: the draw is retried every
-                    // minute, and this answer stands until somebody pushes a
-                    // commit or comments on a PR.
+                    // Said once, not once per pass: this answer stands until
+                    // somebody pushes a commit or comments on a PR.
                     if blocked.news(&[NOTHING_TO_DO.to_owned()]) {
                         info!("{NOTHING_TO_DO}");
                     }
-                    sleep(&cli, Backoff::Normal, &status, &pending, true);
+                    idle_draws = idle_draws.saturating_add(1);
+                    sleep(
+                        &cli,
+                        Backoff::Normal,
+                        &status,
+                        &pending,
+                        Some(idle_draws),
+                        || store.generation() != generation,
+                    );
                 }
             },
             Ok(report) => {
+                idle_draws = 0;
                 if blocked.cleared() {
                     info!("taking turns again");
                 }
@@ -231,15 +245,20 @@ fn main() -> Result<()> {
                     // backoff still holds, since retrying early just burns
                     // the next turn on the same limit.
                     Backoff::Normal if report.canceled => {}
-                    backoff => sleep(&cli, backoff, &status, &pending, false),
+                    backoff => sleep(&cli, backoff, &status, &pending, None, || {
+                        store.generation() != generation
+                    }),
                 }
             }
             // A failing turn (bad token, unreachable forge, ...) must not
             // kill the runner now that config is editable at runtime.
             Err(err) => {
+                idle_draws = 0;
                 error!("turn failed: {err:#}");
                 Status::update(&status, |s| s.log_tail = format!("turn failed: {err:#}"));
-                sleep(&cli, Backoff::Normal, &status, &pending, false);
+                sleep(&cli, Backoff::Normal, &status, &pending, None, || {
+                    store.generation() != generation
+                });
             }
         }
         if cli.once {
@@ -608,10 +627,41 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
 /// all.
 const MAX_USAGE_HOLD: u64 = 7 * 24 * 3600;
 
+/// The gap after a turn that ran, after one that failed, and before the first
+/// re-draw once the pool goes quiet. Short: taking the next turn is the point
+/// of the process.
+const TURN_GAP: u64 = 60;
+
+/// The longest gap between draws on a runner that keeps finding nothing. A
+/// draw is not free — it asks every forge for its repository listing, its
+/// notification feed, the bot's open PRs on each repository, and each
+/// repository's head commit — so a pool that has been caught up for a quarter
+/// of an hour is asked every ten minutes rather than every minute.
+const MAX_IDLE_GAP: u64 = 10 * TURN_GAP;
+
+/// How long to wait before drawing again after `streak` draws in a row that
+/// found nothing, doubling from `TURN_GAP` up to `MAX_IDLE_GAP`.
+///
+/// Backing off costs nothing a caught-up runner needs, because the draw is
+/// not what notices work arriving: the activity watcher polls each forge's
+/// feed on its own thread and pushes onto `pending`, which cuts this wait
+/// short, and a settings edit cuts it short too. What is left to wait for is
+/// a commit landing on a default branch, which ungates the tasks that read
+/// the tree — work that was not urgent a minute ago and is not urgent ten
+/// minutes later either.
+fn idle_gap(streak: u32) -> u64 {
+    // Clamped before the shift: `TURN_GAP << 64` is undefined, and anything
+    // past the fourth doubling is already over the cap.
+    let doublings = streak.saturating_sub(1).min(16);
+    (TURN_GAP << doublings).min(MAX_IDLE_GAP)
+}
+
 /// How long to hold before the next turn, and whether the hold is a usage
 /// window — which, unlike an ordinary pause, fresh forge activity may not cut
-/// short, since nothing can run before the window reopens.
-fn hold(backoff: Backoff, now: u64) -> (u64, bool) {
+/// short, since nothing can run before the window reopens. `idle` carries the
+/// number of consecutive draws that have found nothing, and is None when the
+/// pass took a turn.
+fn hold(backoff: Backoff, idle: Option<u32>, now: u64) -> (u64, bool) {
     match backoff {
         // A minute past the reopening, so the next turn isn't racing it.
         Backoff::UsageLimit(epoch) if epoch > now => {
@@ -624,7 +674,7 @@ fn hold(backoff: Backoff, now: u64) -> (u64, bool) {
             }
             (asked.min(MAX_USAGE_HOLD), true)
         }
-        _ => (60, false),
+        _ => (idle.map_or(TURN_GAP, idle_gap), false),
     }
 }
 
@@ -636,13 +686,14 @@ fn sleep(
     backoff: Backoff,
     status: &status::Shared,
     pending: &events::Pending,
-    idle: bool,
+    idle: Option<u32>,
+    edited: impl Fn() -> bool,
 ) {
     if cli.once {
         return;
     }
     let now = status::epoch_now();
-    let (seconds, limited) = hold(backoff, now);
+    let (seconds, limited) = hold(backoff, idle, now);
     let until = now + seconds;
     if limited {
         info!(
@@ -651,17 +702,27 @@ fn sleep(
         );
     }
     Status::update(status, |s| {
-        s.activity = paused_as(limited, idle, until);
+        s.activity = paused_as(limited, idle.is_some(), until);
     });
     // Sliced, so fresh forge activity starts the next turn right away
-    // instead of waiting out the pause. The usage-limit hold is slept out in
+    // instead of waiting out the pause — and so does a settings edit, which
+    // the idle gap makes worth checking: a task or repository enabled while
+    // the runner has nothing to do must not wait out a ten-minute gap that
+    // was computed before it existed. The usage-limit hold is slept out in
     // full: nothing can run before the window reopens.
     wait(seconds, 5, || {
-        let activity = !limited && !pending.is_empty();
-        if activity {
-            info!("forge activity; ending the sleep early");
+        if limited {
+            return false;
         }
-        activity
+        if !pending.is_empty() {
+            info!("forge activity; ending the sleep early");
+            return true;
+        }
+        if edited() {
+            info!("settings edited; drawing again");
+            return true;
+        }
+        false
     });
 }
 
@@ -773,28 +834,64 @@ mod tests {
         let now = 1_760_000_000;
         // No limit reported: the short pause that keeps a failing run from
         // spinning the loop.
-        assert_eq!(hold(Backoff::Normal, now), (60, false));
+        assert_eq!(hold(Backoff::Normal, None, now), (TURN_GAP, false));
         // A window reopening in an hour is obeyed as given, plus the minute
         // of slack that keeps the next turn from racing it.
-        assert_eq!(hold(Backoff::UsageLimit(now + 3600), now), (3660, true));
+        assert_eq!(
+            hold(Backoff::UsageLimit(now + 3600), None, now),
+            (3660, true)
+        );
         // One that already reopened is no hold at all.
-        assert_eq!(hold(Backoff::UsageLimit(now - 1), now), (60, false));
+        assert_eq!(
+            hold(Backoff::UsageLimit(now - 1), None, now),
+            (TURN_GAP, false)
+        );
         // A weekly window is the widest Anthropic reports, and lands right at
         // the cap rather than being clipped by it.
         assert_eq!(
-            hold(Backoff::UsageLimit(now + MAX_USAGE_HOLD - 60), now),
+            hold(Backoff::UsageLimit(now + MAX_USAGE_HOLD - 60), None, now),
             (MAX_USAGE_HOLD, true)
         );
         // Anything beyond is capped: the largest epoch the scanner will hand
         // over is a 261-year hold taken at face value.
         assert_eq!(
-            hold(Backoff::UsageLimit(9_999_999_999), now),
+            hold(Backoff::UsageLimit(9_999_999_999), None, now),
             (MAX_USAGE_HOLD, true)
         );
         assert_eq!(
-            hold(Backoff::UsageLimit(u64::MAX), now),
+            hold(Backoff::UsageLimit(u64::MAX), None, now),
             (MAX_USAGE_HOLD, true)
         );
+        // An idle streak lengthens the ordinary gap and nothing else: a usage
+        // window outranks it, since the hold is the window's either way.
+        assert_eq!(hold(Backoff::Normal, Some(3), now), (240, false));
+        assert_eq!(
+            hold(Backoff::UsageLimit(now + 3600), Some(9), now),
+            (3660, true)
+        );
+    }
+
+    /// A draw that finds nothing costs a forge round trip per repository, and
+    /// on a caught-up runner it finds nothing every time, so the gap grows
+    /// instead of staying at a minute forever. The first gap after work dries
+    /// up is still the ordinary one — the common case is a pool that has just
+    /// gone quiet and is about to be busy again.
+    #[test]
+    fn the_gap_between_fruitless_draws_grows_to_a_cap() {
+        // A turn ran, or the first draw after one did: no backing off yet.
+        assert_eq!(idle_gap(0), TURN_GAP);
+        assert_eq!(idle_gap(1), TURN_GAP);
+        // Then doubling, until the cap.
+        assert_eq!(idle_gap(2), 2 * TURN_GAP);
+        assert_eq!(idle_gap(3), 4 * TURN_GAP);
+        assert_eq!(idle_gap(4), 8 * TURN_GAP);
+        assert_eq!(idle_gap(5), MAX_IDLE_GAP);
+        // And never past it, however long the runner has been quiet. The
+        // shift this is built on is undefined past the width of the type, so
+        // the far end is the case worth pinning: a runner left alone for a
+        // month must not come back with a gap of several centuries.
+        assert_eq!(idle_gap(64), MAX_IDLE_GAP);
+        assert_eq!(idle_gap(u32::MAX), MAX_IDLE_GAP);
     }
 
     /// A blocker stands until somebody edits the settings, and the loop
