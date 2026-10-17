@@ -123,24 +123,51 @@ fn is_marker(line: &str) -> bool {
 }
 
 /// Whether the turn died on authentication somewhere between opencode and
-/// Anthropic, as CLIProxyAPI reports it (bodies captured from 7.3.2 and
-/// 8.0.4): a rejected client key answers `{"error":"Invalid API key"}`, a
-/// proxy whose login can no longer refresh answers 503 `auth_unavailable: no
-/// auth available (providers=claude, ...)`, a 7.x proxy holding no Claude
-/// credential knows no claude models and answers `unknown provider for model
-/// ...`, and a dead login upstream passes Anthropic's own
-/// `authentication_error` through.
+/// Anthropic.
+///
+/// What the log holds is not the error body. opencode renders a provider
+/// failure as one `Error:` line carrying the body's `message` field alone
+/// when the body parses as an Anthropic error, and `<HTTP status text>:
+/// <body>` when it doesn't — so the error *type* never reaches the log, and a
+/// dead login upstream reads as nothing but `Error: invalid x-api-key`. Both
+/// renderings have to be read for, which is why some of what is looked for
+/// here is a plain English word: those only count on a line opencode is
+/// reporting an error on, since `Unauthorized` on its own is also the sort of
+/// thing a repository's own test output says.
 fn auth_error(tail: &str) -> bool {
-    [
-        "authentication_error",
-        "Invalid API key",
-        "unknown provider for model",
-        "auth_unavailable",
-        "no auth available",
-    ]
-    .iter()
-    .any(|needle| tail.contains(needle))
+    AUTH_BODIES.iter().any(|needle| tail.contains(needle))
+        || tail.lines().any(|line| {
+            is_error_report(line) && AUTH_REFUSALS.iter().any(|needle| line.contains(needle))
+        })
 }
+
+/// Fragments of an error body distinctive enough to mean an auth failure
+/// wherever in the tail they turn up, as CLIProxyAPI reports them (captured
+/// from 7.3.2 and 8.0.4): a rejected client key answers
+/// `{"error":"Invalid API key"}`, a proxy whose login can no longer refresh
+/// answers 503 `auth_unavailable: no auth available (providers=claude, ...)`,
+/// a 7.x proxy holding no Claude credential knows no claude models and
+/// answers `unknown provider for model ...`, and a dead login upstream passes
+/// Anthropic's own `authentication_error` through.
+const AUTH_BODIES: [&str; 5] = [
+    "authentication_error",
+    "Invalid API key",
+    "unknown provider for model",
+    "auth_unavailable",
+    "no auth available",
+];
+
+/// What an opencode error report says when the credential was refused:
+/// Anthropic's own 401 messages, whose type is gone by the time the line is
+/// printed, and the HTTP status texts opencode falls back to for a body it
+/// can't read as an Anthropic error.
+const AUTH_REFUSALS: [&str; 5] = [
+    "Unauthorized",
+    "Forbidden",
+    "x-api-key",
+    "bearer token",
+    "OAuth token",
+];
 
 /// The epoch at which an exhausted usage window reopens, parsed from a
 /// `usage limit reached|<epoch>` notice.
@@ -327,25 +354,69 @@ mod tests {
         assert_eq!(strip_ansi("a\x1b(Bb\x1b[2Kc\x1b"), "abc");
     }
 
+    /// The lines opencode actually prints when the proxy refuses the request,
+    /// captured by running a turn against a proxy answering each body. They
+    /// are not the bodies: opencode shows an Anthropic error's `message`
+    /// field alone, so the body's `authentication_error` type is nowhere in
+    /// the log, and for a body it can't read as one it shows the HTTP status
+    /// text followed by what it could read.
     #[test]
-    fn auth_failures() {
-        // A dead login upstream, passed through the proxy verbatim.
+    fn auth_failures_as_opencode_reports_them() {
+        // 401, Anthropic's own shape, which is how a dead login upstream
+        // arrives: the type is dropped and only the message is printed.
+        assert!(auth_error("Error: invalid x-api-key"));
+        assert!(auth_error("Error: Invalid bearer token"));
+        assert!(auth_error("Error: OAuth token has expired"));
+        // 401 with the proxy's own rejection of a wrong client key, whose
+        // body is not an Anthropic error, so the status text leads.
+        assert!(auth_error("Error: Unauthorized: Invalid API key"));
+        assert!(auth_error("Error: Forbidden: forbidden"));
+        // A proxy with no Claude credential knows no claude models, and one
+        // whose stored login can no longer refresh answers 503; both say so
+        // in the message, which does reach the log.
+        assert!(auth_error(
+            "Error: unknown provider for model claude-sonnet-5"
+        ));
+        assert!(auth_error(
+            "Error: auth_unavailable: no auth available (providers=claude, \
+             model=claude-sonnet-4-6; last upstream error: token: [REDACTED])"
+        ));
+        // And the bodies themselves, for the places one is logged whole.
         assert!(auth_error(
             r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}"#
         ));
-        // The proxy's own rejection of a wrong client key.
-        assert!(auth_error(r#"{"error":"Invalid API key"}"#));
-        // A proxy with no Claude credential knows no claude models.
-        assert!(auth_error(
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"unknown provider for model claude-sonnet-5"}}"#
-        ));
-        // A proxy whose stored login can no longer refresh (8.0.4 answers 503
-        // with the upstream refresh failure redacted).
-        assert!(auth_error(
-            r#"{"type":"error","error":{"type":"api_error","message":"auth_unavailable: no auth available (providers=claude, model=claude-sonnet-4-6; last upstream error: token: [REDACTED]); check Claude auth/key session and cooldown state via /v0/management/auth-files"}}"#
-        ));
+
         assert!(!auth_error("all quiet"));
         assert!(!auth_error("Error: something else entirely"));
+        // A tool call the agent recovered from is not the proxy refusing it.
+        assert!(!auth_error(
+            "Error: NotFound: FileSystem.access (/w/gitea/me/rep)"
+        ));
+        // The short words only count as a refusal on opencode's own error
+        // line: a repository is free to print them for its own reasons.
+        assert!(!auth_error(
+            "test auth::rejects_unauthorized ... ok\n\
+             running `curl -H x-api-key: ...`\n"
+        ));
+    }
+
+    /// The tail of a turn whose proxy had no working login, verbatim from the
+    /// turn log: the whole of what the log says about it is one styled line
+    /// holding Anthropic's message, so that line is what has to be read for.
+    /// Missed, the runner retries the dead proxy every turn gap instead of
+    /// holding turns and flagging the proxy.
+    #[test]
+    fn a_refused_credential_is_read_off_the_real_log_tail() {
+        let verdict = Verdict::read(
+            "Database migration complete.\n\
+             \x1b[0m\n\
+             > build · claude-opus-5\n\
+             \x1b[0m\n\
+             \x1b[91m\x1b[1mError: \x1b[0minvalid x-api-key\n",
+        );
+        assert!(verdict.auth_error);
+        assert!(verdict.died);
+        assert!(!verdict.completed);
     }
 
     #[test]
