@@ -212,15 +212,16 @@
   #settings-status.err { color: #e74c3c; }
   #proxy-card { margin-bottom: 16px; }
   #proxy-card.invalid { outline: 1px solid #e74c3c; outline-offset: 4px; }
-  /* The proxy's health, as a dot beside the URL it was probed at; the digest
-     the management API reports is the dot's tooltip. */
-  #proxy-health {
+  /* A service's health — the proxy's, each forge's — as a dot beside the URL
+     it was probed at; what the probe found is the dot's tooltip. */
+  .health {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     margin-left: 5px; vertical-align: 0.05em; cursor: help; background: #9aa0a6;
   }
-  #proxy-health.ok { background: #2ecc71; }
-  #proxy-health.warn { background: #f39c12; }
-  #proxy-health.err { background: #e74c3c; }
+  .health.ok { background: #2ecc71; }
+  .health.warn { background: #f39c12; }
+  .health.err { background: #e74c3c; }
+  .muted[title] { cursor: help; }
   /* The two keys share a row, and stack when the dialog is too narrow. */
   .keys { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
   #proxy-note { font-size: 0.85em; min-height: 1.2em; }
@@ -313,7 +314,7 @@
       </div>
       <div class="field">
         <label for="proxy-base-url">URL
-          <span id="proxy-health" role="img" aria-label="checking" title="checking…"></span></label>
+          <span class="health" id="proxy-health" role="img" aria-label="checking" title="checking…"></span></label>
         <input id="proxy-base-url" placeholder="http://127.0.0.1:8317"></div>
       <div class="keys">
         <div class="field"><label for="proxy-api-key">Client API key</label>
@@ -480,13 +481,6 @@
   function render() {
     const a = state.activity;
     markProblems(a.state === "unconfigured" ? a.problems : []);
-    // Who the bot is on each forge, resolved from the forge API rather than
-    // configured, so the settings card shows it read-only.
-    for (const forge of FORGES) {
-      const span = $(`f-${forge}-identity`);
-      const identity = state.identities?.[forge];
-      if (span) span.textContent = identity ? `commits as ${identity}` : "";
-    }
     // The proxy card's notes read the gate and the running turn off the
     // status, so a status change repaints it too.
     if (proxyHealth) renderProxy(proxyHealth);
@@ -784,6 +778,7 @@
       setLog((liveLog + JSON.parse(event.data)).slice(-LOG_WINDOW)));
     events.addEventListener("host", event => renderHost(JSON.parse(event.data)));
     events.addEventListener("proxy", event => renderProxy(JSON.parse(event.data)));
+    events.addEventListener("forges", event => renderForgeHealth(JSON.parse(event.data)));
     events.onopen = () => $("disconnected").hidden = true;
     events.onerror = () => $("disconnected").hidden = false;
   }
@@ -909,9 +904,9 @@
       </div>
       <div class="field"><label for="f-${name}-token">Token</label>
         <input id="f-${name}-token" type="password" autocomplete="off"></div>
-      <div class="field"><label for="f-${name}-url">URL</label>
+      <div class="field"><label for="f-${name}-url">URL
+          <span class="health" id="f-${name}-health" role="img" aria-label="${name} checking" title="checking…"></span></label>
         <input id="f-${name}-url" placeholder="${URL_PLACEHOLDER[name]}"></div>
-      <span class="muted" id="f-${name}-identity"></span>
       <div class="field">
         <div class="repos-head"><label>Repositories</label>
           <button type="button" class="small" id="f-${name}-repos-refresh">refresh</button></div>
@@ -960,6 +955,7 @@
     const button = $(`f-${forge}-repos-refresh`);
     button.disabled = true;
     note.textContent = "loading…";
+    note.title = "";
     try {
       const res = await fetch(`/api/repos/${forge}`);
       const body = await res.json();
@@ -968,7 +964,10 @@
       loadedRepos.add(forge);
       renderRepos(forge, body.repos.map(r => r.name));
     } catch (err) {
-      note.textContent = String(err.message || err);
+      // The forge's own complaint can run to a CLI's whole stderr; the card
+      // says that the listing failed and the hover says why.
+      note.textContent = "could not load repositories";
+      note.title = String(err.message || err);
     } finally {
       button.disabled = false;
     }
@@ -1164,11 +1163,37 @@
       cls = "ok";
     }
     const dot = $("proxy-health");
-    dot.className = cls;
+    dot.className = "health " + cls;
     dot.title = text;
     dot.setAttribute("aria-label", "proxy " + text);
     $("proxy-note").textContent = h && state?.oauth_gated_until
       ? "turns held until " + new Date(state.oauth_gated_until * 1000).toLocaleString() : "";
+  }
+
+  // Each forge's reachability, as the dot beside its URL: the server asks the
+  // forge who its token is, so a dead host and a rejected token both show,
+  // and the forge's own complaint is the tooltip rather than card text.
+  const FORGE_REACH = {
+    "ok": ["ok", h => "connected as " + h.account],
+    "unauthorized": ["err", h => "token rejected: " + h.error],
+    "unreachable": ["err", h => "can't connect: " + h.error],
+    "incomplete": ["warn", h => "connected, but " + h.error],
+    "checking": ["", () => "checking…"],
+    "disabled": ["", () => "disabled"],
+    "no-token": ["", () => "no token"],
+    "no-url": ["", () => "needs a URL"],
+  };
+
+  function renderForgeHealth(forges) {
+    for (const forge of FORGES) {
+      const h = forges?.[forge] ?? { state: "checking" };
+      const [cls, describe] = FORGE_REACH[h.state] ?? FORGE_REACH.checking;
+      const text = describe(h);
+      const dot = $(`f-${forge}-health`);
+      dot.className = "health " + cls;
+      dot.title = text;
+      dot.setAttribute("aria-label", `${forge} ${text}`);
+    }
   }
 
   $("forges").append(...FORGES.map(forgeCard));

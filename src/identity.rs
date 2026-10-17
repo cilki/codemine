@@ -8,9 +8,11 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 
 use crate::config::{Forge, ForgeKind};
 use crate::precheck::forge_json;
+use crate::settings::Settings;
 
 /// The account a forge token authenticates as.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -67,14 +69,11 @@ fn remember(key: Key, answer: Cached) {
 }
 
 /// Fill each forge's author email — and Gitea's credential-line user — from
-/// its whoami endpoint, through the cache, returning who the bot is on each
-/// forge for the UI. Fails on the first forge that can't answer, naming it:
-/// a turn there would commit as nobody, so the caller holds turns like any
-/// other unrunnable configuration.
-pub fn resolve(
-    forges: &mut [Forge],
-) -> Result<BTreeMap<String, Identity>, (ForgeKind, anyhow::Error)> {
-    let mut resolved = BTreeMap::new();
+/// its whoami endpoint, through the cache. Fails on the first forge that
+/// can't answer, naming it: a turn there would commit as nobody, so the
+/// caller holds turns like any other unrunnable configuration. The web UI's
+/// view of the same endpoint is [`health`], which keeps asking.
+pub fn resolve(forges: &mut [Forge]) -> Result<(), (ForgeKind, anyhow::Error)> {
     for forge in forges.iter_mut() {
         let key = (forge.kind, forge.url.clone(), forge.token.clone());
         let identity = match cached(&key) {
@@ -106,14 +105,176 @@ pub fn resolve(
         if forge.kind == ForgeKind::Gitea {
             forge.user = identity.login.clone();
         }
-        resolved.insert(forge.kind.name().to_owned(), identity);
     }
-    Ok(resolved)
+    Ok(())
 }
 
 fn whoami(forge: &Forge) -> Result<Identity> {
-    // Every forge spells its whoami endpoint the same way.
-    parse_identity(forge.kind, &forge_json(forge, "user", "user", "user")?)
+    parse_identity(forge.kind, &ask_whoami(forge)?)
+}
+
+/// The raw whoami answer. Every forge spells its whoami endpoint the same way.
+fn ask_whoami(forge: &Forge) -> Result<serde_json::Value> {
+    forge_json(forge, "user", "user", "user")
+}
+
+/// Whether the web UI's forge card can reach its forge, as the dot beside
+/// the URL shows it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reach {
+    /// No answer yet for these settings: the first probe is still out.
+    Checking,
+    /// The forge answered with the account the token authenticates as.
+    Ok,
+    /// The forge answered, but refused the token.
+    Unauthorized,
+    /// No usable answer: refused connection, DNS, timeout, a wrong URL.
+    Unreachable,
+    /// The token works, but the account came back without a login or email
+    /// to commit as.
+    Incomplete,
+    /// Nothing to probe: the forge is switched off, or lacks what it needs.
+    Disabled,
+    NoToken,
+    NoUrl,
+}
+
+/// One forge's reading for the web UI.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+pub struct ForgeHealth {
+    pub state: Reach,
+    /// "login <email>", once the forge has named the account.
+    pub account: Option<String>,
+    /// Why the probe failed, for the dot's tooltip.
+    pub error: Option<String>,
+}
+
+impl ForgeHealth {
+    fn bare(state: Reach) -> Self {
+        ForgeHealth {
+            state,
+            account: None,
+            error: None,
+        }
+    }
+}
+
+/// How long a reading stands before the forge is asked again. Unlike
+/// `resolve`'s cache, a success expires too: the dot is how a revoked token
+/// or a forge gone down shows up while turns are running.
+const HEALTH_TTL: Duration = Duration::from_secs(60);
+
+/// The last reading for one forge configuration, and whether a probe for it
+/// is still out.
+struct Reading {
+    at: Option<Instant>,
+    health: ForgeHealth,
+    probing: bool,
+}
+
+/// Readings keyed like `CACHE`: a new token or URL is a new reading, so a
+/// just-saved token is probed at once instead of waiting out the old one.
+static READINGS: Mutex<BTreeMap<Key, Reading>> = Mutex::new(BTreeMap::new());
+
+fn readings() -> MutexGuard<'static, BTreeMap<Key, Reading>> {
+    READINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Each forge's reachability for the web UI, keyed by forge slug. Never
+/// blocks: a stale or missing reading is refreshed on a thread of its own and
+/// the last one (or `Checking`) is handed back meanwhile. The caller is the
+/// event stream's tick, and a forge that never answers would otherwise stall
+/// it for the whole of Gitea's request timeout — or forever, for gh and glab,
+/// which have none.
+pub fn health(settings: &Settings) -> BTreeMap<String, ForgeHealth> {
+    [ForgeKind::Gitea, ForgeKind::Github, ForgeKind::Gitlab]
+        .into_iter()
+        .map(|kind| {
+            let stored = settings.forge(kind);
+            let health = match settings.runtime_forge(kind) {
+                Some(forge) => reading(forge),
+                None if !stored.enabled => ForgeHealth::bare(Reach::Disabled),
+                None if stored.token.is_empty() => ForgeHealth::bare(Reach::NoToken),
+                None => ForgeHealth::bare(Reach::NoUrl),
+            };
+            (kind.name().to_owned(), health)
+        })
+        .collect()
+}
+
+/// The standing reading for a forge, sending a probe out when it is stale.
+fn reading(forge: Forge) -> ForgeHealth {
+    let key = (forge.kind, forge.url.clone(), forge.token.clone());
+    let mut held = readings();
+    let entry = held.entry(key.clone()).or_insert_with(|| Reading {
+        at: None,
+        health: ForgeHealth::bare(Reach::Checking),
+        probing: false,
+    });
+    let stale = entry.at.is_none_or(|at| at.elapsed() >= HEALTH_TTL);
+    if stale && !entry.probing {
+        let spawned = std::thread::Builder::new()
+            .name("forge-health".into())
+            .spawn(move || {
+                let health = probe(&forge);
+                if let Some(entry) = readings().get_mut(&key) {
+                    entry.health = health;
+                    entry.at = Some(Instant::now());
+                    entry.probing = false;
+                }
+            });
+        // A thread that couldn't start is retried on the next tick.
+        entry.probing = spawned.is_ok();
+    }
+    entry.health.clone()
+}
+
+/// Ask the forge who the token is, and read the answer as reachability.
+fn probe(forge: &Forge) -> ForgeHealth {
+    let answer = match ask_whoami(forge) {
+        Ok(answer) => answer,
+        Err(err) => {
+            let error = format!("{err:#}");
+            return ForgeHealth {
+                state: classify(&error),
+                account: None,
+                error: Some(error),
+            };
+        }
+    };
+    match parse_identity(forge.kind, &answer) {
+        Ok(identity) => ForgeHealth {
+            state: Reach::Ok,
+            account: Some(format!("{} <{}>", identity.login, identity.email)),
+            error: None,
+        },
+        Err(err) => ForgeHealth {
+            state: Reach::Incomplete,
+            account: None,
+            error: Some(format!("{err:#}")),
+        },
+    }
+}
+
+/// Whether a failed whoami was the forge refusing the token, or no answer at
+/// all. Read off the error text, which is the only place the three ways of
+/// asking agree: our own Gitea request reports `HTTP {status}`, and gh and
+/// glab both end their complaint with `(HTTP {status})`. A 403 that is
+/// GitHub's rate limit is the forge being busy, not the token being bad. A
+/// token that can't even be sent as a header is a bad token too.
+fn classify(error: &str) -> Reach {
+    let error = error.to_lowercase();
+    let refused = error.contains("http 401")
+        || error.contains("401 unauthorized")
+        || error.contains("bad credentials")
+        || (error.contains("http 403") && !error.contains("rate limit"))
+        || error.contains("not a usable header value");
+    if refused {
+        Reach::Unauthorized
+    } else {
+        Reach::Unreachable
+    }
 }
 
 /// The login and email out of a whoami response. A present-but-empty field
@@ -281,6 +442,64 @@ mod tests {
         // which it only can if the failing lookup made it to the cache.
         let (_, err) = resolve(&mut forges).unwrap_err();
         assert_eq!(format!("{err:#}"), first);
+    }
+
+    #[test]
+    fn a_refused_token_reads_apart_from_no_answer() {
+        for refused in [
+            "could not identify the gitea account: the gitea api answered HTTP 401 for https://g/api/v1/user",
+            "gh exited with exit status: 1: gh: Bad credentials (HTTP 401)",
+            "glab exited with exit status: 1: glab: 401 Unauthorized (HTTP 401)",
+            "the gitea api answered HTTP 403 for https://g/api/v1/user",
+            "the Authorization value is not a usable header value",
+        ] {
+            assert_eq!(classify(refused), Reach::Unauthorized, "{refused}");
+        }
+        for unreachable in [
+            "failed to GET http://127.0.0.1:1/api/v1/user: connection refused",
+            "the gitea api answered HTTP 404 for https://g/api/v1/user",
+            "gh exited with exit status: 1: error connecting to ghe.example.com",
+            "gh: API rate limit exceeded for user ID 1. (HTTP 403)",
+            "failed to run glab",
+        ] {
+            assert_eq!(classify(unreachable), Reach::Unreachable, "{unreachable}");
+        }
+    }
+
+    #[test]
+    fn forges_with_nothing_to_probe_say_why() {
+        let mut settings = Settings::default();
+        settings.github.token = "unused".into();
+        settings.gitea.enabled = true;
+        settings.gitea.token = "unused".into();
+        settings.gitlab.enabled = true;
+        let health = health(&settings);
+        // Only enabled forges are probed, token or not.
+        assert_eq!(health["github"].state, Reach::Disabled);
+        assert_eq!(health["gitea"].state, Reach::NoUrl);
+        assert_eq!(health["gitlab"].state, Reach::NoToken);
+    }
+
+    /// The first reading is `Checking`, handed back without waiting; the
+    /// probe lands on its own thread and a later call reads its answer.
+    #[test]
+    fn a_probe_lands_without_blocking_the_caller() {
+        let mut settings = Settings::default();
+        settings.gitea.enabled = true;
+        settings.gitea.token = "health-probe-test".into();
+        // Nothing listens on port 1, so the probe fails fast.
+        settings.gitea.url = "http://127.0.0.1:1".into();
+        assert_eq!(health(&settings)["gitea"].state, Reach::Checking);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let landed = loop {
+            let gitea = health(&settings).remove("gitea").unwrap();
+            if gitea.state != Reach::Checking || Instant::now() > deadline {
+                break gitea;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(landed.state, Reach::Unreachable);
+        assert!(landed.error.is_some());
     }
 
     #[test]

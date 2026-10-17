@@ -166,7 +166,8 @@ async fn api_turn_log(State(state): State<AppState>, Path(started): Path<u64>) -
 
 /// Push state to the page so it never has to poll: a `status` event on every
 /// change to the shared state, a `log` or `log-append` event whenever the
-/// tail moves, and a `host` event as the host details drift. All carry JSON,
+/// tail moves, and `proxy`, `forges` and `host` events as those readings
+/// drift. All carry JSON,
 /// which keeps a log line's own newlines and carriage returns out of the SSE
 /// framing.
 async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
@@ -175,7 +176,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         let mut changes = state.status.subscribe();
         // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
-        let (mut sent_status, mut sent_proxy) = (None, None);
+        let (mut sent_status, mut sent_proxy, mut sent_forges) = (None, None, None);
         let mut log_cursor = None;
         #[cfg(feature = "hostinfo")]
         let mut sent_host = None;
@@ -195,7 +196,12 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             // inside a turn for hours at a time, so proxy health can't ride
             // the status it owns. The probe makes a blocking request (behind
             // a short cache), so it runs off this current-thread runtime.
-            let proxy_settings = state.settings.snapshot().0.proxy;
+            let settings = state.settings.snapshot().0;
+            // Each forge's reachability, for the dot on its card. Never
+            // blocks: the probes run on threads of their own.
+            let forges = serde_json::to_string(&crate::identity::health(&settings))
+                .unwrap_or_else(|_| "{}".into());
+            let proxy_settings = settings.proxy;
             let proxy = tokio::task::spawn_blocking(move || {
                 serde_json::to_string(&crate::proxy::health(&proxy_settings))
                     .unwrap_or_else(|_| "null".into())
@@ -206,6 +212,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             let mut channels = vec![
                 ("status", &snapshot, &status, &mut sent_status),
                 ("proxy", &proxy, &proxy, &mut sent_proxy),
+                ("forges", &forges, &forges, &mut sent_forges),
             ];
             #[cfg(feature = "hostinfo")]
             channels.push(("host", &host, &host, &mut sent_host));

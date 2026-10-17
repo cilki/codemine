@@ -26,7 +26,6 @@ mod usage;
 mod webui;
 mod workspace;
 
-use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -130,7 +129,6 @@ fn main() -> Result<()> {
             problems,
             generation,
             &mut applied_generation,
-            &status,
         ) {
             Ok(cfg) => cfg,
             Err(problems) => {
@@ -379,7 +377,6 @@ fn runnable(
     blocking: Vec<Problem>,
     generation: u64,
     applied_generation: &mut Option<u64>,
-    status: &Shared,
 ) -> Result<Config, Vec<Problem>> {
     if !blocking.is_empty() {
         return Err(blocking);
@@ -394,20 +391,12 @@ fn runnable(
     // Cached, so resolving is a map lookup on every pass but the first.
     // Errors are returned rather than logged here: the caller logs whatever
     // blocks turns, once per distinct set, and this runs on every pass.
-    let resolved = identity::resolve(&mut cfg.forges).map_err(|(kind, err)| {
+    identity::resolve(&mut cfg.forges).map_err(|(kind, err)| {
         vec![Problem::new(
             &format!("f-{}-token", kind.name()),
             format!("{err:#}"),
         )]
     })?;
-    let identities: BTreeMap<String, String> = resolved
-        .into_iter()
-        .map(|(name, id)| (name, format!("{} <{}>", id.login, id.email)))
-        .collect();
-    // Only a change wakes the SSE stream; this runs every pass.
-    if status.lock().identities != identities {
-        Status::update(status, |s| s.identities = identities);
-    }
 
     if *applied_generation != Some(generation) {
         apply_forge_auth(cli, &cfg).map_err(|err| {
