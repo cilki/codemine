@@ -17,7 +17,8 @@ pull requests, respond to review feedback, and file issues.
 The assigned repository is already cloned, up to date, and checked out on its
 default branch at `$4` — do not clone or fetch it again. Leftover build
 artifacts (`target/`, `node_modules/`, ...) from earlier runs may be present and
-are fine to reuse.
+are fine to reuse; they are wiped about once a week. Local branches that were
+never pushed are deleted once their last commit is a month old.
 
 Prefer the `codegraph_explore` tool over grep/find/broad file reads when
 exploring the codebase — it answers structural questions in a single call and is

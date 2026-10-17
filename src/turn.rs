@@ -202,6 +202,8 @@ pub fn run(
             last_lines(&tail, 20)
         );
         turn.finish(status, &tail, Outcome::Failed, elapsed, None);
+        // The clone itself may be half-made; only the workspace-wide sweep.
+        workspace::remove_orphans(&cfg.workspace, &pool);
         return Ok(Report::default());
     }
 
@@ -238,6 +240,12 @@ pub fn run(
     // are the next best figure, and better than a row with no cost on it.
     let tokens = crate::usage::collect_since(turn.wall).or(sampled);
     turn.finish(status, &tail, outcome, elapsed, tokens);
+
+    // After the turn is recorded, so the page isn't held on it. The agent's
+    // whole process group is gone by now (see `supervise`), so nothing is
+    // still writing into the clone.
+    workspace::tidy(cfg, forge, repo, &log);
+    workspace::remove_orphans(&cfg.workspace, &pool);
 
     Ok(Report {
         backoff: match verdict.usage_limit {
@@ -452,8 +460,12 @@ fn supervise(
             });
         }
     };
-    if exit.is_none() {
-        workspace::kill_group(child)?;
+    match exit {
+        None => workspace::kill_group(child)?,
+        // The leader exiting says nothing about what it started in the
+        // background; left alone, that outlives the turn and keeps writing
+        // into the clone.
+        Some(_) => workspace::kill_leftovers(child.id() as i32),
     }
     Ok((exit, canceled, sampled))
 }
