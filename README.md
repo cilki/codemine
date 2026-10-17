@@ -92,6 +92,39 @@ above.
 Then open http://localhost:8080 and finish up in the settings: pick a model, add
 a forge token, and enable some repositories.
 
+### Command line
+
+Everything but the three options below is configured through the web UI and
+persisted in the workspace:
+
+```
+usage: codemine [--listen ADDR] [--workspace DIR] [--once]
+
+  --listen ADDR     bind address for the web UI (default 0.0.0.0:8080)
+  --workspace DIR   persistent workspace root (default ~/.codemine)
+  --once            run a single turn and exit
+  --help            show this help
+```
+
+The container's entrypoint runs `codemine --workspace /workspace "$@"`, so the
+volume is the default there and anything you append to `docker run` is passed
+straight through — including a `--workspace` of your own, since the last one
+wins.
+
+`--once` is how you check a configuration without leaving a runner behind: it
+draws one turn, exits 0, and — unlike the long-running loop — refuses to wait
+out anything that stops a turn from starting (unsound settings, an unreachable
+proxy, a closed schedule window, a spent allowance), failing with that reason
+instead. Log verbosity is `RUST_LOG`, which defaults to `info` and takes the
+usual per-module filters.
+
+Building outside the image needs no extra steps beyond a Rust toolchain —
+`cargo build --release`, or `nix-shell shell.nix --run "cargo build --release"`
+for the pinned dev shell the image builds in. The `hostinfo` feature is on by
+default and is
+what fills the web UI's host panel; `--no-default-features` drops the
+`sysinfo` dependency and hides the panel.
+
 ### Features
 
 #### CLIProxyAPI
@@ -116,8 +149,21 @@ are compressed to save tokens.
 
 #### Scheduling and rate limiting
 
-With a schedule enabled, turns can only _start_ inside a daily window. You can
-also limit the number of turns that can run per hour.
+With a schedule enabled, turns can only _start_ inside a daily window — a turn
+already under way is left to finish — and the window is read against the
+container's clock, as above. A window whose start is after its end wraps
+midnight: "22:00 to 06:00" is one window, not two.
+
+The hourly limit is a rate, not a cap per clock hour. It is spent from a bucket
+that refills continuously and holds at most an hour's worth, so an idle stretch
+banks up to that and the turns can then run back to back, and fractional limits
+mean what they say: `0.5` is one turn every two hours. Editing the limit
+resizes the bucket on the spot rather than taking effect once the old one has
+run out.
+
+Only a turn that reported `TASK COMPLETED` — one that actually changed
+something on a forge — spends from the bucket. Turns that skip, fail, or time
+out are free, so a quiet repository costs nothing against the limit.
 
 #### Multiple forge support
 
@@ -128,7 +174,23 @@ select what repos **codemine** is enabled for (none by default).
 
 You can view and manage the **codemine** instance via a simple web UI on
 port 8080. This is where you configure your forge settings, rate limits, select
-a model, choose what task types are run, view agent logs, etc.
+a model, choose what task types are run, view agent logs, etc. Settings are
+read fresh before each turn, so an edit applies at the next turn boundary
+rather than needing a restart; the waits between turns are sliced so a raised
+limit or a widened window is picked up at once.
+
+A turn's log streams live, and while one is running the log panel offers two
+controls over it: **pause** SIGSTOPs the agent's whole process tree (and
+resumes it with SIGCONT), which is the way to hand the machine back for a
+while without losing the turn, and **cancel turn** kills the tree and goes
+straight on to the next turn rather than sitting out the usual gap. A pause is
+not persisted — the runner always comes back running — and a paused tree is
+still killable, since the kill SIGCONTs it on the way. Above the panels,
+counters track turns by outcome — completed, skipped, failed — alongside the
+tokens they spent and the hourly allowance left.
+
+A turn that runs past the turn timeout (six hours by default, and settable
+here) is killed the same way and recorded as timed out.
 
 #### Skip caching
 
