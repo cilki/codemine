@@ -26,8 +26,14 @@ tea repos ls --fields owner,name,updated,description
    already been turned down:
 
    ```sh
-   tea pr ls --repo <owner>/<repo> --state all # every pull request, not just open ones
+   tea pr ls --repo <owner>/<repo> --state all --limit 100 # every pull request, not just open ones
    ```
+
+   `--limit` is not optional padding. `tea` lists 30 items per page and drops
+   the oldest off the end, so on a repository with any history the table looks
+   complete while hiding exactly the older pull requests you are checking for —
+   open ones included. Raise the limit (or walk the pages with `--page`) and
+   check that the count you get back is the whole repository.
 
    Each is marked `open`, `merged`, or `closed`. A `merged` one already landed
    on the default branch. A `closed` one was either turned down or closed by
@@ -53,7 +59,7 @@ If a push is rejected, stop and report it rather than working around it.
 To see your open pull requests and what reviewers have said about them:
 
 ```sh
-tea pr ls --repo <owner>/<repo> --fields index,state,head,base,title,author,mergeable # open pull requests, with their branches
+tea pr ls --repo <owner>/<repo> --limit 100 --fields index,state,head,base,title,author,mergeable # open pull requests, with their branches
 tea pr <number> --comments --repo <owner>/<repo>                     # the conversation under a pull request
 ```
 
@@ -121,7 +127,7 @@ one pull request, something that needs a decision from the user, or a problem
 you found while doing something else.
 
 ```sh
-tea issues ls --repo <owner>/<repo>              # open issues; `--state all` for the rest
+tea issues ls --repo <owner>/<repo> --limit 100  # open issues; `--state all` for the rest
 tea issues <number> --comments --repo <owner>/<repo> # the body and its conversation
 ```
 
