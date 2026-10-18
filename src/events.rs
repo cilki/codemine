@@ -1,14 +1,17 @@
 //! Forge activity watching: a background thread polls each configured
 //! forge's account-wide feed and queues repositories with fresh activity, so
-//! a comment on a PR or issue gets a feedback turn ahead of the random draw
-//! — immediately when the runner is between turns (the sleep cuts itself
-//! short), or as the very next turn when one is already running.
+//! a comment on a PR or issue gets a feedback turn, and a review request a
+//! review turn, ahead of the random draw — immediately when the runner is
+//! between turns (the sleep cuts itself short), or as the very next turn
+//! when one is already running.
 //!
 //! Polling rather than webhooks on purpose: webhooks would need the runner
 //! to be reachable from every forge and a hook registered on every
 //! repository, while the feeds are readable with the tokens the runner
-//! already holds. The feeds are the same signals the feedback precheck
-//! reads, so an event can never queue work the turn wouldn't have found.
+//! already holds. The feed is the same signal the feedback precheck reads,
+//! and a queued repository is still put through each task's own precheck
+//! before it is drawn, so an event can never queue work a turn wouldn't
+//! have found.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -23,6 +26,15 @@ use crate::settings::SharedSettings;
 /// How often each forge's feed is polled. GitHub asks notification pollers
 /// for at most one request a minute, and the others are in no hurry either.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The tasks fresh activity can lead to, in the order a queued repository is
+/// offered to them: a review request on someone else's PR is `review`'s, a
+/// comment on the bot's own PR or an assignment is `feedback`'s. Both arrive
+/// on the same feed, so the watcher can't tell which until the tasks' own
+/// prechecks do — and `review` asks first because its precheck is exact
+/// (the request set), where `feedback`'s is satisfied by any unread thread
+/// and would claim a review request only to skip on it.
+pub const QUEUED_TASKS: [&str; 2] = ["review", "feedback"];
 
 /// Repositories with fresh forge activity, queued to jump the next draw.
 /// The watcher pushes, the turn runner pops, and the between-turn sleep
@@ -83,9 +95,13 @@ fn watch(store: SharedSettings, pending: SharedPending) -> ! {
     loop {
         std::thread::sleep(POLL_INTERVAL);
         let (settings, _) = store.snapshot();
-        // Activity only ever leads to feedback turns; without the task in
-        // the pool there is nothing to queue.
-        if !settings.tasks.iter().any(|task| task == "feedback") {
+        // Activity only ever leads to the queued tasks' turns; with none of
+        // them in the pool there is nothing to queue.
+        if !settings
+            .tasks
+            .iter()
+            .any(|task| QUEUED_TASKS.contains(&task.as_str()))
+        {
             continue;
         }
         let mut current: BTreeMap<(ForgeKind, String), String> = BTreeMap::new();
@@ -121,7 +137,7 @@ fn watch(store: SharedSettings, pending: SharedPending) -> ! {
         }
         for (kind, repo) in fresh(&seen, &current) {
             info!(
-                "activity on {} {repo}; queueing a feedback turn",
+                "activity on {} {repo}; queueing it for the next draw",
                 kind.name()
             );
             pending.push(kind, repo);
@@ -153,8 +169,8 @@ fn fresh(
 /// The single reading of "this repository has feedback waiting" in the
 /// runner: the watcher polls it for repositories to queue, and `cache::Probe`
 /// both gates `feedback` on it and remembers a skip against the stamp it
-/// answered for. An event therefore can never queue work the turn's own
-/// precondition would have rejected.
+/// answered for. A review request lands on the same feed, which is how
+/// `review` gets queued too; its own precheck then confirms the request.
 pub fn unread(forge: &Forge) -> Result<BTreeMap<String, String>> {
     let feed = crate::precheck::forge_json(forge, "notifications", "notifications", "todos")?;
     Ok(match forge.kind {

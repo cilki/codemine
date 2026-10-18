@@ -270,20 +270,25 @@ fn pool(cfg: &Config) -> Result<Vec<(&Forge, String)>> {
 /// The (task, forge, repository) triple this turn runs on, or None when
 /// nothing in the pool is worth one.
 ///
-/// Fresh forge activity jumps the queue: the watcher saw a comment land, so
-/// that repository gets a feedback turn ahead of the random draw. Entries
-/// that no longer check out (repository disabled or gone, the feedback
-/// already handled, the task since disabled) are dropped rather than
-/// requeued — the ordinary draw probes feedback anyway.
+/// Fresh forge activity jumps the queue: the watcher saw a comment or a
+/// review request land, so that repository gets a feedback or review turn
+/// ahead of the random draw. Entries that no longer check out (repository
+/// disabled or gone, the activity already handled, the tasks since disabled)
+/// are dropped rather than requeued — the ordinary draw probes both tasks
+/// anyway.
 fn pick<'a>(
     cfg: &'a Config,
     pool: &'a [(&'a Forge, String)],
     pending: &crate::events::Pending,
     probe: &cache::Probe,
 ) -> Option<(&'a str, &'a Forge, &'a str)> {
-    let feedback = cfg.tasks.iter().any(|task| task == "feedback");
+    let queued: Vec<&str> = crate::events::QUEUED_TASKS
+        .iter()
+        .copied()
+        .filter(|task| cfg.tasks.iter().any(|enabled| enabled == task))
+        .collect();
     while let Some((kind, repo)) = pending.pop() {
-        if !feedback {
+        if queued.is_empty() {
             continue;
         }
         let Some((forge, repo)) = pool
@@ -293,9 +298,11 @@ fn pick<'a>(
         else {
             continue;
         };
-        if probe.actionable("feedback", forge, repo) {
-            info!("fresh activity on {repo}; drawing it first");
-            return Some(("feedback", forge, repo));
+        for task in &queued {
+            if probe.actionable(task, forge, repo) {
+                info!("fresh activity on {repo}; drawing {task} on it first");
+                return Some((task, forge, repo));
+            }
         }
     }
     precheck::draw(&cfg.tasks, pool, |task, forge, repo| {
@@ -332,11 +339,11 @@ fn open_log(logs_dir: &Path, started: u64) -> Result<(PathBuf, File)> {
 /// commit it is about to read, taken while the clone is still on a clean
 /// default branch — after the turn it could be sitting on whatever branch the
 /// agent left behind — the notification stamp it is about to read, taken
-/// before the agent marks any of the feed read, or the conflicting PRs it is
-/// about to look at, taken before any force-push of its own moves them (the
-/// probe memoized them when it answered the draw). A task that skips is
-/// remembered against it. Best-effort: without it the task is simply drawn
-/// again next time.
+/// before the agent marks any of the feed read, or the conflicting PRs or
+/// review requests it is about to look at, taken before any force-push or
+/// submitted review of its own moves them (the probe memoized them when it
+/// answered the draw). A task that skips is remembered against it.
+/// Best-effort: without it the task is simply drawn again next time.
 fn answered_state(cfg: &Config, turn: &Turn, probe: &cache::Probe) -> Option<String> {
     match cache::basis(turn.task)? {
         cache::Basis::Head => match workspace::head_sha(&cfg.workspace, &turn.dir) {
@@ -349,7 +356,9 @@ fn answered_state(cfg: &Config, turn: &Turn, probe: &cache::Probe) -> Option<Str
                 None
             }
         },
-        cache::Basis::Feed | cache::Basis::Prs => probe.state(turn.task, turn.forge, turn.repo),
+        cache::Basis::Feed | cache::Basis::Prs | cache::Basis::Reviews => {
+            probe.state(turn.task, turn.forge, turn.repo)
+        }
     }
 }
 

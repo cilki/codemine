@@ -5,8 +5,11 @@
 //! `feedback` reads the forge's notification feed, so its answer holds until
 //! a thread newer than the ones it already read arrives. `rebase` reads the
 //! forge's view of the bot's own open PRs, so its answer holds until one of
-//! those branches or the conflict set moves. Drawing any of them meanwhile
-//! buys a session's worth of tokens and another `TASK SKIPPED`.
+//! those branches or the conflict set moves. `review` reads the forge's view
+//! of the PRs the bot has been asked to review, so its answer holds until a
+//! request is made, withdrawn, or the branch under it moves. Drawing any of
+//! them meanwhile buys a session's worth of tokens and another
+//! `TASK SKIPPED`.
 //! Each skip is remembered against that state and the task's own
 //! instructions, and the task isn't drawn for that repository again until one
 //! of the two changes. The memory is persisted at the workspace root so it
@@ -46,6 +49,11 @@ pub enum Basis {
     /// `rebase` — probed first, like every gated task — wins every draw
     /// until the branch moves.
     Prs,
+    /// The open PRs the bot is a pending requested reviewer on, as `review`
+    /// sees them. Same duality as `Prs`: a request the agent found nothing
+    /// to say about and didn't submit on (or couldn't — a draft, a branch
+    /// that won't build) would otherwise keep the probe true forever.
+    Reviews,
 }
 
 /// The state this task's answer depends on. `None` for the tasks that can
@@ -57,18 +65,20 @@ pub fn basis(task: &str) -> Option<Basis> {
         "docs" | "simplify" | "benchmark" | "coverage" | "mutation" => Some(Basis::Head),
         "feedback" => Some(Basis::Feed),
         "rebase" => Some(Basis::Prs),
+        "review" => Some(Basis::Reviews),
         _ => None,
     }
 }
 
 /// Whether the task has a precondition probe, which is exactly the tasks
-/// whose basis is forge state rather than the tree: an empty feed or an empty
-/// conflict set is both "nothing has moved" and "there is nothing to act
-/// on", so the same read answers either question. A `Basis::Head` task reads
-/// the tree the agent is handed and can always find something there, so only
-/// its memory holds it back. Every other task is always drawable.
+/// whose basis is forge state rather than the tree: an empty feed, an empty
+/// conflict set, or an empty request set is both "nothing has moved" and
+/// "there is nothing to act on", so the same read answers either question. A
+/// `Basis::Head` task reads the tree the agent is handed and can always find
+/// something there, so only its memory holds it back. Every other task is
+/// always drawable.
 pub fn gated(task: &str) -> bool {
-    matches!(basis(task), Some(Basis::Feed | Basis::Prs))
+    matches!(basis(task), Some(Basis::Feed | Basis::Prs | Basis::Reviews))
 }
 
 /// The state a skip was remembered against. Both halves have to still match
@@ -176,20 +186,21 @@ fn digest(task: &str) -> String {
         .collect()
 }
 
-/// One repository's conflicting-PR keys, as `precheck::conflicting_prs`
-/// spells them.
-type Conflicts = Vec<String>;
+/// One repository's PR keys, as `precheck::conflicting_prs` and
+/// `precheck::review_requests` spell them.
+type PrKeys = Vec<String>;
 
 /// The draw's precondition check with the skip memory folded in, plus the
 /// forge state read along the way: default-branch commits per repository,
-/// notification feeds per forge, conflicting PRs per repository. Each is
-/// fetched at most once and answers for every candidate the rest of the draw
-/// asks about.
+/// notification feeds per forge, conflicting PRs and pending review
+/// requests per repository. Each is fetched at most once and answers for
+/// every candidate the rest of the draw asks about.
 pub struct Probe<'a> {
     cache: &'a Cache,
     heads: RefCell<BTreeMap<(ForgeKind, String), Option<String>>>,
     feeds: RefCell<BTreeMap<ForgeKind, Option<BTreeMap<String, String>>>>,
-    conflicts: RefCell<BTreeMap<(ForgeKind, String), Option<Conflicts>>>,
+    conflicts: RefCell<BTreeMap<(ForgeKind, String), Option<PrKeys>>>,
+    reviews: RefCell<BTreeMap<(ForgeKind, String), Option<PrKeys>>>,
 }
 
 impl<'a> Probe<'a> {
@@ -199,6 +210,7 @@ impl<'a> Probe<'a> {
             heads: RefCell::new(BTreeMap::new()),
             feeds: RefCell::new(BTreeMap::new()),
             conflicts: RefCell::new(BTreeMap::new()),
+            reviews: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -227,6 +239,12 @@ impl<'a> Probe<'a> {
             Some(Basis::Prs) => self
                 .conflicting(forge, repo)
                 .is_some_and(|prs| !prs.is_empty()),
+            // `review` likewise: work only when someone has asked the bot
+            // for a review it hasn't given yet, and held back on an
+            // unreadable listing.
+            Some(Basis::Reviews) => self
+                .requested(forge, repo)
+                .is_some_and(|prs| !prs.is_empty()),
             // Every other task is always worth a turn; only the memory above
             // holds one back.
             _ => true,
@@ -241,6 +259,7 @@ impl<'a> Probe<'a> {
             Basis::Head => self.head(forge, repo),
             Basis::Feed => self.stamp(forge, repo),
             Basis::Prs => self.conflicting(forge, repo).map(|prs| prs.join(" ")),
+            Basis::Reviews => self.requested(forge, repo).map(|prs| prs.join(" ")),
         }
     }
 
@@ -259,8 +278,8 @@ impl<'a> Probe<'a> {
         }
         // Fail-open: with no state to compare against, the mark can't be
         // said to still stand, so it doesn't hold the task back. (`rebase`
-        // is held back regardless — its precondition fails closed on the
-        // same unreadable listing.)
+        // and `review` are held back regardless — their preconditions fail
+        // closed on the same unreadable listing.)
         let Some(state) = self.state(task, forge, repo) else {
             return false;
         };
@@ -268,8 +287,9 @@ impl<'a> Probe<'a> {
             // One commit is neither newer nor older than another here: any
             // move off the remembered one is news. The same goes for the
             // conflict set: a force-push, a close, a conflict appearing or
-            // resolving under base movement all change the string.
-            Basis::Head | Basis::Prs => state == mark.state,
+            // resolving under base movement all change the string. And for
+            // the request set: a push, a re-request, a review submitted.
+            Basis::Head | Basis::Prs | Basis::Reviews => state == mark.state,
             // Stamps from one server, only ever compared to each other, so
             // string order is time order — the same test `events::fresh`
             // makes. A stamp moving backward is a thread being read or
@@ -296,10 +316,20 @@ impl<'a> Probe<'a> {
     /// The bot's open conflicting PRs on the repository, read from the forge
     /// once per repository and remembered for the rest of the draw. `None`
     /// when the listing couldn't be read.
-    fn conflicting(&self, forge: &Forge, repo: &str) -> Option<Conflicts> {
+    fn conflicting(&self, forge: &Forge, repo: &str) -> Option<PrKeys> {
         once(&self.conflicts, (forge.kind, repo.to_owned()), || {
             crate::precheck::conflicting_prs(forge, repo)
                 .with_context(|| format!("failed to read {repo}'s conflicting PRs"))
+        })
+    }
+
+    /// The open PRs the bot is asked to review on the repository, read from
+    /// the forge once per repository and remembered for the rest of the
+    /// draw. `None` when the listing couldn't be read.
+    fn requested(&self, forge: &Forge, repo: &str) -> Option<PrKeys> {
+        once(&self.reviews, (forge.kind, repo.to_owned()), || {
+            crate::precheck::review_requests(forge, repo)
+                .with_context(|| format!("failed to read {repo}'s review requests"))
         })
     }
 
@@ -392,10 +422,21 @@ mod tests {
         probe
     }
 
+    /// And for the review-request listing `review` is probed out of.
+    fn review_probe<'a>(cache: &'a Cache, prs: Option<&[&str]>) -> Probe<'a> {
+        let probe = Probe::new(cache);
+        probe.reviews.borrow_mut().insert(
+            (ForgeKind::Github, "me/repo".into()),
+            prs.map(|prs| prs.iter().map(|pr| (*pr).to_owned()).collect()),
+        );
+        probe
+    }
+
     /// Each task is remembered against whatever it reads: the tree-only ones
     /// against the tree, `feedback` against the notification feed, `rebase`
-    /// against the bot's conflicting PRs. The tasks that can become
-    /// actionable with nothing observable moving keep no memory at all.
+    /// against the bot's conflicting PRs, `review` against the PRs it is
+    /// asked to review. The tasks that can become actionable with nothing
+    /// observable moving keep no memory at all.
     ///
     /// The check runs both ways over the whole task pool. A slug that no
     /// longer names a section has stopped being remembered, and a section
@@ -411,6 +452,7 @@ mod tests {
         }
         assert_eq!(basis("feedback"), Some(Basis::Feed));
         assert_eq!(basis("rebase"), Some(Basis::Prs));
+        assert_eq!(basis("review"), Some(Basis::Reviews));
         for task in unremembered {
             assert_eq!(basis(task), None, "{task}");
         }
@@ -418,7 +460,7 @@ mod tests {
         let declared: BTreeSet<&str> = head
             .into_iter()
             .chain(unremembered)
-            .chain(["feedback", "rebase"])
+            .chain(["feedback", "rebase", "review"])
             .collect();
         let slugs: BTreeSet<String> = crate::prompts::default_tasks().into_iter().collect();
         for task in &declared {
@@ -436,6 +478,7 @@ mod tests {
     fn the_gated_tasks_are_the_ones_probed_out_of_forge_state() {
         assert!(gated("feedback"));
         assert!(gated("rebase"));
+        assert!(gated("review"));
         for task in ["docs", "simplify", "bump", "todo", "feature"] {
             assert!(!gated(task), "{task}");
         }
@@ -612,6 +655,45 @@ mod tests {
         assert!(!probe.actionable("rebase", &forge(ForgeKind::Github), "me/repo"));
     }
 
+    /// `review` is drawn only when someone has asked the bot for a review it
+    /// hasn't given, and like `rebase` an unreadable listing holds it back.
+    #[test]
+    fn review_is_drawn_only_when_a_review_is_requested() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        let github = forge(ForgeKind::Github);
+        assert!(review_probe(&cache, Some(&["12@abc"])).actionable("review", &github, "me/repo"));
+        assert!(!review_probe(&cache, Some(&[])).actionable("review", &github, "me/repo"));
+        assert!(!review_probe(&cache, None).actionable("review", &github, "me/repo"));
+    }
+
+    /// A `review` skip is keyed on the request set: it stands while the set
+    /// sits still, and any move — a push to the branch, a new request, the
+    /// review being submitted — redraws the task. The memory outranks the
+    /// precondition, so a request the agent already answered for without
+    /// submitting doesn't win every draw.
+    #[test]
+    fn a_review_skip_stands_until_the_request_set_moves() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        let github = forge(ForgeKind::Github);
+        cache.remember("review", ForgeKind::Github, "me/repo", "12@abc");
+
+        let same = review_probe(&cache, Some(&["12@abc"]));
+        assert!(same.remembered("review", &github, "me/repo"));
+        assert!(!same.actionable("review", &github, "me/repo"));
+        assert!(!review_probe(&cache, Some(&["12@def"])).remembered("review", &github, "me/repo"));
+        assert!(
+            !review_probe(&cache, Some(&["12@abc", "15@eee"]))
+                .remembered("review", &github, "me/repo")
+        );
+        assert!(!review_probe(&cache, Some(&[])).remembered("review", &github, "me/repo"));
+
+        let unreadable = review_probe(&cache, None);
+        assert!(!unreadable.remembered("review", &github, "me/repo"));
+        assert!(!unreadable.actionable("review", &github, "me/repo"));
+    }
+
     /// A task with no precondition of its own is drawn without any forge
     /// lookup once the memory has let it through.
     #[test]
@@ -623,6 +705,7 @@ mod tests {
         assert!(probe.heads.borrow().is_empty());
         assert!(probe.feeds.borrow().is_empty());
         assert!(probe.conflicts.borrow().is_empty());
+        assert!(probe.reviews.borrow().is_empty());
     }
 
     #[test]
@@ -670,6 +753,7 @@ mod tests {
         assert!(probe.heads.borrow().is_empty());
         assert!(probe.feeds.borrow().is_empty());
         assert!(probe.conflicts.borrow().is_empty());
+        assert!(probe.reviews.borrow().is_empty());
     }
 
     /// A skip remembered under one wording of the task doesn't gate the next.

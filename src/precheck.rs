@@ -11,21 +11,22 @@ use tracing::{debug, info};
 use crate::cache::gated;
 use crate::config::{Forge, ForgeKind};
 
-/// Open PRs examined per repository; the bot's own open PRs fit well inside
-/// one page.
+/// Open PRs examined per repository; the bot's own open PRs, and the ones it
+/// is asked to review, fit well inside one page.
 const PR_LIMIT: usize = 20;
 
 /// Draw a (task, forge, repo) triple worth an agent turn. The gated tasks are
 /// probed first — every enabled one against every repository, in a shuffled
 /// order — and the first pair with work wins, so responsive work (a
-/// conflicting PR, a review comment) is never waiting on a lucky draw. Only once nothing is
-/// pending do the rest get their turn, as one shuffled pass over every (task,
-/// repository) pair: `check` waves most of them straight through, so this is
-/// the uniform draw it used to be, but a pair the skip cache has already
-/// answered for is passed over instead of drawn. The cache applies to the
-/// gated pass too — both gated tasks are probed out of the same state their
-/// memory is keyed on — so a gated task can no longer monopolize the draw on
-/// a precondition that stays true. None when nothing at all is worth a turn.
+/// conflicting PR, a review comment, a review request) is never waiting on a
+/// lucky draw. Only once nothing is pending do the rest get their turn, as
+/// one shuffled pass over every (task, repository) pair: `check` waves most
+/// of them straight through, so this is the uniform draw it used to be, but
+/// a pair the skip cache has already answered for is passed over instead of
+/// drawn. The cache applies to the gated pass too — every gated task is
+/// probed out of the same state its memory is keyed on — so a gated task can
+/// no longer monopolize the draw on a precondition that stays true. None
+/// when nothing at all is worth a turn.
 pub fn draw<'a>(
     tasks: &'a [String],
     pool: &'a [(&'a Forge, String)],
@@ -162,6 +163,51 @@ pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
     Ok(keys)
 }
 
+/// The open PRs by other authors on which the bot is a pending requested
+/// reviewer, as sorted `number@head-sha` keys. The set doubles as `review`'s
+/// precondition — non-empty means work — and as the state a skipped turn is
+/// remembered against: submitting the review clears the request, and a
+/// re-request or a push to the branch moves the key.
+pub fn review_requests(forge: &Forge, repo: &str) -> Result<Vec<String>> {
+    if forge.login.is_empty() {
+        // An unresolved login would silently match no reviewer at all;
+        // bailing routes through the probe's fail-closed arm instead.
+        bail!("the {} login is unresolved", forge.kind.name());
+    }
+    let listing = forge_json(
+        forge,
+        &format!("repos/{repo}/pulls?state=open&limit={PR_LIMIT}"),
+        &format!("repos/{repo}/pulls?state=open&per_page={PR_LIMIT}"),
+        // GitLab can filter the listing to MRs the bot is a reviewer on, so
+        // the page only ever holds candidates.
+        &format!(
+            "projects/{}/merge_requests?state=opened&per_page={PR_LIMIT}&reviewer_username={}",
+            project(repo),
+            forge.login
+        ),
+    )?;
+    let mut keys = Vec::new();
+    for pr in requested_prs(&listing, &forge.login)? {
+        // Gitea and GitHub drop the bot from `requested_reviewers` once it
+        // submits, so the listing alone says whether a review is owed.
+        // GitLab keeps the reviewer and tracks a state per reviewer instead,
+        // which `/request_review` resets to `unreviewed` and a submitted
+        // review moves off it — one GET per candidate reads it.
+        if forge.kind == ForgeKind::Gitlab {
+            let Some(iid) = pr["iid"].as_u64() else {
+                continue;
+            };
+            let path = format!("projects/{}/merge_requests/{iid}/reviewers", project(repo));
+            if !unreviewed_by(&api_json(forge, "glab", &path)?, &forge.login) {
+                continue;
+            }
+        }
+        keys.extend(pr_key(pr));
+    }
+    keys.sort();
+    Ok(keys)
+}
+
 /// One GET via the gh/glab `api` subcommand, parsed as JSON. Unlike
 /// `turn::list_api_repos` there is no pagination: one page decides the answer.
 pub fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Value> {
@@ -200,6 +246,45 @@ fn authored_by(pr: &serde_json::Value, login: &str) -> bool {
         .as_str()
         .or_else(|| pr["author"]["username"].as_str())
         == Some(login)
+}
+
+/// Whether `login` is among the PR's requested reviewers, under either forge
+/// spelling (`requested_reviewers[].login` on Gitea and GitHub,
+/// `reviewers[].username` on GitLab).
+fn requested_from(pr: &serde_json::Value, login: &str) -> bool {
+    let named = |reviewers: &serde_json::Value, field: &str| {
+        reviewers
+            .as_array()
+            .is_some_and(|rs| rs.iter().any(|r| r[field].as_str() == Some(login)))
+    };
+    named(&pr["requested_reviewers"], "login") || named(&pr["reviewers"], "username")
+}
+
+/// Whether GitLab's per-reviewer listing for an MR has `login` still owing a
+/// review: its entry's `state` is `unreviewed`, which is where
+/// `/request_review` puts it and a submitted review or approval moves it off.
+fn unreviewed_by(reviewers: &serde_json::Value, login: &str) -> bool {
+    reviewers.as_array().is_some_and(|rs| {
+        rs.iter().any(|r| {
+            r["user"]["username"].as_str() == Some(login)
+                && r["state"].as_str() == Some("unreviewed")
+        })
+    })
+}
+
+/// The listed PRs that are someone else's and name `login` as a requested
+/// reviewer. Like `owned_prs`, a listing that isn't an array is an error so
+/// `review`'s probe fails closed on it.
+fn requested_prs<'a>(
+    prs: &'a serde_json::Value,
+    login: &str,
+) -> Result<Vec<&'a serde_json::Value>> {
+    Ok(prs
+        .as_array()
+        .context("expected an array of pulls")?
+        .iter()
+        .filter(|pr| !authored_by(pr, login) && requested_from(pr, login))
+        .collect())
 }
 
 /// Whether the forge reports the PR as unable to merge into its base, under
@@ -288,6 +373,63 @@ mod tests {
         assert_eq!(numbers, [1, 4]);
         assert!(owned_prs(&json!([]), "bot").unwrap().is_empty());
         assert!(owned_prs(&json!({"message": "oops"}), "bot").is_err());
+    }
+
+    #[test]
+    fn requested_from_reads_either_reviewer_spelling() {
+        assert!(requested_from(
+            &json!({"requested_reviewers": [{"login": "a"}, {"login": "bot"}]}),
+            "bot"
+        ));
+        assert!(requested_from(
+            &json!({"reviewers": [{"username": "bot"}]}),
+            "bot"
+        ));
+        assert!(!requested_from(
+            &json!({"requested_reviewers": [{"login": "a"}]}),
+            "bot"
+        ));
+        assert!(!requested_from(
+            &json!({"requested_reviewers": null}),
+            "bot"
+        ));
+        assert!(!requested_from(&json!({}), "bot"));
+    }
+
+    /// GitLab's reviewer state is what tells a fresh request from one the
+    /// bot has already answered.
+    #[test]
+    fn unreviewed_by_reads_the_bots_reviewer_state() {
+        let pending = json!([
+            {"user": {"username": "a"}, "state": "reviewed"},
+            {"user": {"username": "bot"}, "state": "unreviewed"},
+        ]);
+        assert!(unreviewed_by(&pending, "bot"));
+        let done = json!([{"user": {"username": "bot"}, "state": "approved"}]);
+        assert!(!unreviewed_by(&done, "bot"));
+        assert!(!unreviewed_by(&json!([]), "bot"));
+        assert!(!unreviewed_by(&json!({"message": "oops"}), "bot"));
+    }
+
+    /// Only another author's PR that names the bot as a requested reviewer
+    /// is a review candidate: the bot's own PRs are never reviewed by it,
+    /// and a PR nobody asked it about is left alone.
+    #[test]
+    fn requested_prs_keeps_other_authors_requests_only() {
+        let prs = json!([
+            {"number": 1, "user": {"login": "someone"}, "requested_reviewers": [{"login": "bot"}], "head": {"sha": "aaa"}},
+            {"number": 2, "user": {"login": "bot"}, "requested_reviewers": [{"login": "bot"}], "head": {"sha": "bbb"}},
+            {"number": 3, "user": {"login": "someone"}, "requested_reviewers": [], "head": {"sha": "ccc"}},
+            {"iid": 4, "author": {"username": "someone"}, "reviewers": [{"username": "bot"}], "sha": "ddd"},
+        ]);
+        let keys: Vec<String> = requested_prs(&prs, "bot")
+            .unwrap()
+            .into_iter()
+            .filter_map(pr_key)
+            .collect();
+        assert_eq!(keys, ["1@aaa", "4@ddd"]);
+        assert!(requested_prs(&json!([]), "bot").unwrap().is_empty());
+        assert!(requested_prs(&json!({"message": "oops"}), "bot").is_err());
     }
 
     /// A PR's key names its number and current head revision, under either

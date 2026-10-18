@@ -390,7 +390,7 @@ mod tests {
             "- Handle a TODO comment in the code or a TODO list item from the \
              project's AGENTS.md"
         );
-        assert_eq!(by_slug("feedback").lines().count(), 2);
+        assert_eq!(by_slug("feedback").lines().count(), 3);
         // Nested bullets keep their indentation.
         assert!(
             by_slug("bump").contains("\n  - Only make a PR"),

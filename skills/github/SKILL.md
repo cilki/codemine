@@ -1,8 +1,9 @@
 ---
 name: github
 description:
-  How to list, open pull requests, respond to review feedback, and file
-  issues on our GitHub repositories via the gh CLI.
+  How to list, open pull requests, respond to review feedback, review other
+  people's pull requests, and file issues on our GitHub repositories via the
+  gh CLI.
 ---
 
 These repositories live on GitHub. You deliver work as pull requests — never by
@@ -91,6 +92,51 @@ gh pr close <number> --delete-branch   # closes the pull request and deletes its
 Only your own pull requests, and only on that test: another author's is never
 yours to close, and a change that still applies is never obsolete however
 awkward it has become to land.
+
+## Reviewing someone else's pull request
+
+You review a pull request only when its author asked you to: your account is
+listed under its pending review requests. Submitting the review clears the
+request, so a pull request you already answered stays out of the list until
+someone requests a review from you again.
+
+```sh
+gh pr list --repo <owner>/<repo> --json number,title,author,headRefName,baseRefName,reviewRequests # candidates: another author, and you under reviewRequests
+gh pr view <number> --comments --repo <owner>/<repo>   # the description and the conversation so far
+gh pr diff <number> --repo <owner>/<repo>              # the whole diff against the base
+gh pr checkout <number>                                # to build it or run its tests
+```
+
+Submit the whole review as one request, so the author is notified once.
+Write it as JSON: `event` is `APPROVE`, `REQUEST_CHANGES`, or `COMMENT`;
+`body` is the summary; each entry of `comments` anchors one finding to a line
+on the new side of the diff (`line` is the line number in the file as it is
+after the change, and only lines the diff touches or shows as context can be
+anchored):
+
+```sh
+cat > review.json <<'EOF'
+{
+  "event": "REQUEST_CHANGES",
+  "body": "<what the change does, what you checked, and the verdict>",
+  "comments": [
+    {"path": "src/lib.rs", "line": 42, "side": "RIGHT", "body": "<the finding>"}
+  ]
+}
+EOF
+gh api --method POST repos/<owner>/<repo>/pulls/<number>/reviews --input review.json
+```
+
+If the API rejects a comment's position, drop the `comments` and put the
+findings in the body as `path:line` citations instead:
+
+```sh
+gh pr review <number> --request-changes --body-file <body-file>   # or --approve, or --comment
+```
+
+Never push to, rebase, close, or merge a pull request that isn't yours; a
+review is comments and a verdict only. Once it is submitted, mark the review
+request's notification read as described below.
 
 ## Clearing notifications you have read
 

@@ -1,8 +1,9 @@
 ---
 name: gitlab
 description:
-  How to list, open merge requests, respond to review feedback, and file
-  issues on our GitLab projects via the glab CLI.
+  How to list, open merge requests, respond to review feedback, review other
+  people's merge requests, and file issues on our GitLab projects via the
+  glab CLI.
 ---
 
 These repositories live on GitLab, where pull requests are called merge
@@ -94,6 +95,49 @@ git push origin --delete <source-branch>   # glab's close leaves the branch behi
 Only your own merge requests, and only on that test: another author's is never
 yours to close, and a change that still applies is never obsolete however
 awkward it has become to land.
+
+## Reviewing someone else's merge request
+
+You review a merge request only when its author asked you to: your account is
+one of its reviewers and your review state on it is `unreviewed`. Submitting
+the review moves the state on, so a merge request you already answered stays
+out of the list until someone runs `/request_review @<you>` on it again.
+
+```sh
+glab api "projects/:id/merge_requests?state=opened&reviewer_username=<you>" --jq '.[] | {iid, title, author: .author.username, source_branch, target_branch}'
+glab api "projects/:id/merge_requests/<iid>/reviewers" --jq '.[] | select(.user.username == "<you>") | .state' # unreviewed means a review is owed
+glab mr view <iid> --comments     # the description and the conversation so far
+glab mr diff <iid>                # the whole diff against the target branch
+glab mr checkout <iid>            # to build it or run its tests
+```
+
+Each finding goes in its own discussion, anchored to the line it is about
+where the diff allows it. The anchor needs the merge request's three SHAs
+(`glab api projects/:id/merge_requests/<iid> --jq .diff_refs`) and the new
+side's path and line. Only anchor lines the diff **adds**; a context line
+needs the old-side line number too and is rejected without it, so cite those
+in the summary as `path:line` instead:
+
+```sh
+glab api --method POST "projects/:id/merge_requests/<iid>/discussions" \
+  -f body="<the finding>" \
+  -f "position[position_type]=text" \
+  -f "position[base_sha]=<base_sha>" -f "position[start_sha]=<start_sha>" -f "position[head_sha]=<head_sha>" \
+  -f "position[new_path]=src/lib.rs" -f "position[old_path]=src/lib.rs" -f "position[new_line]=42"
+```
+
+Then the summary, and the verdict as a note of its own — a quick action only
+takes effect when it is the whole note, and it is what moves your review
+state and notifies the author:
+
+```sh
+glab mr note create <iid> --message "<what the change does, what you checked, and the verdict>"
+glab mr note create <iid> --message "/submit_review requested_changes"   # or: /submit_review approve
+```
+
+Never push to, rebase, close, or merge a merge request that isn't yours; a
+review is comments and a verdict only. Once it is submitted, mark the review
+request's todo done as described below.
 
 ## Clearing todos you have handled
 

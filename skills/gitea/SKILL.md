@@ -1,8 +1,9 @@
 ---
 name: gitea
 description:
-  How to list, open pull requests, respond to review feedback, and file
-  issues on our Gitea repositories via the tea CLI.
+  How to list, open pull requests, respond to review feedback, review other
+  people's pull requests, and file issues on our Gitea repositories via the
+  tea CLI.
 ---
 
 These repositories live on Gitea. You deliver work as pull requests — never
@@ -96,6 +97,37 @@ git push origin --delete <head>   # tea's close leaves the branch behind
 Only your own pull requests, and only on that test: another author's is never
 yours to close, and a change that still applies is never obsolete however
 awkward it has become to land.
+
+## Reviewing someone else's pull request
+
+You review a pull request only when its author asked you to: your account is
+listed under its requested reviewers. Submitting the review clears the
+request, so a pull request you already answered stays out of the list until
+someone requests a review from you again. The listing doesn't show
+reviewers; the detail view does, as a `- REQUEST_REVIEW by @<you>` line
+while a review is owed (`APPROVED` or `REQUEST_CHANGES` once you've
+answered):
+
+```sh
+tea pr ls --repo <owner>/<repo> --fields index,title,author,head,base  # open pull requests; skip your own
+tea pr <number> --comments --repo <owner>/<repo>   # the description, who is asked to review, and the conversation so far
+git fetch origin <base> <head> && git diff origin/<base>...origin/<head>   # the whole diff against the base
+git checkout origin/<head>                         # to build it or run its tests
+```
+
+`tea pr review` is interactive and can't be scripted, so inline comments
+aren't available here: cite each finding in the summary as `path:line`, then
+submit the summary with the verdict in one command. The second argument is
+the review body:
+
+```sh
+tea pr reject <number> "<what the change does, what you checked, each finding as path:line, and why it blocks>"
+tea pr approve <number> "<what the change does, what you checked, and why it is fine to merge>"
+```
+
+Never push to, rebase, close, or merge a pull request that isn't yours; a
+review is comments and a verdict only. Once it is submitted, mark the review
+request's notification read as described below.
 
 ## Clearing notifications you have read
 

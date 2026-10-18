@@ -19,6 +19,9 @@ Each "turn" does one of the following on a repo:
 - `rebase`: rebases its own open PR branches that have merge conflicts with
   their base branch, resolving the conflicts and force-pushing — or closes the
   PR and deletes the branch when the change has gone obsolete.
+- `review`: reviews other people's PRs when asked — request a review from the
+  bot's account and it reads the change, comments inline on what it finds, and
+  approves or requests changes.
 - `bump`: update dependencies, handling any migration issues.
 - `simplify`: remove dead code, simplify implementations, drop trivial tests.
 - `todo`: handle a TODO comment in the code, or an item from the repo's
@@ -147,6 +150,10 @@ counts as the state is whatever the task reads:
 - `rebase` answers out of the bot's own open PRs, so it remembers the set of
   conflicting ones. That set is its precondition too — no conflicting PR of its
   own, no turn.
+- `review` answers out of the PRs the bot has been asked to review, so it
+  remembers the set of pending requests. Same precondition — no pending
+  request, no turn — and submitting the review clears the request, so a PR is
+  reviewed once per request.
 
 Any other outcome retires the memory instead, since the turn either changed
 something (and the state it would be remembered against is stale) or never got
