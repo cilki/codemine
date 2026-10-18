@@ -1,5 +1,6 @@
-//! The persistent workspace: one clone per repository, kept up to date and
-//! indexed with codegraph across turns instead of recloned each time.
+//! The workspace: one clone per repository, kept up to date and indexed with
+//! codegraph across turns instead of recloned each time, and cleared on every
+//! restart.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -12,7 +13,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tracing::{info, warn};
+use tracing::warn;
 use wait_timeout::ChildExt;
 
 use crate::config::{Config, Forge, IoClass};
@@ -165,8 +166,8 @@ fn reclone(workspace: &Path, url: &str, dir: &Path, log: &File) -> Result<()> {
 }
 
 /// Bring an existing clone back to a current default branch, whatever state
-/// the previous turn left it in. Ignored files (build caches) survive here;
-/// [`tidy`] wipes them weekly after a turn.
+/// the previous turn left it in. Ignored files (build caches) survive until
+/// the next restart, which clears every clone — see [`clear_clones`].
 fn update(workspace: &Path, url: &str, dir: &Path, log: &File) -> Result<()> {
     // Before any git that would act on it: the config is the agent's to
     // write and git reads it as code.
@@ -405,240 +406,31 @@ fn fast_forward_branches(workspace: &Path, dir: &Path, current: &str, log: &File
     Ok(())
 }
 
-/// How often a clone's ignored files (build outputs: `target/`,
-/// `node_modules/`, ...) are wiped. Kept in between so turns can reuse them,
-/// but never kept forever: incremental build caches only grow.
-const BUILD_CLEAN_INTERVAL: u64 = 7 * 24 * 60 * 60;
-
-/// How old a local-only branch's tip must be before the tidy-up drops it.
-/// Turns keep branches that were never pushed (or were merged and deleted
-/// upstream) so a later turn can pick them back up; past this age nothing
-/// will, and they only pin objects gc could otherwise reclaim.
-const STALE_BRANCH_AGE: u64 = 30 * 24 * 60 * 60;
-
-/// When each clone last had its build outputs wiped, keyed by its path under
-/// the workspace (`<forge>/<owner>/<repo>`). Kept at the workspace root
-/// rather than in the clone, where the agent could write it.
-fn tidy_state_path(workspace: &Path) -> PathBuf {
-    workspace.join("tidy.json")
-}
-
-fn load_tidy_state(workspace: &Path) -> BTreeMap<String, u64> {
-    std::fs::read_to_string(tidy_state_path(workspace))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
-
-/// The key a clone goes by in [`tidy_state_path`].
-fn tidy_key(forge_slug: &str, repo: &str) -> String {
-    format!("{forge_slug}/{repo}")
-}
-
-/// Clean up after a turn, in the clone it ran in: drop local-only branches
-/// gone stale, wipe the ignored build outputs once a week, and let git pack
-/// and prune what has accumulated. Best-effort throughout — nothing here
-/// fails the turn, and each step is independent of the others.
-pub fn tidy(cfg: &Config, forge: &Forge, repo: &str, log: &File) {
-    let dir = repo_dir(&cfg.workspace, forge.kind.name(), repo);
-    if !dir.join(".git").is_dir() {
-        return;
-    }
-    tidy_clone(
-        &cfg.workspace,
-        &tidy_key(forge.kind.name(), repo),
-        &clone_url(forge, repo),
-        &dir,
-        log,
-        crate::status::epoch_now(),
-    );
-}
-
-fn tidy_clone(workspace: &Path, key: &str, url: &str, dir: &Path, log: &File, now: u64) {
-    // The agent has just had the run of `.git/config`; everything below is
-    // a git of the runner's own, so it goes the way `update` does.
-    if let Err(err) = reset_local_config(workspace, dir, url) {
-        warn!("failed to tidy {}: {err:#}", dir.display());
-        return;
-    }
-    if let Err(err) = prune_stale_branches(workspace, dir, now, log) {
-        warn!("failed to prune branches in {}: {err:#}", dir.display());
-    }
-    let mut state = load_tidy_state(workspace);
-    let due = state
-        .get(key)
-        .is_none_or(|last| now.saturating_sub(*last) >= BUILD_CLEAN_INTERVAL);
-    if due {
-        // `-X` removes only what is ignored. The index is excluded by
-        // pathspec: `-e` would add an ignore rule, and with `-X` ignored is
-        // exactly what goes.
-        let cleaned = run_logged(
-            git_in(workspace, dir).args(["clean", "-fdXq", "--", ".", ":(exclude).codegraph"]),
-            GIT_TIMEOUT,
-            log,
-        );
-        match cleaned {
-            Ok(()) => {
-                info!("wiped build outputs in {}", dir.display());
-                state.insert(key.to_owned(), now);
-                if let Err(err) = write_json(&tidy_state_path(workspace), &state) {
-                    warn!("failed to record the clean of {}: {err:#}", dir.display());
-                }
-            }
-            Err(err) => warn!("failed to clean {}: {err:#}", dir.display()),
-        }
-    }
-    // In the foreground, so it is done before the next turn's fetch.
-    let gc = run_logged(
-        git_in(workspace, dir).args(["-c", "gc.autoDetach=false", "gc", "--auto", "--quiet"]),
-        GIT_TIMEOUT,
-        log,
-    );
-    if let Err(err) = gc {
-        warn!("git gc failed in {}: {err:#}", dir.display());
-    }
-}
-
-/// Delete the local branches that have no origin counterpart and whose tip
-/// is older than [`STALE_BRANCH_AGE`]. The default branch and whatever is
-/// checked out are never touched. Names go to git as whole refnames, for the
-/// same reason as in [`fast_forward_branches`].
-fn prune_stale_branches(workspace: &Path, dir: &Path, now: u64, log: &File) -> Result<()> {
-    let remote: BTreeSet<String> = git_stdout(
-        workspace,
-        dir,
-        &["for-each-ref", "--format=%(refname)", "refs/remotes/origin"],
-    )?
-    .lines()
-    .filter_map(|refname| refname.strip_prefix("refs/remotes/origin/"))
-    .map(str::to_owned)
-    .collect();
-    let mut keep = BTreeSet::new();
-    // Detached, or no origin HEAD: nothing to protect from that side.
-    if let Ok(head) = git_stdout(workspace, dir, &["symbolic-ref", "-q", "HEAD"]) {
-        keep.insert(head.trim().to_owned());
-    }
-    if let Ok(head) = git_stdout(
-        workspace,
-        dir,
-        &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
-    ) && let Some(branch) = head.trim().strip_prefix("refs/remotes/origin/")
-    {
-        keep.insert(format!("refs/heads/{branch}"));
-    }
-    let listing = git_stdout(
-        workspace,
-        dir,
-        &[
-            "for-each-ref",
-            "--format=%(refname) %(committerdate:unix)",
-            "refs/heads",
-        ],
-    )?;
-    for line in listing.lines() {
-        // A ref pointing at something other than a commit has no date and
-        // is left alone rather than guessed at.
-        let Some((refname, date)) = line.split_once(' ') else {
-            continue;
-        };
-        let (Some(name), Ok(date)) = (refname.strip_prefix("refs/heads/"), date.parse::<u64>())
-        else {
-            continue;
-        };
-        if keep.contains(refname)
-            || remote.contains(name)
-            || now.saturating_sub(date) < STALE_BRANCH_AGE
-        {
-            continue;
-        }
-        match run_logged(
-            git_in(workspace, dir).args(["update-ref", "-d", refname]),
-            GIT_TIMEOUT,
-            log,
-        ) {
-            Ok(()) => info!("dropped stale branch {name} in {}", dir.display()),
-            Err(err) => warn!("failed to drop {name} in {}: {err:#}", dir.display()),
-        }
-    }
-    Ok(())
-}
-
-/// Delete everything under the workspace's forge directories that is not
-/// the clone of a repository in `pool` (or a directory on the way to one):
-/// clones of repositories since disabled, renamed, or dropped by their forge,
-/// and whatever a failed clone left behind. The tidy state of the clones
-/// that went is dropped with them.
-///
-/// Only called with a pool the forges actually listed — a failed listing
-/// fails the turn before it gets here — since anything missing from it is
-/// deleted, `.codegraph` index and all.
-pub fn remove_orphans(workspace: &Path, pool: &[(&Forge, String)]) {
-    let keys: BTreeSet<String> = pool
-        .iter()
-        .map(|(forge, repo)| tidy_key(forge.kind.name(), repo))
-        .collect();
-    remove_orphans_except(workspace, &keys);
-}
-
-fn remove_orphans_except(workspace: &Path, keys: &BTreeSet<String>) {
-    if let Err(err) = sweep_orphans(workspace, keys) {
-        warn!("failed to remove orphaned clones: {err:#}");
-    }
-    let mut state = load_tidy_state(workspace);
-    let before = state.len();
-    state.retain(|key, _| keys.contains(key));
-    if state.len() != before
-        && let Err(err) = write_json(&tidy_state_path(workspace), &state)
-    {
-        warn!("failed to update the tidy state: {err:#}");
-    }
-}
-
-fn sweep_orphans(workspace: &Path, keys: &BTreeSet<String>) -> Result<()> {
-    let keep: BTreeSet<PathBuf> = keys.iter().map(|key| workspace.join(key)).collect();
-    let on_the_way: BTreeSet<PathBuf> = keep
-        .iter()
-        .flat_map(|path| path.ancestors().skip(1))
-        .filter(|path| path.starts_with(workspace) && *path != workspace)
-        .map(Path::to_path_buf)
-        .collect();
+/// Throw away every repository clone, so each process starts from fresh
+/// ones. Between turns a clone is brought forward by [`update`]; across
+/// restarts it is not kept at all, which is what bounds the build outputs,
+/// stale local branches, and clones of since-disabled repositories that
+/// would otherwise pile up in it. Only the forge directories go: the rest of
+/// the workspace root is settings and state the runner keeps on purpose.
+pub fn clear_clones(workspace: &Path) -> Result<()> {
     for slug in ["gitea", "github", "gitlab"] {
         let path = workspace.join(slug);
-        if on_the_way.contains(&path) {
-            sweep_dir(&path, &keep, &on_the_way)?;
-        } else if path.symlink_metadata().is_ok() {
-            remove_path(&path)?;
-        }
-    }
-    Ok(())
-}
-
-fn sweep_dir(dir: &Path, keep: &BTreeSet<PathBuf>, on_the_way: &BTreeSet<PathBuf>) -> Result<()> {
-    let entries =
-        std::fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read {}", dir.display()))?;
-        let path = entry.path();
-        if keep.contains(&path) {
-            continue;
-        }
         // Not followed through a symlink: one is removed like a file.
-        if on_the_way.contains(&path) && entry.file_type()?.is_dir() {
-            sweep_dir(&path, keep, on_the_way)?;
-        } else {
-            remove_path(&path)?;
-        }
+        let removed = match path.symlink_metadata() {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(_) => continue,
+        };
+        removed.with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    // Left behind by the weekly tidy-up this replaced.
+    let stale = workspace.join("tidy.json");
+    if let Err(err) = std::fs::remove_file(&stale)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err).with_context(|| format!("failed to remove {}", stale.display()));
     }
     Ok(())
-}
-
-fn remove_path(path: &Path) -> Result<()> {
-    info!("removing orphaned {}", path.display());
-    let removed = match path.symlink_metadata()?.is_dir() {
-        true => std::fs::remove_dir_all(path),
-        false => std::fs::remove_file(path),
-    };
-    removed.with_context(|| format!("failed to remove {}", path.display()))
 }
 
 /// The commit the clone is checked out at, which the skip cache remembers an
@@ -1175,146 +967,36 @@ mod tests {
         assert!(stored.contains("bot:token@forge.example"), "{stored}");
     }
 
-    /// Build outputs are wiped once a week and kept in between; the codegraph
-    /// index, tracked files, and untracked work that isn't ignored never are.
+    /// The forge directories go, whatever is in them; everything else at the
+    /// workspace root — the settings, the skip cache, the proxy login — stays.
     #[test]
-    fn build_outputs_are_wiped_weekly_and_the_index_survives() {
-        let root = tempfile::tempdir().unwrap();
-        let (origin, clone) = origin_and_clone(root.path());
-        std::fs::write(clone.join(".gitignore"), "target/\n").unwrap();
-        std::fs::create_dir_all(clone.join(".codegraph")).unwrap();
-        std::fs::write(clone.join(".codegraph/.gitignore"), "codegraph.db*\n").unwrap();
-        std::fs::write(clone.join(".codegraph/codegraph.db"), "index").unwrap();
-        std::fs::write(clone.join("notes.txt"), "untracked").unwrap();
-        let build = || {
-            std::fs::create_dir_all(clone.join("target/debug")).unwrap();
-            std::fs::write(clone.join("target/debug/out"), "artifact").unwrap();
-        };
-        build();
-
-        let log = tempfile::tempfile().unwrap();
-        let url = url_of(&origin);
-        let start = 1_000_000_000;
-        let tidy = |now| tidy_clone(root.path(), "gitea/o/r", &url, &clone, &log, now);
-
-        // Never cleaned before: due straight away.
-        tidy(start);
-        assert!(!clone.join("target").exists());
-        assert!(clone.join(".codegraph/codegraph.db").exists());
-        assert!(clone.join("notes.txt").exists());
-        assert!(clone.join("first").exists());
-
-        // Within the week the outputs are left for reuse...
-        build();
-        tidy(start + 24 * 60 * 60);
-        assert!(clone.join("target/debug/out").exists());
-
-        // ...and wiped again once it has passed.
-        tidy(start + BUILD_CLEAN_INTERVAL);
-        assert!(!clone.join("target").exists());
-        assert!(clone.join(".codegraph/codegraph.db").exists());
-        assert_eq!(
-            load_tidy_state(root.path()).get("gitea/o/r"),
-            Some(&(start + BUILD_CLEAN_INTERVAL))
-        );
-    }
-
-    /// Only stale local-only branches go: never one with an origin
-    /// counterpart, the default branch, or the one checked out — and a name
-    /// spelled like an option is a branch like any other.
-    #[test]
-    fn only_stale_local_only_branches_are_pruned() {
-        let root = tempfile::tempdir().unwrap();
-        let (origin, clone) = origin_and_clone(root.path());
-        git(&origin, &["branch", "feature"]);
-        git(&clone, &["fetch", "origin"]);
-        git(&clone, &["branch", "feature", "origin/feature"]);
-        git(&clone, &["branch", "local-only"]);
-        git(&clone, &["update-ref", "refs/heads/-x", "refs/heads/main"]);
-        git(&clone, &["checkout", "-b", "wip"]);
-        let log = tempfile::tempfile().unwrap();
-        let branches = || {
-            git_stdout(
-                root.path(),
-                &clone,
-                &["for-each-ref", "--format=%(refname:strip=2)", "refs/heads"],
-            )
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>()
-        };
-        let all: BTreeSet<String> = ["-x", "feature", "local-only", "main", "wip"]
-            .map(String::from)
-            .into();
-
-        // Fresh commits: nothing is stale yet.
-        let now = crate::status::epoch_now();
-        prune_stale_branches(root.path(), &clone, now, &log).unwrap();
-        assert_eq!(branches(), all);
-
-        // Past the age, the local-only ones go and the rest stay.
-        prune_stale_branches(root.path(), &clone, now + STALE_BRANCH_AGE + 60, &log).unwrap();
-        let left: BTreeSet<String> = ["feature", "main", "wip"].map(String::from).into();
-        assert_eq!(branches(), left);
-    }
-
-    /// Everything under the forge directories that isn't a kept clone, or on
-    /// the way to one, goes — nested GitLab groups included — and nothing
-    /// inside a kept clone or outside the forge directories is touched.
-    #[test]
-    fn orphaned_clones_are_removed() {
+    fn clones_are_cleared_and_nothing_else() {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path();
-        let mkdir = |path: &str| std::fs::create_dir_all(ws.join(path)).unwrap();
-        for clone in [
-            "gitea/a/keep/.git",
-            "gitea/a/keep/vendor/sub/.git",
-            "gitea/a/gone/.git",
-            "gitea/b/also-gone/.git",
-            "gitea/a/half-made/src",
+        for dir in [
+            "gitea/a/r/.git",
             "gitlab/g/sub/repo/.git",
-            "gitlab/g/other/.git",
             "github/z/y/.git",
             "logs",
             "cliproxyapi/auth",
         ] {
-            mkdir(clone);
+            std::fs::create_dir_all(ws.join(dir)).unwrap();
         }
-        std::fs::write(ws.join("config.json"), "{}").unwrap();
-        let state: BTreeMap<String, u64> = [("gitea/a/keep".into(), 1), ("gitea/a/gone".into(), 2)]
-            .into_iter()
-            .collect();
-        write_json(&tidy_state_path(ws), &state).unwrap();
-
-        let keys: BTreeSet<String> = ["gitea/a/keep", "gitlab/g/sub/repo"]
-            .map(String::from)
-            .into();
-        remove_orphans_except(ws, &keys);
-
-        for kept in [
-            "gitea/a/keep/.git",
-            "gitea/a/keep/vendor/sub/.git",
-            "gitlab/g/sub/repo/.git",
-            "logs",
-            "cliproxyapi/auth",
-            "config.json",
-        ] {
-            assert!(ws.join(kept).exists(), "{kept} was removed");
+        for file in ["config.json", "skips.json", "tidy.json"] {
+            std::fs::write(ws.join(file), "{}").unwrap();
         }
-        for gone in [
-            "gitea/a/gone",
-            "gitea/a/half-made",
-            "gitea/b",
-            "gitlab/g/other",
-            "github",
-        ] {
+
+        clear_clones(ws).unwrap();
+
+        for gone in ["gitea", "gitlab", "github", "tidy.json"] {
             assert!(!ws.join(gone).exists(), "{gone} survived");
         }
-        assert_eq!(
-            load_tidy_state(ws).into_keys().collect::<Vec<_>>(),
-            ["gitea/a/keep"]
-        );
+        for kept in ["logs", "cliproxyapi/auth", "config.json", "skips.json"] {
+            assert!(ws.join(kept).exists(), "{kept} was removed");
+        }
+
+        // Nothing to clear is not an error.
+        clear_clones(ws).unwrap();
     }
 
     /// What the agent started in the background dies with the turn, even

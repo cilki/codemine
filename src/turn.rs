@@ -138,9 +138,9 @@ impl Turn<'_> {
     }
 }
 
-/// Run one opencode turn against the repository's persistent workspace clone
-/// and report how it went. The workspace survives across turns, and so does
-/// the turn's log under `<workspace>/logs`, for as long as the process runs.
+/// Run one opencode turn against the repository's workspace clone and report
+/// how it went. The clone survives across turns, and so does the turn's log
+/// under `<workspace>/logs`, for as long as the process runs.
 pub fn run(
     cfg: &Config,
     status: &Shared,
@@ -202,8 +202,6 @@ pub fn run(
             last_lines(&tail, 20)
         );
         turn.finish(status, &tail, Outcome::Failed, elapsed, None);
-        // The clone itself may be half-made; only the workspace-wide sweep.
-        workspace::remove_orphans(&cfg.workspace, &pool);
         return Ok(Report::default());
     }
 
@@ -240,12 +238,6 @@ pub fn run(
     // are the next best figure, and better than a row with no cost on it.
     let tokens = crate::usage::collect_since(turn.wall).or(sampled);
     turn.finish(status, &tail, outcome, elapsed, tokens);
-
-    // After the turn is recorded, so the page isn't held on it. The agent's
-    // whole process group is gone by now (see `supervise`), so nothing is
-    // still writing into the clone.
-    workspace::tidy(cfg, forge, repo, &log);
-    workspace::remove_orphans(&cfg.workspace, &pool);
 
     Ok(Report {
         backoff: match verdict.usage_limit {

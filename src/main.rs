@@ -1,6 +1,6 @@
 //! Continuously invoke an opencode command to sweep repositories on our code
-//! forges. Each turn runs in a fresh session against a persistent per-repo
-//! workspace that stays cloned and codegraph-indexed across turns,
+//! forges. Each turn runs in a fresh session against a per-repo clone that
+//! stays cloned and codegraph-indexed across turns (but not across restarts),
 //! back-to-back with the previous one. Everything except the CLI flags is
 //! configured through the always-on web UI and persisted in the workspace.
 
@@ -519,6 +519,10 @@ fn setup(cli: &mut Cli) -> Result<()> {
         std::fs::remove_dir_all(&logs)
             .with_context(|| format!("failed to clear {}", logs.display()))?;
     }
+    // Every process starts from fresh clones: whatever earlier turns built,
+    // branched, or left behind in them goes, as do clones of repositories
+    // no longer enabled. Nothing is running in them yet.
+    workspace::clear_clones(&cli.workspace)?;
 
     let gitconfig = install_git_config(cli, &config::home())?;
     // SAFETY: setup() runs before the web UI and agent threads exist, so no

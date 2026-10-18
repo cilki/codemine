@@ -9,8 +9,9 @@
 //! buys a session's worth of tokens and another `TASK SKIPPED`.
 //! Each skip is remembered against that state and the task's own
 //! instructions, and the task isn't drawn for that repository again until one
-//! of the two changes. The memory is persisted next to the rest of the
-//! workspace, since the clones outlive the process too.
+//! of the two changes. The memory is persisted at the workspace root so it
+//! outlives the process; it is keyed by commit and forge state, not by the
+//! clone, so the fresh clones a restart brings leave it valid.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

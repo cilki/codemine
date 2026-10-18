@@ -53,8 +53,8 @@ instance which I mirror to Github.
 ### Getting started
 
 Build the image and bring it up with the workspace on a volume; everything that
-must survive the container — settings, repo clones, the proxy login — lives
-there:
+must survive the container — settings, the skip cache, the proxy login — lives
+there. Repository clones live there too, but are recloned fresh on every start:
 
 ```sh
 docker build -t codemine .
