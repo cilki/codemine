@@ -25,8 +25,14 @@ gh api user/repos --paginate --jq '.[].full_name'
    already been turned down:
 
    ```sh
-   gh pr list --repo <owner>/<repo> --state all # every pull request, not just open ones
+   gh pr list --repo <owner>/<repo> --state all --limit 100 # every pull request, not just open ones
    ```
+
+   `--limit` is not optional padding. `gh` fetches 30 items and stops, newest
+   first, so on a repository with any history the listing looks complete while
+   hiding exactly the older pull requests you are checking for — open ones
+   included. Raise the limit and check that the count you get back is the whole
+   repository.
 
    Each is marked `OPEN`, `MERGED`, or `CLOSED`. A merged one already landed
    on the default branch. A closed one was either turned down or closed by you
@@ -52,7 +58,7 @@ If a push is rejected, stop and report it rather than working around it.
 To see your open pull requests and what reviewers have said about them:
 
 ```sh
-gh pr list --repo <owner>/<repo> --json number,state,headRefName,baseRefName,title,author,mergeable # open pull requests, with their branches; mergeable is MERGEABLE, CONFLICTING, or UNKNOWN
+gh pr list --repo <owner>/<repo> --limit 100 --json number,state,headRefName,baseRefName,title,author,mergeable # open pull requests, with their branches; mergeable is MERGEABLE, CONFLICTING, or UNKNOWN
 gh pr view <number> --comments --repo <owner>/<repo>                               # the conversation under a pull request
 ```
 
@@ -163,7 +169,7 @@ one pull request, something that needs a decision from the user, or a problem
 you found while doing something else.
 
 ```sh
-gh issue list --repo <owner>/<repo>                # open issues; `--state all` for the rest
+gh issue list --repo <owner>/<repo> --limit 100    # open issues; `--state all` for the rest
 gh issue view <number> --comments --repo <owner>/<repo> # the body and its conversation
 ```
 

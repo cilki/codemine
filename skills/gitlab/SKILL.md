@@ -26,8 +26,14 @@ glab repo list --member --per-page 100
    already been turned down:
 
    ```sh
-   glab mr list --repo <namespace>/<project> --all # every merge request, not just open ones
+   glab mr list --repo <namespace>/<project> --all --per-page 100 # every merge request, not just open ones
    ```
+
+   `--all` widens the *state* filter, not the page: it is "any state", not "all
+   of them". `glab` still lists 30 per page, newest first, so on a project with
+   any history the listing looks complete while hiding exactly the older merge
+   requests you are checking for — open ones included. `--per-page` is what
+   lifts that; check that the count you get back is the whole project.
 
    Each is marked open, merged, or closed. A merged one already landed on the
    default branch. A closed one was either turned down or closed by you as
@@ -53,9 +59,9 @@ If a push is rejected, stop and report it rather than working around it.
 To see your open merge requests and what reviewers have said about them:
 
 ```sh
-glab mr list --repo <namespace>/<project>              # open merge requests, with their branches
+glab mr list --repo <namespace>/<project> --per-page 100 # open merge requests, with their branches
 glab mr view <number> --comments --repo <namespace>/<project> # the conversation under a merge request
-glab api "projects/:id/merge_requests?state=opened&author_username=<you>" --jq '.[] | {iid, source_branch, has_conflicts}' # which of your merge requests conflict with their base
+glab api "projects/:id/merge_requests?state=opened&author_username=<you>&per_page=100" --jq '.[] | {iid, source_branch, has_conflicts}' # which of your merge requests conflict with their base
 ```
 
 When a comment points at a file or line, read that spot in the diff
@@ -166,7 +172,7 @@ for one merge request, something that needs a decision from the user, or a
 problem you found while doing something else.
 
 ```sh
-glab issue list --repo <namespace>/<project>                # open issues; `--all` for the rest
+glab issue list --repo <namespace>/<project> --per-page 100 # open issues; `--all` for the rest
 glab issue view <number> --comments --repo <namespace>/<project> # the body and its conversation
 ```
 
