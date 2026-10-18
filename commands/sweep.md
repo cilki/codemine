@@ -57,8 +57,8 @@ the user decide what to do.
 
 - Respond to reviewer comments on your open PRs
 - If you are assigned an issue, create a PR to address it
-- A request to review a PR — someone else's or one of your own — is the
-  `review` task's, not yours: leave it, and leave its notification unread
+- A request to review a PR — someone else's or one of your own — is the `review`
+  task's, not yours: leave it, and leave its notification unread
 
 ## "rebase"
 
@@ -66,24 +66,22 @@ the user decide what to do.
   branch with no such PR is not yours: do not rebase it and do not delete it
 - If one of those PRs has merge conflicts with its base branch, rebase it onto
   the base, resolve the conflicts, and force-push
-- Unless the change is obsolete — the base already carries an equivalent change,
-  the code it touched is gone, or the problem it fixed no longer exists. Then
-  comment on the PR saying why it is obsolete, close it, and delete its branch
-  instead of rebasing. See the `$3` skill for how
+- If the PR becomes obsolete, then comment on the PR saying why it is obsolete,
+  close it, and delete its branch instead of rebasing.
 - Conflict size is never the test: a change that still applies gets rebased
   however messy the conflicts are
 - Leave branches that merge cleanly alone, even when they are behind their base,
   and leave other authors' PRs alone entirely
-- Delete branches you've created that don't have an open PR
+- If the scope of the PR changes, edit the PR description accordingly
 
 ## "review"
 
 - Review the open PRs on which your own forge account is a pending requested
-  reviewer. Who opened the PR doesn't matter: one of your own is yours to
-  review when someone asks you to, and review it as critically as anyone
-  else's. A PR nobody asked you about, or one you already answered and haven't
-  been re-asked about, is not yours to review. See the `$3` skill for how to
-  find and submit a review
+  reviewer. Who opened the PR doesn't matter: one of your own is yours to review
+  when someone asks you to, and review it as critically as anyone else's. A PR
+  nobody asked you about, or one you already answered and haven't been re-asked
+  about, is not yours to review. See the `$3` skill for how to find and submit a
+  review
 - Read the PR description and its discussion so you know what the change is for,
   then the whole diff against its base branch. Check the branch out and build or
   run the tests when the change warrants it
@@ -101,8 +99,8 @@ the user decide what to do.
   when something does. Submit everything in one go, so the author is notified
   once
 - A review is comments and a verdict only. Never push to, rebase, close, or
-  merge the PR under review — not even your own; fixing what you found is
-  the `feedback` task's job — and never claim you ran something you didn't
+  merge the PR under review — not even your own; fixing what you found is the
+  `feedback` task's job — and never claim you ran something you didn't
 - Clear the review request's notification once the review is submitted, as the
   `$3` skill describes
 

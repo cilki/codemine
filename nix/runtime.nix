@@ -37,7 +37,7 @@ with pkgs;
     if pkgs ? ${name} then
       pkgs.${name}
     else
-      (import (builtins.fetchTarball {
+      (import (fetchTarball {
         url = "https://github.com/NixOS/nixpkgs/archive/nixos-unstable.tar.gz";
       }) { }).${name};
 in [
@@ -50,6 +50,17 @@ in [
   # refresh; codemine and opencode are only clients.
   (fromUnstable "cliproxyapi")
 ])
+# attest isn't in nixpkgs yet; build it from the package expression on the
+# cilki/nixpkgs `attest` branch against our own pin rather than importing the
+# whole fork.
+++ [
+  (if pkgs ? attest then
+    attest
+  else
+    callPackage (builtins.fetchurl {
+      url = "https://raw.githubusercontent.com/cilki/nixpkgs/attest/pkgs/by-name/at/attest/package.nix";
+    }) { })
+]
 # rtk is missing from some nixpkgs pins too, and unlike codegraph and
 # cliproxyapi it has no fallback: nothing else in the tree installs it. So on
 # a pin without rtk the image simply ships without it, `prompts::install_rtk`
