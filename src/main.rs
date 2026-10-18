@@ -101,6 +101,12 @@ fn main() -> Result<()> {
     // anything it can't fix on its own needs a human either way — which the
     // health problem below surfaces independently.
     let mut auth_gated: Option<u64> = None;
+    // The model a turn found opencode refusing, and what it said about it.
+    // Unlike the auth gate this has no expiry: a model ID the provider has
+    // renamed or retired is wrong until somebody picks another one, so it
+    // stands as a blocker against the model field until that model stops
+    // being the configured one.
+    let mut rejected_model: Option<(String, String)> = None;
     // What was last logged as blocking turns, so a blocker that needs a
     // human says so once instead of once per pass.
     let mut blocked = Blocked::default();
@@ -121,6 +127,15 @@ fn main() -> Result<()> {
                     "the last turn failed to authenticate with CLIProxyAPI; \
                      retrying shortly",
                 ));
+            }
+        }
+        // A refused model stands as a blocker for as long as it is the
+        // configured one; picking another retires it, and the turn that then
+        // runs is what reports the recovery.
+        if let Some((model, complaint)) = &rejected_model {
+            match *model == settings.model {
+                true => problems.push(Problem::new("s-model", complaint.clone())),
+                false => rejected_model = None,
             }
         }
         let cfg = match runnable(
@@ -225,6 +240,10 @@ fn main() -> Result<()> {
                     );
                     auth_gated = Some(until);
                     Status::update(&status, |s| s.oauth_gated_until = Some(until));
+                }
+                if let Some(complaint) = report.rejected_model {
+                    error!("opencode refused the configured model: {complaint}");
+                    rejected_model = Some((cfg.model.clone(), complaint));
                 }
                 if report.completed {
                     let left = Status::update(&status, |s| s.allowance.spend());

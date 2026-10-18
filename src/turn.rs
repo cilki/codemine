@@ -52,6 +52,10 @@ pub struct Report {
     /// proxy with no usable login); the main loop briefly gates further
     /// turns so a broken setup can't burn them back to back.
     pub auth_error: bool,
+    /// opencode refused the configured model, with what it said about it.
+    /// Nothing but an edit fixes that, so the main loop raises it against the
+    /// model field and stops drawing rather than retrying.
+    pub rejected_model: Option<String>,
     /// The web UI cancelled the turn; the main loop skips the between-turn
     /// sleep so the next one starts right away.
     pub canceled: bool,
@@ -248,6 +252,7 @@ pub fn run(
         idle: None,
         completed: verdict.completed,
         auth_error: verdict.auth_error,
+        rejected_model: verdict.rejected_model,
         canceled,
     })
 }
@@ -684,6 +689,7 @@ mod tests {
             died,
             usage_limit: None,
             auth_error: false,
+            rejected_model: None,
         }
     }
 
@@ -705,8 +711,8 @@ mod tests {
         assert_eq!(outcome_of(None, false, &completed, 1, ""), Outcome::Timeout);
 
         // A nonzero exit is a failure, and so is a clean exit whose session
-        // died on an error: opencode exits 0 on an unknown command or a
-        // missing model, which is the whole reason the log is scanned at all.
+        // died on an error: opencode exits 0 on a provider refusing the
+        // request, which is the whole reason the log is scanned at all.
         assert_eq!(
             outcome_of(exited(1), false, &completed, 1, ""),
             Outcome::Failed

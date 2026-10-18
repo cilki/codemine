@@ -1,8 +1,9 @@
 //! What the tail of a turn's log says about how the turn went. opencode exits
-//! 0 even when the turn died on an error (unknown command, missing auth, bad
-//! model), so its exit status settles almost nothing and the log is the
-//! witness: it is scanned for opencode's error reports, the agent's own task
-//! markers, usage-limit notices, and proxy authentication failures.
+//! 0 even when the turn died on an error (missing auth, a provider refusing
+//! the request mid-session), so its exit status settles almost nothing and
+//! the log is the witness: it is scanned for opencode's error reports, the
+//! agent's own task markers, usage-limit notices, proxy authentication
+//! failures, and a model the configured ID doesn't name.
 //!
 //! opencode colors its output, so the tail has to be read through ANSI
 //! escapes. That stripping — and the slice of closing lines the markers are
@@ -11,7 +12,7 @@
 //! and the only caller wants all four: two strips of the closing lines and
 //! two of the whole tail, to say four things about one piece of text.
 
-/// What the turn's log says about how it went: the four things the log is the
+/// What the turn's log says about how it went: the five things the log is the
 /// only witness to, read together because they are read from one text.
 pub struct Verdict {
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
@@ -24,6 +25,9 @@ pub struct Verdict {
     pub usage_limit: Option<u64>,
     /// The turn died on proxy authentication.
     pub auth_error: bool,
+    /// opencode refused the configured model outright, with whatever it said
+    /// about it — the model ID and, when it has them, its suggestions.
+    pub rejected_model: Option<String>,
 }
 
 /// How much of the tail counts as the agent's last word. A `TASK COMPLETED`
@@ -32,20 +36,21 @@ pub struct Verdict {
 const CLOSING_LINES: usize = 50;
 
 impl Verdict {
-    /// Read the log tail once and answer all four questions off it, rather
+    /// Read the log tail once and answer all five questions off it, rather
     /// than scanning it again wherever one of the answers is wanted.
     pub fn read(tail: &str) -> Verdict {
         let tail = strip_ansi(tail);
         // The markers and how the session ended are the agent's last word, so
-        // they are looked for in the closing lines; the usage notice and the
-        // auth failure are whatever went wrong mid-turn and can sit anywhere
-        // in the tail.
+        // they are looked for in the closing lines; the usage notice, the
+        // auth failure, and the refused model are whatever went wrong
+        // mid-turn and can sit anywhere in the tail.
         let closing = last_lines(&tail, CLOSING_LINES);
         Verdict {
             completed: reported_completed(closing),
             died: died_on_error(closing),
             usage_limit: usage_limit_epoch(&tail),
             auth_error: auth_error(&tail),
+            rejected_model: rejected_model(&tail),
         }
     }
 }
@@ -168,6 +173,35 @@ const AUTH_REFUSALS: [&str; 5] = [
     "bearer token",
     "OAuth token",
 ];
+
+/// What opencode says when the `--model` it was given names no model it
+/// knows. The ID follows, and for a near miss a list of the ones it meant.
+const MODEL_REFUSAL: &str = "Model not found:";
+
+/// What the turn says about the configured model being refused: the text of
+/// opencode's complaint, or None if it never made one.
+///
+/// This is a settings problem rather than a transient one — a model ID that
+/// the provider has renamed or retired stays wrong until someone picks
+/// another — and it costs a whole turn to find out: opencode exits before
+/// the session starts, so every drawn turn recloned, reindexed, and died in
+/// seconds, around the clock, with the reason visible only to whoever opened
+/// that turn's log. Read for here so the main loop can put it on the model
+/// field instead and stop drawing.
+///
+/// Only opencode's own error line counts, the same way the short auth
+/// refusals do: the phrase is plain enough English that a repository under a
+/// turn could print it for its own reasons, and holding every turn on a
+/// settings blocker nobody can see a cause for is worse than one wasted turn.
+fn rejected_model(tail: &str) -> Option<String> {
+    tail.lines().find_map(|line| {
+        if !is_error_report(line) {
+            return None;
+        }
+        let at = line.find(MODEL_REFUSAL)?;
+        Some(line[at..].trim().to_owned())
+    })
+}
 
 /// The epoch at which an exhausted usage window reopens, parsed from a
 /// `usage limit reached|<epoch>` notice.
@@ -417,6 +451,58 @@ mod tests {
         assert!(verdict.auth_error);
         assert!(verdict.died);
         assert!(!verdict.completed);
+    }
+
+    /// What opencode prints when `--model` names something it doesn't know,
+    /// captured by running 1.15.10 against each shape: a near miss comes with
+    /// the models it meant, an unknown provider with nothing but the ID, and
+    /// an ID with no provider in it gets split anyway. The whole complaint is
+    /// kept, since it is what the settings page shows the one who has to pick
+    /// a different model.
+    #[test]
+    fn a_refused_model_is_read_off_the_real_log_tail() {
+        let verdict = Verdict::read(
+            "Database migration complete.\n\
+             \x1b[91m\x1b[1mError: \x1b[0mModel not found: anthropic/claude-opus-4. \
+             Did you mean: claude-opus-4-8, claude-opus-4-6, claude-opus-4-5?\n\
+             \x1b[91m\x1b[1mError: \x1b[0m{\n  \"name\": \"UnknownError\",\n}\n",
+        );
+        assert_eq!(
+            verdict.rejected_model.as_deref(),
+            Some(
+                "Model not found: anthropic/claude-opus-4. Did you mean: \
+                 claude-opus-4-8, claude-opus-4-6, claude-opus-4-5?"
+            )
+        );
+        assert!(verdict.died);
+        assert!(!verdict.auth_error, "a bad model is not a refused login");
+
+        for line in [
+            "Error: Model not found: nosuchprovider/whatever.",
+            "Error: Model not found: justamodel/.",
+        ] {
+            assert_eq!(
+                rejected_model(line).as_deref(),
+                Some(line.trim_start_matches("Error: "))
+            );
+        }
+    }
+
+    /// The complaint is plain English, so it only counts on opencode's own
+    /// error line — a repository's own output is free to say it, and a false
+    /// reading here blocks every turn until a human edits the settings.
+    #[test]
+    fn only_opencodes_own_line_refuses_a_model() {
+        assert_eq!(rejected_model("all quiet"), None);
+        assert_eq!(rejected_model("Error: something else entirely"), None);
+        assert_eq!(
+            rejected_model("test registry::Model not found: foo ... ok"),
+            None
+        );
+        assert_eq!(
+            rejected_model("  warning: Model not found: anthropic/x"),
+            None
+        );
     }
 
     #[test]
