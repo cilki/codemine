@@ -12,8 +12,8 @@ Your assigned task for this turn: $1
 Your assigned repository: $2, hosted on our $3 forge
 
 Load the `$3` skill before doing anything on the forge; it explains how to open
-pull requests, respond to review feedback, review other people's pull requests,
-and file issues.
+pull requests, respond to review feedback, review pull requests, and file
+issues.
 
 The assigned repository is already cloned, up to date, and checked out on its
 default branch at `$4` — do not clone or fetch it again. Leftover build
@@ -57,8 +57,8 @@ the user decide what to do.
 
 - Respond to reviewer comments on your open PRs
 - If you are assigned an issue, create a PR to address it
-- A request to review someone else's PR is the `review` task's, not yours: leave
-  it, and leave its notification unread
+- A request to review a PR — someone else's or one of your own — is the
+  `review` task's, not yours: leave it, and leave its notification unread
 
 ## "rebase"
 
@@ -78,10 +78,12 @@ the user decide what to do.
 
 ## "review"
 
-- Review the open PRs by other authors on which your own forge account is a
-  pending requested reviewer. A PR nobody asked you about, or one you already
-  answered and haven't been re-asked about, is not yours to review; your own PRs
-  never are. See the `$3` skill for how to find and submit a review
+- Review the open PRs on which your own forge account is a pending requested
+  reviewer. Who opened the PR doesn't matter: one of your own is yours to
+  review when someone asks you to, and review it as critically as anyone
+  else's. A PR nobody asked you about, or one you already answered and haven't
+  been re-asked about, is not yours to review. See the `$3` skill for how to
+  find and submit a review
 - Read the PR description and its discussion so you know what the change is for,
   then the whole diff against its base branch. Check the branch out and build or
   run the tests when the change warrants it
@@ -99,7 +101,8 @@ the user decide what to do.
   when something does. Submit everything in one go, so the author is notified
   once
 - A review is comments and a verdict only. Never push to, rebase, close, or
-  merge another author's PR, and never claim you ran something you didn't
+  merge the PR under review — not even your own; fixing what you found is
+  the `feedback` task's job — and never claim you ran something you didn't
 - Clear the review request's notification once the review is submitted, as the
   `$3` skill describes
 

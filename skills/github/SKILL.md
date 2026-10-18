@@ -1,9 +1,8 @@
 ---
 name: github
 description:
-  How to list, open pull requests, respond to review feedback, review other
-  people's pull requests, and file issues on our GitHub repositories via the
-  gh CLI.
+  How to list, open pull requests, respond to review feedback, review pull
+  requests, and file issues on our GitHub repositories via the gh CLI.
 ---
 
 These repositories live on GitHub. You deliver work as pull requests — never by
@@ -93,15 +92,16 @@ Only your own pull requests, and only on that test: another author's is never
 yours to close, and a change that still applies is never obsolete however
 awkward it has become to land.
 
-## Reviewing someone else's pull request
+## Reviewing a pull request
 
-You review a pull request only when its author asked you to: your account is
-listed under its pending review requests. Submitting the review clears the
-request, so a pull request you already answered stays out of the list until
-someone requests a review from you again.
+You review a pull request only when someone asked you to: your account is
+listed under its pending review requests. That is the whole test — who opened
+the pull request, you included, doesn't come into it. Submitting the review
+clears the request, so a pull request you already answered stays out of the
+list until someone requests a review from you again.
 
 ```sh
-gh pr list --repo <owner>/<repo> --json number,title,author,headRefName,baseRefName,reviewRequests # candidates: another author, and you under reviewRequests
+gh pr list --repo <owner>/<repo> --json number,title,author,headRefName,baseRefName,reviewRequests # candidates: you under reviewRequests
 gh pr view <number> --comments --repo <owner>/<repo>   # the description and the conversation so far
 gh pr diff <number> --repo <owner>/<repo>              # the whole diff against the base
 gh pr checkout <number>                                # to build it or run its tests
@@ -134,9 +134,9 @@ findings in the body as `path:line` citations instead:
 gh pr review <number> --request-changes --body-file <body-file>   # or --approve, or --comment
 ```
 
-Never push to, rebase, close, or merge a pull request that isn't yours; a
-review is comments and a verdict only. Once it is submitted, mark the review
-request's notification read as described below.
+Never push to, rebase, close, or merge the pull request you are reviewing,
+your own included; a review is comments and a verdict only. Once it is
+submitted, mark the review request's notification read as described below.
 
 ## Clearing notifications you have read
 

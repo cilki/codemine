@@ -163,11 +163,13 @@ pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-/// The open PRs by other authors on which the bot is a pending requested
-/// reviewer, as sorted `number@head-sha` keys. The set doubles as `review`'s
-/// precondition — non-empty means work — and as the state a skipped turn is
-/// remembered against: submitting the review clears the request, and a
-/// re-request or a push to the branch moves the key.
+/// The open PRs on which the bot is a pending requested reviewer, as sorted
+/// `number@head-sha` keys. Who authored the PR doesn't come into it: a
+/// request on one of the bot's own PRs is as much work as any other. The
+/// set doubles as `review`'s precondition — non-empty means work — and as
+/// the state a skipped turn is remembered against: submitting the review
+/// clears the request, and a re-request or a push to the branch moves the
+/// key.
 pub fn review_requests(forge: &Forge, repo: &str) -> Result<Vec<String>> {
     if forge.login.is_empty() {
         // An unresolved login would silently match no reviewer at all;
@@ -272,8 +274,8 @@ fn unreviewed_by(reviewers: &serde_json::Value, login: &str) -> bool {
     })
 }
 
-/// The listed PRs that are someone else's and name `login` as a requested
-/// reviewer. Like `owned_prs`, a listing that isn't an array is an error so
+/// The listed PRs that name `login` as a requested reviewer, the bot's own
+/// included. Like `owned_prs`, a listing that isn't an array is an error so
 /// `review`'s probe fails closed on it.
 fn requested_prs<'a>(
     prs: &'a serde_json::Value,
@@ -283,7 +285,7 @@ fn requested_prs<'a>(
         .as_array()
         .context("expected an array of pulls")?
         .iter()
-        .filter(|pr| !authored_by(pr, login) && requested_from(pr, login))
+        .filter(|pr| requested_from(pr, login))
         .collect())
 }
 
@@ -411,15 +413,16 @@ mod tests {
         assert!(!unreviewed_by(&json!({"message": "oops"}), "bot"));
     }
 
-    /// Only another author's PR that names the bot as a requested reviewer
-    /// is a review candidate: the bot's own PRs are never reviewed by it,
-    /// and a PR nobody asked it about is left alone.
+    /// A PR that names the bot as a requested reviewer is a review candidate
+    /// whoever authored it — the bot's own included, when someone asks it
+    /// to — and a PR nobody asked it about is left alone.
     #[test]
-    fn requested_prs_keeps_other_authors_requests_only() {
+    fn requested_prs_keeps_every_pr_the_bot_is_asked_about() {
         let prs = json!([
             {"number": 1, "user": {"login": "someone"}, "requested_reviewers": [{"login": "bot"}], "head": {"sha": "aaa"}},
             {"number": 2, "user": {"login": "bot"}, "requested_reviewers": [{"login": "bot"}], "head": {"sha": "bbb"}},
             {"number": 3, "user": {"login": "someone"}, "requested_reviewers": [], "head": {"sha": "ccc"}},
+            {"number": 5, "user": {"login": "bot"}, "requested_reviewers": [{"login": "someone"}], "head": {"sha": "eee"}},
             {"iid": 4, "author": {"username": "someone"}, "reviewers": [{"username": "bot"}], "sha": "ddd"},
         ]);
         let keys: Vec<String> = requested_prs(&prs, "bot")
@@ -427,7 +430,7 @@ mod tests {
             .into_iter()
             .filter_map(pr_key)
             .collect();
-        assert_eq!(keys, ["1@aaa", "4@ddd"]);
+        assert_eq!(keys, ["1@aaa", "2@bbb", "4@ddd"]);
         assert!(requested_prs(&json!([]), "bot").unwrap().is_empty());
         assert!(requested_prs(&json!({"message": "oops"}), "bot").is_err());
     }

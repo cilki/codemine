@@ -28,8 +28,8 @@ use crate::settings::SharedSettings;
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The tasks fresh activity can lead to, in the order a queued repository is
-/// offered to them: a review request on someone else's PR is `review`'s, a
-/// comment on the bot's own PR or an assignment is `feedback`'s. Both arrive
+/// offered to them: a review request is `review`'s, a comment on the bot's
+/// own PR or an assignment is `feedback`'s. Both arrive
 /// on the same feed, so the watcher can't tell which until the tasks' own
 /// prechecks do — and `review` asks first because its precheck is exact
 /// (the request set), where `feedback`'s is satisfied by any unread thread

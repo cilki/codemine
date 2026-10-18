@@ -19,9 +19,9 @@ Each "turn" does one of the following on a repo:
 - `rebase`: rebases its own open PR branches that have merge conflicts with
   their base branch, resolving the conflicts and force-pushing — or closes the
   PR and deletes the branch when the change has gone obsolete.
-- `review`: reviews other people's PRs when asked — request a review from the
-  bot's account and it reads the change, comments inline on what it finds, and
-  approves or requests changes.
+- `review`: reviews a PR when asked — request a review from the bot's account
+  on any PR, one of its own included, and it reads the change, comments inline
+  on what it finds, and approves or requests changes.
 - `bump`: update dependencies, handling any migration issues.
 - `simplify`: remove dead code, simplify implementations, drop trivial tests.
 - `todo`: handle a TODO comment in the code, or an item from the repo's
