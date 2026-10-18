@@ -105,15 +105,19 @@ fn first_sha(commits: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The bot's open PRs that conflict with their base branch, as sorted
-/// `number@head-sha` keys. A branch that is merely behind but merges cleanly
-/// doesn't count: there is nothing a rebase turn would have to resolve. The
-/// set doubles as `rebase`'s precondition — non-empty means work — and as
-/// the state a skipped turn is remembered against.
-pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
+/// One page of the repository's open PRs, as every forge spells that listing.
+/// Both PR probes read this same page — `rebase` looks through it for the
+/// bot's own conflicting PRs, `review` for the ones it has been asked
+/// about — so a draw fetches it once per repository and answers both
+/// questions off it rather than making the identical request twice.
+///
+/// An unresolved login is an error rather than an empty page: it would
+/// silently match no author and no reviewer at all, where bailing routes
+/// through the probes' fail-closed arm. So is a listing that isn't an array,
+/// since a forge that answered with something else never said the bot has
+/// nothing waiting.
+pub fn open_prs(forge: &Forge, repo: &str) -> Result<Vec<serde_json::Value>> {
     if forge.login.is_empty() {
-        // An unresolved login would silently match no author at all; bailing
-        // routes through the probe's fail-closed arm instead.
         bail!("the {} login is unresolved", forge.kind.name());
     }
     let listing = forge_json(
@@ -126,14 +130,40 @@ pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
         &format!("repos/{repo}/pulls?state=open&per_page={PR_LIMIT}"),
         // The listing's `has_conflicts` is GitLab's cached merge status; the
         // recheck parameter schedules an async refresh so a stale answer
-        // heals by the next probe.
+        // heals by the next probe. GitLab could also narrow the listing to
+        // MRs the bot is a reviewer on, but that would be a second page for
+        // the same repository: `requested_from` reads the `reviewers` this
+        // one already carries.
         &format!(
             "projects/{}/merge_requests?state=opened&per_page={PR_LIMIT}&with_merge_status_recheck=true",
             project(repo)
         ),
     )?;
+    pulls(listing)
+}
+
+/// The entries of a PR listing. Not an array at all is an error, so both
+/// probes fail closed on it instead of reading it as an empty page.
+fn pulls(listing: serde_json::Value) -> Result<Vec<serde_json::Value>> {
+    match listing {
+        serde_json::Value::Array(prs) => Ok(prs),
+        _ => bail!("expected an array of pulls"),
+    }
+}
+
+/// The bot's open PRs that conflict with their base branch, as sorted
+/// `number@head-sha` keys, read off the page [`open_prs`] fetched. A branch
+/// that is merely behind but merges cleanly doesn't count: there is nothing a
+/// rebase turn would have to resolve. The set doubles as `rebase`'s
+/// precondition — non-empty means work — and as the state a skipped turn is
+/// remembered against.
+pub fn conflicting_prs(
+    forge: &Forge,
+    repo: &str,
+    open: &[serde_json::Value],
+) -> Result<Vec<String>> {
     let mut keys = Vec::new();
-    for pr in owned_prs(&listing, &forge.login)? {
+    for pr in open.iter().filter(|pr| authored_by(pr, &forge.login)) {
         // GitHub's listing is the one that carries no mergeability, so each
         // of the bot's PRs costs a GET of its own. That GET both reads
         // mergeability and triggers GitHub's lazy computation of it, so a
@@ -164,32 +194,19 @@ pub fn conflicting_prs(forge: &Forge, repo: &str) -> Result<Vec<String>> {
 }
 
 /// The open PRs on which the bot is a pending requested reviewer, as sorted
-/// `number@head-sha` keys. Who authored the PR doesn't come into it: a
-/// request on one of the bot's own PRs is as much work as any other. The
-/// set doubles as `review`'s precondition — non-empty means work — and as
-/// the state a skipped turn is remembered against: submitting the review
-/// clears the request, and a re-request or a push to the branch moves the
-/// key.
-pub fn review_requests(forge: &Forge, repo: &str) -> Result<Vec<String>> {
-    if forge.login.is_empty() {
-        // An unresolved login would silently match no reviewer at all;
-        // bailing routes through the probe's fail-closed arm instead.
-        bail!("the {} login is unresolved", forge.kind.name());
-    }
-    let listing = forge_json(
-        forge,
-        &format!("repos/{repo}/pulls?state=open&limit={PR_LIMIT}"),
-        &format!("repos/{repo}/pulls?state=open&per_page={PR_LIMIT}"),
-        // GitLab can filter the listing to MRs the bot is a reviewer on, so
-        // the page only ever holds candidates.
-        &format!(
-            "projects/{}/merge_requests?state=opened&per_page={PR_LIMIT}&reviewer_username={}",
-            project(repo),
-            forge.login
-        ),
-    )?;
+/// `number@head-sha` keys, read off the same page [`open_prs`] fetched. Who
+/// authored the PR doesn't come into it: a request on one of the bot's own
+/// PRs is as much work as any other. The set doubles as `review`'s
+/// precondition — non-empty means work — and as the state a skipped turn is
+/// remembered against: submitting the review clears the request, and a
+/// re-request or a push to the branch moves the key.
+pub fn review_requests(
+    forge: &Forge,
+    repo: &str,
+    open: &[serde_json::Value],
+) -> Result<Vec<String>> {
     let mut keys = Vec::new();
-    for pr in requested_prs(&listing, &forge.login)? {
+    for pr in open.iter().filter(|pr| requested_from(pr, &forge.login)) {
         // Gitea and GitHub drop the bot from `requested_reviewers` once it
         // submits, so the listing alone says whether a review is owed.
         // GitLab keeps the reviewer and tracks a state per reviewer instead,
@@ -274,21 +291,6 @@ fn unreviewed_by(reviewers: &serde_json::Value, login: &str) -> bool {
     })
 }
 
-/// The listed PRs that name `login` as a requested reviewer, the bot's own
-/// included. Like `owned_prs`, a listing that isn't an array is an error so
-/// `review`'s probe fails closed on it.
-fn requested_prs<'a>(
-    prs: &'a serde_json::Value,
-    login: &str,
-) -> Result<Vec<&'a serde_json::Value>> {
-    Ok(prs
-        .as_array()
-        .context("expected an array of pulls")?
-        .iter()
-        .filter(|pr| requested_from(pr, login))
-        .collect())
-}
-
 /// Whether the forge reports the PR as unable to merge into its base, under
 /// either spelling: `mergeable == false` on Gitea and GitHub,
 /// `has_conflicts == true` on GitLab. A missing or null field (GitHub still
@@ -305,22 +307,6 @@ fn pr_key(pr: &serde_json::Value) -> Option<String> {
     let number = pr["number"].as_u64().or_else(|| pr["iid"].as_u64())?;
     let sha = pr["head"]["sha"].as_str().or_else(|| pr["sha"].as_str())?;
     Some(format!("{number}@{sha}"))
-}
-
-/// The listed PRs authored by `login`, which is as far as every forge's
-/// listing takes the probe in common: whether one of them conflicts is
-/// either on the entry already or one GET away, depending on the forge.
-///
-/// A listing that isn't an array at all is an error rather than an empty
-/// set, so `rebase`'s probe fails closed on it — a forge that answered with
-/// something else never said the bot has no conflicting PRs.
-fn owned_prs<'a>(prs: &'a serde_json::Value, login: &str) -> Result<Vec<&'a serde_json::Value>> {
-    Ok(prs
-        .as_array()
-        .context("expected an array of pulls")?
-        .iter()
-        .filter(|pr| authored_by(pr, login))
-        .collect())
 }
 
 #[cfg(test)]
@@ -352,29 +338,23 @@ mod tests {
         assert!(!conflicting(&json!({})));
     }
 
-    /// The one filter every forge's listing goes through. A listing that is
-    /// not an array is an error, not an empty set: `rebase`'s probe fails
-    /// closed, and GitHub's half of it used to read such a listing as "no
-    /// conflicting PRs" where the other two reported it.
+    /// A listing that is not an array is an error, not an empty page: both
+    /// probes fail closed, where reading it as "nothing waiting" would both
+    /// hand the draw a wrong answer and let a skip be remembered against it.
     #[test]
-    fn owned_prs_keeps_only_the_bots_prs() {
-        let prs = json!([
-            {"number": 1, "user": {"login": "bot"}},
-            {"number": 2, "user": {"login": "someone"}},
-            // Malformed, and the bot's: kept here and dropped where the
-            // number is needed, rather than failing the whole probe.
-            {"user": {"login": "bot"}},
-            {"number": 4, "author": {"username": "bot"}},
-        ]);
-        let owned = owned_prs(&prs, "bot").unwrap();
-        assert_eq!(owned.len(), 3);
-        let numbers: Vec<u64> = owned
-            .iter()
-            .filter_map(|pr| pr["number"].as_u64())
-            .collect();
-        assert_eq!(numbers, [1, 4]);
-        assert!(owned_prs(&json!([]), "bot").unwrap().is_empty());
-        assert!(owned_prs(&json!({"message": "oops"}), "bot").is_err());
+    fn a_listing_that_is_not_an_array_is_an_error() {
+        assert!(pulls(json!([])).unwrap().is_empty());
+        assert_eq!(pulls(json!([{"number": 1}])).unwrap().len(), 1);
+        assert!(pulls(json!({"message": "oops"})).is_err());
+        assert!(pulls(json!(null)).is_err());
+    }
+
+    /// An unresolved login matches no author and no reviewer, so asking at
+    /// all would answer "nothing waiting" for every repository. Both probes
+    /// read the one listing, so this is the one place it is checked.
+    #[test]
+    fn an_unresolved_login_fails_the_listing() {
+        assert!(open_prs(&gitea(""), "me/repo").is_err());
     }
 
     #[test]
@@ -418,21 +398,26 @@ mod tests {
     /// to — and a PR nobody asked it about is left alone.
     #[test]
     fn requested_prs_keeps_every_pr_the_bot_is_asked_about() {
-        let prs = json!([
+        let prs = pulls(json!([
             {"number": 1, "user": {"login": "someone"}, "requested_reviewers": [{"login": "bot"}], "head": {"sha": "aaa"}},
             {"number": 2, "user": {"login": "bot"}, "requested_reviewers": [{"login": "bot"}], "head": {"sha": "bbb"}},
             {"number": 3, "user": {"login": "someone"}, "requested_reviewers": [], "head": {"sha": "ccc"}},
             {"number": 5, "user": {"login": "bot"}, "requested_reviewers": [{"login": "someone"}], "head": {"sha": "eee"}},
+            // Keyless, and the bot's to review: dropped rather than keyed
+            // or made to fail the whole probe.
+            {"requested_reviewers": [{"login": "bot"}], "head": {"sha": "fff"}},
             {"iid": 4, "author": {"username": "someone"}, "reviewers": [{"username": "bot"}], "sha": "ddd"},
-        ]);
-        let keys: Vec<String> = requested_prs(&prs, "bot")
-            .unwrap()
-            .into_iter()
-            .filter_map(pr_key)
-            .collect();
-        assert_eq!(keys, ["1@aaa", "2@bbb", "4@ddd"]);
-        assert!(requested_prs(&json!([]), "bot").unwrap().is_empty());
-        assert!(requested_prs(&json!({"message": "oops"}), "bot").is_err());
+        ]))
+        .unwrap();
+        assert_eq!(
+            review_requests(&gitea("bot"), "me/repo", &prs).unwrap(),
+            ["1@aaa", "2@bbb", "4@ddd"]
+        );
+        assert!(
+            review_requests(&gitea("bot"), "me/repo", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A PR's key names its number and current head revision, under either
@@ -454,24 +439,24 @@ mod tests {
 
     /// What `conflicting_prs` makes of a listing that carries mergeability
     /// itself (Gitea and GitLab): only a PR that is both the bot's and
-    /// conflicting gets a key, and a keyless entry is dropped rather than
-    /// failing the whole probe.
+    /// conflicting gets a key, a keyless entry is dropped rather than
+    /// failing the whole probe, and the keys come back sorted — the skip
+    /// cache compares them as one joined string, and listing order isn't
+    /// stable across fetches.
     #[test]
     fn only_the_bots_conflicting_prs_are_keyed() {
-        let prs = json!([
+        let prs = pulls(json!([
             {"number": 15, "user": {"login": "bot"}, "mergeable": false, "head": {"sha": "eee"}},
             {"number": 1, "user": {"login": "bot"}, "mergeable": true, "head": {"sha": "aaa"}},
             {"number": 2, "user": {"login": "someone"}, "mergeable": false, "head": {"sha": "bbb"}},
             {"user": {"login": "bot"}, "mergeable": false, "head": {"sha": "ddd"}},
             {"number": 12, "user": {"login": "bot"}, "mergeable": false, "head": {"sha": "ccc"}},
-        ]);
-        let keys: Vec<String> = owned_prs(&prs, "bot")
-            .unwrap()
-            .into_iter()
-            .filter(|pr| conflicting(pr))
-            .filter_map(pr_key)
-            .collect();
-        assert_eq!(keys, ["15@eee", "12@ccc"]);
+        ]))
+        .unwrap();
+        assert_eq!(
+            conflicting_prs(&gitea("bot"), "me/repo", &prs).unwrap(),
+            ["12@ccc", "15@eee"]
+        );
     }
 
     fn forge() -> Forge {
@@ -483,6 +468,18 @@ mod tests {
             email: String::new(),
             url: "https://github.com".into(),
             enabled_repos: BTreeSet::new(),
+        }
+    }
+
+    /// A Gitea forge with `login` as its resolved account. Gitea is the kind
+    /// whose listing answers both probes on its own, so the keys they build
+    /// can be checked without a forge to ask.
+    fn gitea(login: &str) -> Forge {
+        Forge {
+            kind: ForgeKind::Gitea,
+            login: login.into(),
+            url: "https://gitea.example.com".into(),
+            ..forge()
         }
     }
 

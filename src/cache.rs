@@ -190,15 +190,21 @@ fn digest(task: &str) -> String {
 /// `precheck::review_requests` spell them.
 type PrKeys = Vec<String>;
 
+/// One page of a repository's open PRs, as `precheck::open_prs` fetched it.
+type OpenPrs = Vec<serde_json::Value>;
+
 /// The draw's precondition check with the skip memory folded in, plus the
 /// forge state read along the way: default-branch commits per repository,
-/// notification feeds per forge, conflicting PRs and pending review
-/// requests per repository. Each is fetched at most once and answers for
-/// every candidate the rest of the draw asks about.
+/// notification feeds per forge, and the open-PR listing per repository with
+/// the conflicting PRs and pending review requests read off it. Each is
+/// fetched at most once and answers for every candidate the rest of the draw
+/// asks about.
 pub struct Probe<'a> {
     cache: &'a Cache,
     heads: RefCell<BTreeMap<(ForgeKind, String), Option<String>>>,
     feeds: RefCell<BTreeMap<ForgeKind, Option<BTreeMap<String, String>>>>,
+    /// The page both PR answers below are read from.
+    listings: RefCell<BTreeMap<(ForgeKind, String), Option<OpenPrs>>>,
     conflicts: RefCell<BTreeMap<(ForgeKind, String), Option<PrKeys>>>,
     reviews: RefCell<BTreeMap<(ForgeKind, String), Option<PrKeys>>>,
 }
@@ -209,6 +215,7 @@ impl<'a> Probe<'a> {
             cache,
             heads: RefCell::new(BTreeMap::new()),
             feeds: RefCell::new(BTreeMap::new()),
+            listings: RefCell::new(BTreeMap::new()),
             conflicts: RefCell::new(BTreeMap::new()),
             reviews: RefCell::new(BTreeMap::new()),
         }
@@ -313,24 +320,40 @@ impl<'a> Probe<'a> {
         self.feed(forge)?.get(repo).cloned()
     }
 
-    /// The bot's open conflicting PRs on the repository, read from the forge
-    /// once per repository and remembered for the rest of the draw. `None`
-    /// when the listing couldn't be read.
+    /// The bot's open conflicting PRs on the repository, answered once per
+    /// repository and remembered for the rest of the draw. `None` when the
+    /// listing couldn't be read.
     fn conflicting(&self, forge: &Forge, repo: &str) -> Option<PrKeys> {
         once(&self.conflicts, (forge.kind, repo.to_owned()), || {
-            crate::precheck::conflicting_prs(forge, repo)
+            let open = self.open_prs(forge, repo)?;
+            crate::precheck::conflicting_prs(forge, repo, &open)
                 .with_context(|| format!("failed to read {repo}'s conflicting PRs"))
         })
     }
 
-    /// The open PRs the bot is asked to review on the repository, read from
-    /// the forge once per repository and remembered for the rest of the
-    /// draw. `None` when the listing couldn't be read.
+    /// The open PRs the bot is asked to review on the repository, answered
+    /// once per repository and remembered for the rest of the draw. `None`
+    /// when the listing couldn't be read.
     fn requested(&self, forge: &Forge, repo: &str) -> Option<PrKeys> {
         once(&self.reviews, (forge.kind, repo.to_owned()), || {
-            crate::precheck::review_requests(forge, repo)
+            let open = self.open_prs(forge, repo)?;
+            crate::precheck::review_requests(forge, repo, &open)
                 .with_context(|| format!("failed to read {repo}'s review requests"))
         })
+    }
+
+    /// The repository's open PRs as its forge lists them, read once per
+    /// repository and shared by both answers above: `rebase` wants the bot's
+    /// own conflicting ones out of that page and `review` the ones it has
+    /// been asked about, and the gated pass probes both. Each used to fetch
+    /// the page for itself, which on Gitea and GitHub is the identical
+    /// request made twice per repository per draw.
+    fn open_prs(&self, forge: &Forge, repo: &str) -> Result<OpenPrs> {
+        once(&self.listings, (forge.kind, repo.to_owned()), || {
+            crate::precheck::open_prs(forge, repo)
+                .with_context(|| format!("failed to list {repo}'s open PRs"))
+        })
+        .context("the open PR listing is unreadable")
     }
 
     /// The forge's unread notifications as repository → newest stamp. The
