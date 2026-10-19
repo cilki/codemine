@@ -302,7 +302,21 @@ pub struct Status {
     /// The last `HISTORY` turns to finish, newest first; the process owns no
     /// history across restarts, so this is the whole list the UI shows.
     /// `totals` counts every turn, including the ones that have aged out.
+    ///
+    /// Skipped by the derived serialization, because the list is two orders
+    /// of magnitude bigger than everything else here put together and moves
+    /// only when a turn finishes, where the rest of the status moves every
+    /// few seconds while one runs. Both of its readers serialize it
+    /// separately — the event stream as an event of its own, `/api/status`
+    /// spliced back in — so neither pays for it on a status that didn't
+    /// touch it. See `webui::turns_json`.
+    #[serde(skip)]
     pub turns: VecDeque<TurnRecord>,
+    /// Bumped on every change to `turns`, so the event stream can tell a
+    /// moved history from an unmoved one without serializing 44 KB of it to
+    /// compare — which is the whole cost the separate event exists to avoid.
+    #[serde(skip)]
+    pub turns_revision: u64,
     /// Tail of the last finished turn's log.
     pub log_tail: String,
     /// When set, turns are held after one died on proxy auth: the epoch at
@@ -322,6 +336,7 @@ impl Shared {
                 allowance: Bucket::new(),
                 totals: Totals::default(),
                 turns: VecDeque::new(),
+                turns_revision: 0,
                 log_tail: String::new(),
                 oauth_gated_until: None,
             })),
@@ -355,6 +370,7 @@ impl Status {
             self.totals.tokens.add(tokens);
         }
         self.turns.push_front(record);
+        self.turns_revision += 1;
         // A record is the only way to reach a turn's log — the web UI asks
         // for one by the start epoch this list is keyed on — so the file
         // behind an aged-out record is unreachable bytes from here on, and
@@ -412,6 +428,9 @@ mod tests {
 
         let status = shared.lock();
         assert_eq!(status.turns.len(), 61);
+        // The revision is how the event stream notices the list moved — it
+        // compares nothing else — so every record has to move it.
+        assert_eq!(status.turns_revision, 61);
         assert_eq!(status.turns[0].outcome, Outcome::Skipped);
         assert_eq!(status.totals.turns, 61);
         assert_eq!(status.totals.completed, 60);

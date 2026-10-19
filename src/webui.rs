@@ -127,10 +127,14 @@ async fn favicon() -> impl IntoResponse {
     )
 }
 
+/// The whole status, turn list included: nothing polls this, so the one-off
+/// cost of the history is worth paying to keep the endpoint a complete view
+/// of the state. The event stream is where the two are kept apart.
 async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
+    let status = stamped(&status_json(&state.status));
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        stamped(&status_json(&state.status)),
+        with_member(&status, "turns", &turns_json(&state.status)),
     )
 }
 
@@ -165,9 +169,10 @@ async fn api_turn_log(State(state): State<AppState>, Path(started): Path<u64>) -
 }
 
 /// Push state to the page so it never has to poll: a `status` event on every
-/// change to the shared state, a `log` or `log-append` event whenever the
-/// tail moves, and `proxy`, `forges` and `host` events as those readings
-/// drift. All carry JSON,
+/// change to the shared state, a `turns` event whenever a turn joins or
+/// leaves the history, a `log` or `log-append` event whenever the tail
+/// moves, and `proxy`, `forges` and `host` events as those readings drift.
+/// All carry JSON,
 /// which keeps a log line's own newlines and carriage returns out of the SSE
 /// framing.
 async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
@@ -177,6 +182,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
         let (mut sent_status, mut sent_proxy, mut sent_forges) = (None, None, None);
+        let mut sent_turns: Option<u64> = None;
         let mut log_cursor = None;
         #[cfg(feature = "hostinfo")]
         let mut sent_host = None;
@@ -208,6 +214,20 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             })
             .await
             .unwrap_or_else(|_| "null".into());
+            // The history rides an event of its own so a status that only
+            // moved its token sample doesn't drag 44 KB of finished turns
+            // along with it, and goes out ahead of the status so the page's
+            // first status event already has rows to render beside it. Its
+            // revision is what decides whether to send, rather than the JSON
+            // the others compare: building those 44 KB every tick just to
+            // find them unchanged is the cost this is here to avoid.
+            let revision = state.status.lock().turns_revision;
+            if sent_turns != Some(revision) {
+                if send(&tx, "turns", &turns_json(&state.status)).await.is_err() {
+                    return;
+                }
+                sent_turns = Some(revision);
+            }
             #[cfg_attr(not(feature = "hostinfo"), allow(unused_mut))]
             let mut channels = vec![
                 ("status", &snapshot, &status, &mut sent_status),
@@ -254,31 +274,55 @@ async fn send(
 
 /// The status as JSON, which is what both its readers start from: the event
 /// stream compares it to tell a real change from the clock ticking, and
-/// `stamped` turns it into what the page consumes.
+/// `stamped` turns it into what the page consumes. The finished-turn list is
+/// not in it — see [`turns_json`].
 fn status_json(status: &Shared) -> String {
     serde_json::to_string(&*status.lock()).unwrap_or_else(|_| "{}".into())
 }
 
+/// The finished turns as JSON, serialized apart from the status they live in.
+///
+/// The list is almost the whole of a status's bytes — 200 records is 44 KB
+/// against 0.6 KB for every other field together — and it moves only when a
+/// turn finishes, perhaps three times an hour. The rest of the status moves
+/// every few seconds for the whole of a running turn, because the token
+/// sample lands on it, and the stream used to answer each of those samples
+/// with the entire history again: a minute of a running turn pushed 538 KB
+/// to every open page, 31 MB an hour, for the dozen token counts that had
+/// actually changed.
+fn turns_json(status: &Shared) -> String {
+    serde_json::to_string(&status.lock().turns).unwrap_or_else(|_| "[]".into())
+}
+
 /// The status as the page consumes it, stamped with server time so elapsed
 /// and remaining are computed without trusting the browser clock.
-///
-/// The stamp is spliced into the JSON rather than serialized alongside the
-/// status, because the event stream wants the status both ways — with the
-/// stamp to send, without it to compare — and the stamp is just one more
-/// member of the object a status already serializes as. Building the stamped
-/// copy through a `serde_json::Value` instead cost a second full
-/// serialization plus the whole value tree, which on a runner with a few
-/// hundred turns behind it was the most expensive thing on the stream's
-/// tick.
 fn stamped(status: &str) -> String {
-    let now = epoch_now();
-    let Some(fields) = status.strip_prefix('{') else {
-        return status.to_owned();
+    with_member(status, "now", &epoch_now().to_string())
+}
+
+/// One more member spliced onto the front of a serialized object's own, the
+/// way the server stamp and the turn list reach the page's view of a status.
+///
+/// Spliced rather than serialized alongside the status, because both of its
+/// callers want the status more than one way — the event stream with the
+/// stamp to send and without it to compare, `/api/status` with the turn list
+/// the stream carries separately — and each is just one more member of the
+/// object a status already serializes as. Building those copies through a
+/// `serde_json::Value` instead cost a second full serialization plus the
+/// whole value tree, which on a runner with a few hundred turns behind it
+/// was the most expensive thing on the stream's tick.
+///
+/// Anything that isn't an object is passed through untouched: there is
+/// nothing to splice into, and a half-object would be worse than a status
+/// without a clock on it.
+fn with_member(object: &str, name: &str, value: &str) -> String {
+    let Some(fields) = object.strip_prefix('{') else {
+        return object.to_owned();
     };
     // A status always has fields, but an empty object would otherwise come
     // back with a trailing comma in it.
     let separator = if fields.starts_with('}') { "" } else { "," };
-    format!("{{\"now\":{now}{separator}{fields}")
+    format!("{{\"{name}\":{value}{separator}{fields}")
 }
 
 /// The running turn's log tail, else the last finished turn's.
@@ -875,6 +919,128 @@ mod tests {
         // JSON payloads, so a log line's own newlines can't break the framing.
         assert!(seen.contains(r#""state":"starting""#), "{seen}");
         assert!(seen.contains("data: \"\""), "{seen}");
+    }
+
+    /// A record filled out the way a real one is, so what the history costs
+    /// on the wire is what it costs in the test too.
+    fn record(started: u64) -> crate::status::TurnRecord {
+        crate::status::TurnRecord {
+            task: "benchmark".into(),
+            repo: "cilki/codemine".into(),
+            forge: "gitea".into(),
+            started,
+            duration_secs: 987,
+            outcome: crate::status::Outcome::Completed,
+            tokens: Some(crate::status::TokenUsage {
+                input: 123_456,
+                output: 7_890,
+                reasoning: 0,
+                cache_read: 9_876_543,
+                cache_write: 123_456,
+            }),
+            log_path: std::path::PathBuf::from("/nonexistent"),
+        }
+    }
+
+    /// The finished-turn history goes out on its own event, so a status that
+    /// only moved its token sample doesn't drag the whole list along with
+    /// it. A full history is 44 KB against 0.6 KB for the rest of the
+    /// status, and the sample moves every five seconds for the whole of a
+    /// turn — carried on the status, that was half a megabyte a minute to
+    /// every open page for a dozen token counts.
+    #[test]
+    fn the_history_is_sent_once_and_not_on_every_token_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
+        let status = Shared::new();
+        let sample = |n: u64| {
+            Some(crate::status::TokenUsage {
+                input: n,
+                ..Default::default()
+            })
+        };
+        Status::update(&status, |s| {
+            s.activity = Activity::Running {
+                task: "benchmark".into(),
+                repo: "cilki/codemine".into(),
+                forge: "gitea".into(),
+                workspace: "/w".into(),
+                log_path: dir.path().join("turn.log"),
+                pgid: 0,
+                started: 1_760_000_000,
+                tokens: sample(1),
+            };
+            // A full history, which is what the stream used to re-send.
+            for n in 0..200 {
+                s.record_turn(record(1_760_000_000 - n * 1200));
+            }
+        });
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            status.clone(),
+            store,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
+
+        // The history leads, so the page's first status event already has
+        // rows to render beside it. The log event closes the tick.
+        let first = read_until(&mut stream, "event: log");
+        let turns = first.find("event: turns").expect("no history event");
+        assert!(turns < first.find("event: status").unwrap(), "{first}");
+        assert!(first.contains(r#""duration_secs":987"#), "{first}");
+        let history = first.len();
+
+        // A minute's worth of token samples, each waited out so the stream
+        // answers them one at a time the way five seconds apart would.
+        let mut samples = String::new();
+        for n in 2..=12 {
+            Status::update(&status, |s| {
+                if let Activity::Running { tokens: live, .. } = &mut s.activity {
+                    *live = sample(n);
+                }
+            });
+            samples.push_str(&read_until(&mut stream, "event: status"));
+        }
+        // Each sample is answered, and none of them restates the history.
+        assert_eq!(samples.matches("event: status").count(), 11, "{samples}");
+        assert!(!samples.contains("event: turns"), "{samples}");
+        assert!(!samples.contains(r#""duration_secs":987"#), "{samples}");
+        // Eleven samples used to cost the history eleven times over; what is
+        // left is the statuses themselves, under a single copy of it.
+        assert!(samples.len() < history, "{} bytes", samples.len());
+
+        // A turn finishing is what moves the list, and that does go out.
+        Status::update(&status, |s| {
+            s.activity = Activity::Sleeping { until: 0 };
+            s.record_turn(record(1_760_009_999));
+        });
+        let finished = read_until(&mut stream, "event: turns");
+        assert!(finished.contains(r#""started":1760009999"#), "{finished}");
+    }
+
+    /// `/api/status` is nobody's poll, so it stays a complete view: the turn
+    /// list the stream carries separately is spliced back into it.
+    #[test]
+    fn the_status_endpoint_still_carries_the_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
+        let status = Shared::new();
+        Status::update(&status, |s| s.record_turn(record(1_760_000_000)));
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            status,
+            store,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let value = body_json(&request(addr, "GET", "/api/status", ""));
+        assert!(value["now"].as_u64().unwrap() > 1_700_000_000);
+        assert_eq!(value["turns"][0]["started"], 1_760_000_000);
+        assert_eq!(value["turns"][0]["duration_secs"], 987);
+        assert_eq!(value["activity"]["state"], "starting");
     }
 
     #[test]

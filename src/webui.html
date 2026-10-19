@@ -332,6 +332,13 @@
 <script>
   const $ = id => document.getElementById(id);
   let state = null;
+  // The finished turns, pushed as an event of their own because the list is
+  // almost the whole of a status's bytes and moves only when a turn ends,
+  // where the status itself moves every token sample. Held apart from
+  // `state` for the same reason: a status event must not clear it, and named
+  // for the history rather than `turns`, which is already the id of the
+  // container the rows go in.
+  let turnHistory = [];
   // The turn (by its start epoch) a cancel was sent for, so the button stays
   // dead until that turn is gone and can't fire twice or hit its successor.
   let canceling = null;
@@ -507,7 +514,7 @@
       + (running ? tokenTotal(running) : 0);
     $("stat-tokens").textContent = spent ? fmtTokens(spent) : "–";
 
-    const rows = state.turns.map(turn => {
+    const rows = turnHistory.map(turn => {
       const row = turnRow(turn.task, turn.repo, turn.forge, turn.outcome,
         new Date(turn.started * 1000).toLocaleString(),
         fmtDuration(turn.duration_secs) +
@@ -772,6 +779,12 @@
       state = JSON.parse(event.data);
       state.received = Date.now();
       render();
+    });
+    // Sent ahead of the first status and then only when a turn finishes, so
+    // the rows are repainted here rather than on every status event.
+    events.addEventListener("turns", event => {
+      turnHistory = JSON.parse(event.data);
+      if (state) render();
     });
     events.addEventListener("log", event => setLog(JSON.parse(event.data)));
     events.addEventListener("log-append", event =>
