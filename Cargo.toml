@@ -26,7 +26,14 @@ reqwest = { version = "0.13.5", default-features = false, features = [
   "rustls-no-provider",
 ] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-rustls = { version = "0.23", default-features = false, features = [
+# The patch floor is the fix for RUSTSEC-2026-0349, which is a client-side
+# issue and so one the runner is exposed to: an attacker who answers one
+# connection attempt and drops it makes the client remember a classical key
+# exchange group for that server name and offer only that one afterwards,
+# costing the post-quantum confidentiality of every later connection to the
+# forge or the proxy. `^0.23` already resolves above it from scratch; stating
+# it keeps a `cargo update` from walking the lockfile back under it.
+rustls = { version = "0.23.46", default-features = false, features = [
   "ring",
   "std",
   "tls12",
