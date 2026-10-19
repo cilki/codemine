@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use tracing::warn;
 use wait_timeout::ChildExt;
 
-use crate::config::{Config, Forge, IoClass};
+use crate::config::{Config, Forge, ForgeKind, IoClass};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(600);
 const CODEGRAPH_SYNC_TIMEOUT: Duration = Duration::from_secs(600);
@@ -413,8 +413,8 @@ fn fast_forward_branches(workspace: &Path, dir: &Path, current: &str, log: &File
 /// would otherwise pile up in it. Only the forge directories go: the rest of
 /// the workspace root is settings and state the runner keeps on purpose.
 pub fn clear_clones(workspace: &Path) -> Result<()> {
-    for slug in ["gitea", "github", "gitlab"] {
-        let path = workspace.join(slug);
+    for kind in ForgeKind::ALL {
+        let path = workspace.join(kind.name());
         // Not followed through a symlink: one is removed like a file.
         let removed = match path.symlink_metadata() {
             Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
@@ -973,13 +973,16 @@ mod tests {
     fn clones_are_cleared_and_nothing_else() {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path();
-        for dir in [
-            "gitea/a/r/.git",
-            "gitlab/g/sub/repo/.git",
-            "github/z/y/.git",
-            "logs",
-            "cliproxyapi/auth",
-        ] {
+        // A clone under every forge the runner knows, read off the one list
+        // `clear_clones` itself walks: a forge added there has to be cleared
+        // too, where the three slugs spelled out here only ever covered the
+        // three that existed when they were written.
+        for kind in ForgeKind::ALL {
+            std::fs::create_dir_all(ws.join(kind.name()).join("owner/repo/.git")).unwrap();
+        }
+        // GitLab nests namespaces, so the tree under it can be deeper.
+        std::fs::create_dir_all(ws.join("gitlab/g/sub/repo/.git")).unwrap();
+        for dir in ["logs", "cliproxyapi/auth"] {
             std::fs::create_dir_all(ws.join(dir)).unwrap();
         }
         for file in ["config.json", "skips.json", "tidy.json"] {
@@ -988,9 +991,10 @@ mod tests {
 
         clear_clones(ws).unwrap();
 
-        for gone in ["gitea", "gitlab", "github", "tidy.json"] {
-            assert!(!ws.join(gone).exists(), "{gone} survived");
+        for kind in ForgeKind::ALL {
+            assert!(!ws.join(kind.name()).exists(), "{} survived", kind.name());
         }
+        assert!(!ws.join("tidy.json").exists(), "tidy.json survived");
         for kept in ["logs", "cliproxyapi/auth", "config.json", "skips.json"] {
             assert!(ws.join(kept).exists(), "{kept} was removed");
         }

@@ -188,7 +188,7 @@ fn readings() -> MutexGuard<'static, BTreeMap<Key, Reading>> {
 /// it for the whole of Gitea's request timeout — or forever, for gh and glab,
 /// which have none.
 pub fn health(settings: &Settings) -> BTreeMap<String, ForgeHealth> {
-    [ForgeKind::Gitea, ForgeKind::Github, ForgeKind::Gitlab]
+    ForgeKind::ALL
         .into_iter()
         .map(|kind| {
             let stored = settings.forge(kind);

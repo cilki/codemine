@@ -15,6 +15,18 @@ pub enum ForgeKind {
 }
 
 impl ForgeKind {
+    /// Every forge the runner knows, in the order the UI lists them.
+    ///
+    /// The one place the set is written down. The settings validate each of
+    /// these and build the runtime forges from them, the activity watcher
+    /// polls each feed, the web UI's health cards read each, and
+    /// `workspace::clear_clones` wipes the clones under each. All four used
+    /// to spell the three kinds out for themselves — `clear_clones` as bare
+    /// slug strings that had to be kept in step with `name` by hand, where
+    /// a forge missing from its copy would quietly keep its clones across
+    /// every restart.
+    pub const ALL: [ForgeKind; 3] = [ForgeKind::Gitea, ForgeKind::Github, ForgeKind::Gitlab];
+
     /// The slug passed to the sweep prompt; it doubles as the skill name.
     pub fn name(self) -> &'static str {
         match self {
@@ -24,13 +36,11 @@ impl ForgeKind {
         }
     }
 
+    /// The kind a slug names, if any. Read back off `name` rather than
+    /// matched a second time, so the two directions cannot disagree about
+    /// what a forge is called.
     pub fn from_slug(slug: &str) -> Option<Self> {
-        match slug {
-            "gitea" => Some(ForgeKind::Gitea),
-            "github" => Some(ForgeKind::Github),
-            "gitlab" => Some(ForgeKind::Gitlab),
-            _ => None,
-        }
+        ForgeKind::ALL.into_iter().find(|kind| kind.name() == slug)
     }
 }
 
@@ -352,6 +362,24 @@ mod tests {
         for var in [None, Some("".into()), Some("/home/bot".into())] {
             assert!(home_of(var).is_absolute());
         }
+    }
+
+    /// `ALL` is the one place the set of forges is written down — the
+    /// settings validate each of these, the watcher polls each feed, and
+    /// `workspace::clear_clones` wipes the clones under each — and
+    /// `from_slug` reads back off it, so a kind left out of the list is a
+    /// forge the web UI could never name back to the runner.
+    #[test]
+    fn every_forge_kind_round_trips_through_its_slug() {
+        for kind in ForgeKind::ALL {
+            let slug = kind.name();
+            assert_eq!(ForgeKind::from_slug(slug), Some(kind), "{slug}");
+        }
+        // No duplicates, so a slug names exactly one kind.
+        let slugs: BTreeSet<&str> = ForgeKind::ALL.iter().map(|kind| kind.name()).collect();
+        assert_eq!(slugs.len(), ForgeKind::ALL.len());
+        assert_eq!(ForgeKind::from_slug("bitbucket"), None);
+        assert_eq!(ForgeKind::from_slug(""), None);
     }
 
     #[test]
