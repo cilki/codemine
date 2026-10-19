@@ -115,40 +115,46 @@ pub fn servable(id: &str, served: &BTreeSet<String>) -> bool {
     }
 }
 
-/// How long a health reading stands before the proxy is asked again: the 5s
-/// main loop and the 2s event stream both read it, and each probe is a
-/// blocking request.
-const HEALTH_TTL: Duration = Duration::from_secs(10);
+/// How long a probe's answer stands before the proxy is asked again: the 5s
+/// main loop and the 2s event stream both read both of them, and each probe
+/// is a blocking request.
+const PROBE_TTL: Duration = Duration::from_secs(10);
 
-/// A cached probe: when it was taken, the proxy settings it was taken
+/// A probe's answer: when it was taken, the proxy settings it was taken
 /// against, and what it found.
-type Cached<T> = Option<(Instant, String, T)>;
+type Cached<T> = Mutex<Option<(Instant, String, T)>>;
 
-static HEALTH: Mutex<Cached<AuthHealth>> = Mutex::new(None);
+/// The standing answer in `slot`, asking `probe` for a fresh one when it has
+/// expired or the settings behind it moved — `key` spells out whatever of
+/// the settings the answer depends on, so a just-saved URL or key is probed
+/// at once rather than waiting out the old answer's TTL.
+fn cached<T: Clone>(slot: &Cached<T>, key: String, probe: impl FnOnce() -> T) -> T {
+    let mut cached = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, for_key, answer)) = &*cached
+        && at.elapsed() < PROBE_TTL
+        && *for_key == key
+    {
+        return answer.clone();
+    }
+    let answer = probe();
+    *cached = Some((Instant::now(), key, answer.clone()));
+    answer
+}
+
+static HEALTH: Cached<AuthHealth> = Mutex::new(None);
 
 /// The current health, probed through the management API when a key is
 /// configured and by plain reachability otherwise; cached briefly.
 pub fn health(proxy: &ProxySettings) -> AuthHealth {
     let key = format!("{}|{}", proxy.base_url, proxy.management_key);
-    let mut cached = HEALTH
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((at, for_key, health)) = &*cached
-        && at.elapsed() < HEALTH_TTL
-        && *for_key == key
-    {
-        return health.clone();
-    }
-    let health = probe(proxy);
-    *cached = Some((Instant::now(), key, health.clone()));
-    health
+    cached(&HEALTH, key, || probe(proxy))
 }
 
 /// How long the proxy has to answer a probe. It is normally a loopback
 /// service, and the probe sits on the event stream's tick.
 const PROBE_TIMEOUT_SECS: u64 = 5;
 
-static SERVED: Mutex<Cached<Option<BTreeSet<String>>>> = Mutex::new(None);
+static SERVED: Cached<Option<BTreeSet<String>>> = Mutex::new(None);
 
 /// The model IDs the proxy will answer for, from its own listing; cached on
 /// the same terms as the health reading, since the settings page and the
@@ -158,18 +164,7 @@ static SERVED: Mutex<Cached<Option<BTreeSet<String>>>> = Mutex::new(None);
 /// a working model unservable.
 pub fn served_models(proxy: &ProxySettings) -> Option<BTreeSet<String>> {
     let key = format!("{}|{}", proxy.base_url, proxy.api_key);
-    let mut cached = SERVED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((at, for_key, served)) = &*cached
-        && at.elapsed() < HEALTH_TTL
-        && *for_key == key
-    {
-        return served.clone();
-    }
-    let served = probe_served(proxy);
-    *cached = Some((Instant::now(), key, served.clone()));
-    served
+    cached(&SERVED, key, || probe_served(proxy))
 }
 
 fn probe_served(proxy: &ProxySettings) -> Option<BTreeSet<String>> {
@@ -300,6 +295,31 @@ fn is_claude_entry(entry: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both readings come out of one memo now, so what it promises has to
+    /// hold for both: an answer stands for the TTL instead of making a
+    /// blocking request per caller, and a change to the settings it was
+    /// taken against retires it there and then — which is what gets a
+    /// just-saved URL or key probed on the next tick rather than up to ten
+    /// seconds later.
+    #[test]
+    fn a_probe_stands_until_the_settings_it_was_taken_for_move() {
+        static SLOT: Cached<u32> = Mutex::new(None);
+        let probes = std::cell::Cell::new(0);
+        let probe = |answer: u32| {
+            probes.set(probes.get() + 1);
+            answer
+        };
+
+        assert_eq!(cached(&SLOT, "a".into(), || probe(1)), 1);
+        // The same settings inside the TTL: the stored answer, unasked.
+        assert_eq!(cached(&SLOT, "a".into(), || probe(2)), 1);
+        assert_eq!(probes.get(), 1);
+        // Edited settings: asked again however fresh the old answer is.
+        assert_eq!(cached(&SLOT, "b".into(), || probe(3)), 3);
+        assert_eq!(cached(&SLOT, "b".into(), || probe(4)), 3);
+        assert_eq!(probes.get(), 2);
+    }
 
     #[test]
     fn health_reads_a_live_claude_entry() {

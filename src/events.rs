@@ -105,7 +105,7 @@ fn watch(store: SharedSettings, pending: SharedPending) -> ! {
             continue;
         }
         let mut current: BTreeMap<(ForgeKind, String), String> = BTreeMap::new();
-        for kind in [ForgeKind::Gitea, ForgeKind::Github, ForgeKind::Gitlab] {
+        for kind in ForgeKind::ALL {
             let Some(forge) = settings.runtime_forge(kind) else {
                 continue;
             };

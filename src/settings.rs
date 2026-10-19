@@ -127,8 +127,6 @@ impl ForgeSettings {
     }
 }
 
-const FORGE_KINDS: [ForgeKind; 3] = [ForgeKind::Gitea, ForgeKind::Github, ForgeKind::Gitlab];
-
 /// A URL as the settings keep it: no surrounding space, no trailing slash, so
 /// every caller can append a path unconditionally — which they all do, from
 /// `crate::http::get` to the clone URL `workspace::reclone` builds.
@@ -231,7 +229,7 @@ impl Settings {
     /// Empty means the settings are runnable.
     pub fn problems(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
-        for kind in FORGE_KINDS {
+        for kind in ForgeKind::ALL {
             let forge = self.forge(kind);
             if !forge.enabled {
                 continue;
@@ -247,7 +245,7 @@ impl Settings {
                 problems.push(Problem::new("f-gitea-url", "gitea needs a URL"));
             }
         }
-        let active: Vec<&ForgeSettings> = FORGE_KINDS
+        let active: Vec<&ForgeSettings> = ForgeKind::ALL
             .iter()
             .filter(|&&kind| self.forge(kind).active(kind))
             .map(|&kind| self.forge(kind))
@@ -299,7 +297,7 @@ impl Settings {
             return None;
         }
         Some(Config {
-            forges: FORGE_KINDS
+            forges: ForgeKind::ALL
                 .iter()
                 .filter_map(|&kind| self.runtime_forge(kind))
                 .collect(),
@@ -321,7 +319,7 @@ impl Settings {
     /// `*_set` flag so secrets are write-only.
     pub fn redacted(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(self).expect("settings serialize to JSON");
-        for kind in FORGE_KINDS {
+        for kind in ForgeKind::ALL {
             redact(&mut value[kind.name()], "token");
         }
         for key in ["api_key", "management_key"] {
@@ -335,7 +333,7 @@ impl Settings {
     /// nonempty one overwrites it.
     pub fn apply_update(&mut self, mut incoming: Settings) -> Result<()> {
         incoming.model = incoming.model.trim().to_owned();
-        for kind in FORGE_KINDS {
+        for kind in ForgeKind::ALL {
             let stored = &self.forge(kind).token;
             let forge = incoming.forge_mut(kind);
             forge.url = normalize_url(&forge.url);
@@ -373,7 +371,7 @@ impl Settings {
             bail!("task pool must not be empty");
         }
         self.schedule.validate()?;
-        for kind in FORGE_KINDS {
+        for kind in ForgeKind::ALL {
             // Empty is how a forge asks for its default instance; Gitea has
             // none, which `problems` reports instead.
             let url = &self.forge(kind).url;
