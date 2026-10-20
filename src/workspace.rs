@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -122,6 +123,56 @@ pub fn private_dir(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to restrict {}", path.display()))
+}
+
+/// Where the runner's hold on a workspace is taken. Kept in the root beside
+/// the settings, and never removed: an advisory lock lives on the open
+/// descriptor, not on the file existing.
+fn lock_path(workspace: &Path) -> PathBuf {
+    workspace.join("lock")
+}
+
+/// Claim the workspace for this process, failing when another runner already
+/// holds it.
+///
+/// One runner per workspace is not a nicety. Starting up throws away every
+/// clone and every turn log in the workspace — see [`clear_clones`] — which on
+/// a workspace that is already in use deletes the directory the other
+/// runner's turn is working in and the history its web UI is still serving,
+/// and does it before the second process has found out it can't run (its web
+/// UI port is taken, its settings don't parse) and given up. So the claim is
+/// staked before anything is thrown away.
+///
+/// The hold is an advisory `flock`, which the kernel releases however the
+/// process ends: a crash leaves nothing to clean up, unlike a pidfile. The
+/// returned handle *is* the hold — dropping it releases the workspace, so the
+/// caller keeps it for the life of the process.
+pub fn hold(workspace: &Path) -> Result<File> {
+    let path = lock_path(workspace);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        // Owner-only like the rest of the workspace, since this is the one
+        // file here that is created rather than inherited from the directory.
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    // SAFETY: flock only takes a lock on the descriptor it is handed, which
+    // `file` owns and keeps open for as long as the returned handle lives.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            bail!(
+                "another codemine is already holding {}; one runner per \
+                 workspace, because starting one clears the repository clones \
+                 and turn logs the running one is using",
+                workspace.display()
+            );
+        }
+        return Err(err).with_context(|| format!("failed to lock {}", path.display()));
+    }
+    Ok(file)
 }
 
 /// Make the repository's clone exist, current, and indexed, and return its
@@ -684,6 +735,34 @@ mod tests {
         std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
         private_dir(&old).unwrap();
         assert_eq!(mode_of(&old), 0o700);
+    }
+
+    /// A workspace in use is refused to a second runner, which is what keeps
+    /// the startup clear-out from deleting the clone a running turn sits in
+    /// and the turn logs a running web UI is still serving. `flock` is held
+    /// per open descriptor, so a second `hold` from this very process is as
+    /// much a second runner as another process would be.
+    #[test]
+    fn a_workspace_in_use_is_refused_to_a_second_runner() {
+        let root = tempfile::tempdir().unwrap();
+        let held = hold(root.path()).unwrap();
+        let err = hold(root.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("another codemine is already holding"),
+            "{err}"
+        );
+        // The lock file carries no secret, but it is created rather than
+        // inherited from the workspace, so it answers for its own mode.
+        assert_eq!(mode_of(&lock_path(root.path())), 0o600);
+
+        // Released with the handle — which for the runner means when the
+        // process ends, however it ends — so the next start is let in, lock
+        // file and all still there from last time.
+        drop(held);
+        let again = hold(root.path()).unwrap();
+        assert!(hold(root.path()).is_err());
+        drop(again);
     }
 
     /// What counts as an index to sync, and what a rebuild is allowed to

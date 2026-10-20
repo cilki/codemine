@@ -57,7 +57,10 @@ instance which I mirror to Github.
 
 Build the image and bring it up with the workspace on a volume; everything that
 must survive the container — settings, the skip cache, the proxy login — lives
-there. Repository clones live there too, but are recloned fresh on every start:
+there. Repository clones live there too, but are recloned fresh on every start,
+so one runner owns a workspace: a second **codemine** pointed at the same one
+refuses to start rather than clearing the clones and turn logs the running one
+is using.
 
 ```sh
 docker build -t codemine .

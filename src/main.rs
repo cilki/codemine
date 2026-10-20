@@ -26,7 +26,7 @@ mod usage;
 mod webui;
 mod workspace;
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -63,7 +63,9 @@ fn main() -> Result<()> {
         return Ok(());
     };
     init_logging();
-    setup(&mut cli)?;
+    // Held, not dropped: the workspace is this process's for as long as it
+    // runs, and letting go of the handle would let a second runner in.
+    let _workspace = setup(&mut cli)?;
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
     // Point opencode at the proxy before anything lists models; the web UI
@@ -478,8 +480,11 @@ fn init_logging() {
         .init();
 }
 
-/// One-time startup work that doesn't depend on the mutable settings.
-fn setup(cli: &mut Cli) -> Result<()> {
+/// One-time startup work that doesn't depend on the mutable settings. The
+/// returned handle is this process's hold on the workspace — see
+/// [`workspace::hold`] — and releases it when dropped, so the caller keeps it
+/// for as long as it means to take turns.
+fn setup(cli: &mut Cli) -> Result<File> {
     // Pin one answer to "where is home" into the environment before anything
     // reads it. Every tool the runner spawns resolves it for itself, and they
     // do not all agree with `config::home()` when `$HOME` is unset — which is
@@ -533,6 +538,11 @@ fn setup(cli: &mut Cli) -> Result<()> {
     // other thread can be touching the environment.
     unsafe { std::env::set_var("PWD", &cli.workspace) };
 
+    // Claim the workspace before the two steps below throw its contents
+    // away: on a workspace another runner is already using, they delete the
+    // clone its turn is working in and the logs its web UI is still serving.
+    let held = workspace::hold(&cli.workspace)?;
+
     // Turn logs are only reachable through the in-memory turn list, which
     // starts empty, so whatever a previous process left behind is
     // unreachable garbage.
@@ -550,7 +560,7 @@ fn setup(cli: &mut Cli) -> Result<()> {
     // SAFETY: setup() runs before the web UI and agent threads exist, so no
     // other thread can be touching the environment.
     unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &gitconfig) };
-    Ok(())
+    Ok(held)
 }
 
 /// Write the git config the runner owns and return its path, for
