@@ -118,7 +118,10 @@ the user decide what to do.
 - Look for real complexity to remove — a shorter, clearer implementation, a
   redundant abstraction collapsed, a duplicated code path unified. Cosmetic
   tidying is not simplification; skip the turn if that is all you find
-- Start search at recently changed code
+- Start searching at recently changed code to minimize covering the same ground
+  repeatedly
+- If you find a feature that's probably not worth the weight of its complexity,
+  then open an issue for the user to decide whether to delete it.
 
 ## "todo"
 

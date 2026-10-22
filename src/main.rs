@@ -1,4 +1,4 @@
-//! Continuously invoke an opencode command to sweep repositories on our code
+//! Continuously run opencode on the sweep prompt to sweep repositories on our code
 //! forges. Each turn runs in a fresh session against a per-repo clone that
 //! stays cloned and codegraph-indexed across turns (but not across restarts),
 //! back-to-back with the previous one. Everything except the CLI flags is

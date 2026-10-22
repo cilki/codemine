@@ -109,7 +109,9 @@ fn lock(
 fn available_models() -> Vec<String> {
     let listing = crate::child::output(
         std::process::Command::new("opencode")
-            .arg("models")
+            // --standalone: answer from a private server rather than starting
+            // or leaning on opencode's shared background service.
+            .args(["models", "--standalone"])
             .env("NO_COLOR", "1"),
     );
     match listing {

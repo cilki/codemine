@@ -1,5 +1,6 @@
-//! Starter prompts baked into the binary and installed into opencode's config
-//! directory at startup, so the binary works without the image copying them.
+//! Prompts baked into the binary: the sweep prompt every turn sends, and the
+//! forge skills installed into opencode's config directory at startup, so
+//! the binary works without the image copying them.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -9,10 +10,9 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-/// The only opencode command the runner drives; `SWEEP` is installed under
-/// this name and every turn runs it.
-pub const SWEEP_COMMAND: &str = "sweep";
-
+/// The prompt every turn runs, rendered by `sweep_prompt`. It is written as
+/// an opencode command (front matter, `$1`–`$4`) but no longer installed as
+/// one: `opencode run` dropped `--command`, so the runner fills it in itself.
 pub const SWEEP: &[u8] = include_bytes!("../commands/sweep.md");
 pub const GITEA_SKILL: &[u8] = include_bytes!("../skills/gitea/SKILL.md");
 pub const GITHUB_SKILL: &[u8] = include_bytes!("../skills/github/SKILL.md");
@@ -74,11 +74,57 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<(
     crate::workspace::write_json(path, &after)
 }
 
-/// Write the embedded prompts under `dir`, overwriting whatever is there; the
+/// The sweep prompt for one turn: `SWEEP` without its front matter, with
+/// `$1`–`$4` replaced by the task, the repository, the forge, and the clone
+/// the agent must work in.
+///
+/// Replaced in a single pass, so a value that itself contains `$2` and the
+/// like is inserted as it is rather than expanded again.
+pub fn sweep_prompt(task: &str, repo: &str, forge: &str, dir: &Path) -> String {
+    let source = str::from_utf8(SWEEP).expect("sweep.md is UTF-8");
+    let dir = dir.display().to_string();
+    let args = [task, repo, forge, dir.as_str()];
+    let mut prompt = String::with_capacity(source.len());
+    let mut rest = strip_front_matter(source);
+    while let Some(at) = rest.find('$') {
+        prompt.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let arg = after
+            .chars()
+            .next()
+            .and_then(|c| c.to_digit(10))
+            .and_then(|n| args.get((n as usize).checked_sub(1)?));
+        match arg {
+            Some(value) => {
+                prompt.push_str(value);
+                rest = &after[1..];
+            }
+            None => {
+                prompt.push('$');
+                rest = after;
+            }
+        }
+    }
+    prompt.push_str(rest);
+    prompt
+}
+
+/// A markdown file without its leading `---` front-matter block, if it has
+/// one, and without the blank lines that separated the two.
+fn strip_front_matter(source: &str) -> &str {
+    let Some(header) = source.strip_prefix("---\n") else {
+        return source;
+    };
+    match header.find("\n---\n") {
+        Some(end) => header[end + "\n---\n".len()..].trim_start_matches('\n'),
+        None => source,
+    }
+}
+
+/// Write the embedded skills under `dir`, overwriting whatever is there; the
 /// binary is the source of truth.
 pub fn install(dir: &Path) -> Result<()> {
     for (path, bytes) in [
-        ("commands/sweep.md", SWEEP),
         ("skills/gitea/SKILL.md", GITEA_SKILL),
         ("skills/github/SKILL.md", GITHUB_SKILL),
         ("skills/gitlab/SKILL.md", GITLAB_SKILL),
@@ -422,8 +468,6 @@ mod tests {
     fn install_writes_and_overwrites() {
         let dir = tempfile::tempdir().unwrap();
         install(dir.path()).unwrap();
-        let sweep = dir.path().join("commands/sweep.md");
-        assert_eq!(std::fs::read(&sweep).unwrap(), SWEEP);
         for (path, bytes) in [
             ("skills/gitea/SKILL.md", GITEA_SKILL),
             ("skills/github/SKILL.md", GITHUB_SKILL),
@@ -432,9 +476,53 @@ mod tests {
             assert_eq!(std::fs::read(dir.path().join(path)).unwrap(), bytes);
         }
 
-        std::fs::write(&sweep, "stale").unwrap();
+        let skill = dir.path().join("skills/github/SKILL.md");
+        std::fs::write(&skill, "stale").unwrap();
         install(dir.path()).unwrap();
-        assert_eq!(std::fs::read(&sweep).unwrap(), SWEEP);
+        assert_eq!(std::fs::read(&skill).unwrap(), GITHUB_SKILL);
+        // The sweep prompt is sent with each turn, not installed as a command.
+        assert!(!dir.path().join("commands").exists());
+    }
+
+    #[test]
+    fn sweep_prompt_fills_in_the_turn() {
+        let prompt = sweep_prompt(
+            "rebase",
+            "cilki/$2-repo",
+            "gitea",
+            Path::new("/work/some dir/repo"),
+        );
+        // No front matter: opencode would take it as part of the message.
+        assert!(
+            prompt.starts_with("You are an assistant developer."),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("description:"));
+        assert!(prompt.contains("Your assigned task for this turn: rebase\n"));
+        // A value holding a placeholder goes in as it is.
+        assert!(
+            prompt.contains("Your assigned repository: cilki/$2-repo, hosted on our gitea forge")
+        );
+        assert!(prompt.contains("checked out on its\ndefault branch at `/work/some dir/repo`"));
+        assert!(prompt.contains("Load the `gitea` skill"));
+        assert!(prompt.contains("as the\n  `gitea` skill describes"));
+        for placeholder in ["$1", "$3", "$4"] {
+            assert!(
+                !prompt.contains(placeholder),
+                "{placeholder} left in the prompt"
+            );
+        }
+        // Everything after the front matter survives, task sections included.
+        assert!(prompt.contains("## \"rebase\""));
+        assert!(prompt.ends_with("changes.\n"));
+    }
+
+    #[test]
+    fn front_matter_is_only_a_leading_block() {
+        assert_eq!(strip_front_matter("---\na: b\n---\n\nbody\n"), "body\n");
+        assert_eq!(strip_front_matter("body\n---\nmore\n"), "body\n---\nmore\n");
+        // An unterminated block is not front matter.
+        assert_eq!(strip_front_matter("---\na: b\n"), "---\na: b\n");
     }
 
     #[test]

@@ -376,18 +376,26 @@ fn spawn_agent(cfg: &Config, turn: &Turn, log: &File) -> Result<Child> {
         [
             "opencode",
             "run",
-            "--command",
-            crate::prompts::SWEEP_COMMAND,
+            // A private server, started inside the sandbox with this turn's
+            // environment. Without it opencode hands the session to a shared
+            // background service, whose tools run outside the Landlock ruleset
+            // and see none of the forge auth or git identity set below.
+            "--standalone",
+            // Backs up OPENCODE_PERMISSION below: approve whatever it does not
+            // explicitly deny, should this opencode ignore the variable.
+            "--auto",
             "--model",
             &cfg.model,
-            turn.task,
-            turn.repo,
-            turn.forge_name(),
         ]
         .map(String::from),
     );
-    // $4 in the sweep command: where the agent must work.
-    argv.push(turn.dir.display().to_string());
+    // One argument, so a clone path with spaces in it stays whole.
+    argv.push(crate::prompts::sweep_prompt(
+        turn.task,
+        turn.repo,
+        turn.forge_name(),
+        &turn.dir,
+    ));
     Command::new(&argv[0])
         .args(&argv[1..])
         // Own process group, so the timeout can take down the whole tree.
@@ -402,7 +410,7 @@ fn spawn_agent(cfg: &Config, turn: &Turn, log: &File) -> Result<Child> {
         // so the agent can't report what it ran however rtk is configured.
         .env("RTK_TELEMETRY_DISABLED", "1")
         // Headless runs auto-reject permission prompts, so every tool the
-        // agent needs has to be pre-approved. The Landlock sandbox is the
+        // agent needs has to be pre-approved (`--auto` above is the fallback). The Landlock sandbox is the
         // real boundary, and legitimate work (cargo's registry, tool caches)
         // lives outside the clone, so opencode's own external-directory gate
         // stays open too.
