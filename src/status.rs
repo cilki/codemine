@@ -109,6 +109,12 @@ pub enum Activity {
     Unconfigured {
         problems: Vec<crate::settings::Problem>,
     },
+    /// `opencode --version` gave no answer, so there is no knowing which
+    /// flags a turn would start it with; nothing in the settings fixes that,
+    /// only the install does. `reason` is what went wrong asking.
+    IncompleteInstall {
+        reason: String,
+    },
     Running {
         task: String,
         repo: String,

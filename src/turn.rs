@@ -144,9 +144,11 @@ impl Turn<'_> {
 
 /// Run one opencode turn against the repository's workspace clone and report
 /// how it went. The clone survives across turns, and so does the turn's log
-/// under `<workspace>/logs`, for as long as the process runs.
+/// under `<workspace>/logs`, for as long as the process runs. `opencode` is
+/// the version the agent is started with, which settles its flags.
 pub fn run(
     cfg: &Config,
+    opencode: &crate::opencode::Version,
     status: &Shared,
     pending: &crate::events::Pending,
     cache: &cache::Cache,
@@ -210,7 +212,7 @@ pub fn run(
     }
 
     let state = answered_state(cfg, &turn, &probe);
-    let mut child = spawn_agent(cfg, &turn, &log)?;
+    let mut child = spawn_agent(cfg, opencode, &turn, &log)?;
     // Now that the group exists, let the web UI pause and resume it.
     Status::update(status, |s| {
         if let Activity::Running { pgid, .. } = &mut s.activity {
@@ -369,26 +371,19 @@ fn answered_state(cfg: &Config, turn: &Turn, probe: &cache::Probe) -> Option<Str
 
 /// Start the agent on the turn, inside the Landlock write sandbox so it
 /// cannot work from any checkout other than the assigned clone.
-fn spawn_agent(cfg: &Config, turn: &Turn, log: &File) -> Result<Child> {
+fn spawn_agent(
+    cfg: &Config,
+    opencode: &crate::opencode::Version,
+    turn: &Turn,
+    log: &File,
+) -> Result<Child> {
     let mut argv = crate::sandbox::wrap(&turn.dir, &turn.log_path);
     argv.extend(workspace::throttle_argv(cfg));
-    argv.extend(
-        [
-            "opencode",
-            "run",
-            // A private server, started inside the sandbox with this turn's
-            // environment. Without it opencode hands the session to a shared
-            // background service, whose tools run outside the Landlock ruleset
-            // and see none of the forge auth or git identity set below.
-            "--standalone",
-            // Backs up OPENCODE_PERMISSION below: approve whatever it does not
-            // explicitly deny, should this opencode ignore the variable.
-            "--auto",
-            "--model",
-            &cfg.model,
-        ]
-        .map(String::from),
-    );
+    argv.extend(["opencode", "run"].map(String::from));
+    // Which flags keep the session inside the sandbox and pre-approved
+    // depends on the opencode: see `Version::run_flags`.
+    argv.extend(opencode.run_flags().iter().map(|flag| flag.to_string()));
+    argv.extend(["--model", &cfg.model].map(String::from));
     // One argument, so a clone path with spaces in it stays whole.
     argv.push(crate::prompts::sweep_prompt(
         turn.task,
@@ -410,10 +405,10 @@ fn spawn_agent(cfg: &Config, turn: &Turn, log: &File) -> Result<Child> {
         // so the agent can't report what it ran however rtk is configured.
         .env("RTK_TELEMETRY_DISABLED", "1")
         // Headless runs auto-reject permission prompts, so every tool the
-        // agent needs has to be pre-approved (`--auto` above is the fallback). The Landlock sandbox is the
-        // real boundary, and legitimate work (cargo's registry, tool caches)
-        // lives outside the clone, so opencode's own external-directory gate
-        // stays open too.
+        // agent needs has to be pre-approved (on 2.x `--auto` is the
+        // fallback). The Landlock sandbox is the real boundary, and
+        // legitimate work (cargo's registry, tool caches) lives outside the
+        // clone, so opencode's own external-directory gate stays open too.
         .env(
             "OPENCODE_PERMISSION",
             r#"{"edit":"allow","bash":"allow","webfetch":"allow","external_directory":"allow"}"#,

@@ -13,6 +13,7 @@ mod events;
 mod host;
 mod http;
 mod identity;
+mod opencode;
 mod precheck;
 mod prompts;
 mod proxy;
@@ -89,6 +90,10 @@ fn main() -> Result<()> {
     // settings page load shouldn't stall for it.
     // The listing is narrowed to what the proxy serves, so the warmup needs
     // the proxy settings too.
+    // Asked here, ahead of the warmup, so the version is read (and logged)
+    // once rather than raced for by the warmup and the main loop. A failure
+    // is the main loop's to report.
+    drop(opencode::detect());
     let warm_against = store.snapshot().0.proxy;
     std::thread::Builder::new()
         .name("models".into())
@@ -119,6 +124,17 @@ fn main() -> Result<()> {
     // gap before the next one — see `idle_gap`.
     let mut idle_draws: u32 = 0;
     loop {
+        // Ahead of the settings: no edit on the page fixes an opencode that
+        // can't say its version, and every turn would start it with flags
+        // that may not be its own.
+        let opencode = match opencode::detect() {
+            Ok(opencode) => opencode,
+            Err(reason) => {
+                report_incomplete_install(&cli, &mut blocked, &status, reason)?;
+                std::thread::sleep(INSTALL_RETRY);
+                continue;
+            }
+        };
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
         if let Some(retry_at) = auth_gated {
@@ -197,7 +213,7 @@ fn main() -> Result<()> {
             continue;
         }
 
-        match turn::run(&cfg, &status, &pending, &cache) {
+        match turn::run(&cfg, &opencode, &status, &pending, &cache) {
             // The draw took no turn. Which of its two reasons it is decides
             // how that is shown: a pool the forge doesn't list is a blocker
             // like any settings problem, where a caught-up pool is simply
@@ -342,6 +358,33 @@ fn report_blocker(
     Status::update(status, |s| s.activity = Activity::Unconfigured { problems });
     once_only(cli, &reasons.join("; "))
 }
+
+/// Log, show, and (under `--once`) give up on an opencode that can't say its
+/// version. Kept apart from `report_blocker` because it isn't a settings
+/// problem: the page has no field to mark, only the install to point at. The
+/// reason also goes in the log pane, where the page's reader is looking when
+/// no turn is running.
+fn report_incomplete_install(
+    cli: &Cli,
+    blocked: &mut Blocked,
+    status: &Shared,
+    reason: String,
+) -> Result<()> {
+    let said = format!("incomplete install: opencode --version failed: {reason}");
+    if blocked.news(std::slice::from_ref(&said)) {
+        error!("turns are blocked: {said}");
+    }
+    Status::update(status, |s| {
+        s.log_tail = said.clone();
+        s.activity = Activity::IncompleteInstall { reason };
+    });
+    once_only(cli, &said)
+}
+
+/// How often an incomplete install is asked about again. Only the install
+/// fixes it, and asking spawns opencode, so less often than the settings are
+/// re-read.
+const INSTALL_RETRY: Duration = Duration::from_secs(60);
 
 /// What `--once` does when a turn can't start at all. The flag promises a
 /// single turn and an exit, so every hold the loop would otherwise sit out —
@@ -924,9 +967,8 @@ mod tests {
     /// must only be news once — and the recovery exactly once too.
     #[test]
     fn a_standing_blocker_is_only_news_once() {
-        let reasons = |reasons: &[&str]| -> Vec<String> {
-            reasons.iter().map(|r| (*r).to_owned()).collect()
-        };
+        let reasons =
+            |reasons: &[&str]| -> Vec<String> { reasons.iter().map(|r| (*r).to_owned()).collect() };
         let mut blocked = Blocked::default();
         // Nothing has blocked turns yet, so there is nothing to recover from.
         assert!(!blocked.cleared());

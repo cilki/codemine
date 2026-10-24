@@ -107,11 +107,20 @@ fn lock(
 /// the first turn. An unrunnable listing is logged and treated as no models
 /// on offer.
 fn available_models() -> Vec<String> {
+    // Without a version there is no knowing which flags the listing takes;
+    // the main loop shows the install as incomplete, and this is asked again
+    // once it isn't, since an empty listing isn't cached.
+    let opencode = match crate::opencode::detect() {
+        Ok(opencode) => opencode,
+        Err(err) => {
+            tracing::warn!("opencode models skipped: {err}");
+            return Vec::new();
+        }
+    };
     let listing = crate::child::output(
         std::process::Command::new("opencode")
-            // --standalone: answer from a private server rather than starting
-            // or leaning on opencode's shared background service.
-            .args(["models", "--standalone"])
+            .arg("models")
+            .args(opencode.models_flags())
             .env("NO_COLOR", "1"),
     );
     match listing {

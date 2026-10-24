@@ -76,6 +76,8 @@
   #stat-state.running { color: #61afef; }
   #stat-state.paused, #stat-state.rate_limited, #stat-state.off_hours,
   #stat-state.usage_limit, #stat-state.unconfigured { color: #e67e22; }
+  /* Nothing on this page fixes it: the host's install has to change. */
+  #stat-state.incomplete_install { color: #e74c3c; }
   /* Not a problem, just nothing to do: greyed rather than flagged. */
   #stat-state.idle { color: #9aa0a6; }
   #stat-completed { color: #2ecc71; }
@@ -437,6 +439,7 @@
     starting: "starting", running: "running", sleeping: "sleeping",
     idle: "idle", usage_limit: "usage limit", rate_limited: "rate limit",
     off_hours: "off hours", unconfigured: "unconfigured",
+    incomplete_install: "incomplete install",
   };
 
   // The states whose name doesn't say the whole of it, as the runner tile's
@@ -462,7 +465,12 @@
     const value = $("stat-state");
     $("stat-state-label").textContent = paused ? "paused" : STATES[a.state] || a.state;
     value.className = "stat-value " + (paused ? "paused" : a.state);
-    value.title = paused ? "" : STATE_NOTES[a.state] || "";
+    // An incomplete install's note is what went wrong asking opencode, since
+    // that is the one thing the person fixing the host needs to know.
+    value.title = paused ? ""
+      : a.state === "incomplete_install"
+        ? "opencode --version failed, so turns can't start: " + a.reason
+        : STATE_NOTES[a.state] || "";
     // A rate limit counts down to the next turn, so its wait reads as
     // negative time: "-5m" means five minutes until the runner goes again.
     value.textContent = a.state === "running"
