@@ -239,11 +239,7 @@ pub fn run(
         }
     }
 
-    // The last reading can fail like any other (opencode mid-write, or its
-    // database gone with the session); the samples taken while the turn ran
-    // are the next best figure, and better than a row with no cost on it.
-    let tokens = crate::usage::collect_since(turn.wall).or(sampled);
-    turn.finish(status, &tail, outcome, elapsed, tokens);
+    turn.finish(status, &tail, outcome, elapsed, sampled);
 
     Ok(Report {
         backoff: match verdict.usage_limit {
@@ -430,11 +426,14 @@ fn spawn_agent(
 /// Wait for the agent, killing its process group if the timeout runs out or
 /// the web UI asks for the turn to be cut short. How it ended comes back as
 /// the exit status (None when it was killed), whether the kill was the cancel
-/// button's, and the last token sample taken while it ran.
+/// button's, and what the turn spent.
 ///
 /// Waited in short hops rather than one long one, resampling what the turn
 /// has spent between them: opencode records each message as it goes, so the
-/// page can watch the cost climb instead of learning it at the end.
+/// page can watch the cost climb instead of learning it at the end. The
+/// samples come off one [`usage::Sampler`](crate::usage::Sampler), which
+/// carries the sum from hop to hop and so reads only what the agent recorded
+/// since the previous one.
 fn supervise(
     cfg: &Config,
     status: &Shared,
@@ -442,6 +441,7 @@ fn supervise(
     child: &mut Child,
 ) -> Result<(Option<ExitStatus>, bool, Option<TokenUsage>)> {
     let run_start = Instant::now();
+    let mut usage = crate::usage::Sampler::new(turn.wall);
     let mut sampled = None;
     let mut canceled = false;
     let exit = loop {
@@ -459,7 +459,7 @@ fn supervise(
         }
         // A failed read (opencode mid-write, say) leaves the last good
         // sample up rather than blinking the figure away.
-        let tokens = crate::usage::collect_since(turn.wall);
+        let tokens = usage.sample();
         if tokens.is_some() && tokens != sampled {
             sampled = tokens.clone();
             Status::update(status, |s| {
@@ -476,7 +476,11 @@ fn supervise(
         // into the clone.
         Some(_) => workspace::kill_leftovers(child.id() as i32),
     }
-    Ok((exit, canceled, sampled))
+    // One last sample, after the tree is down and so after opencode has
+    // written whatever it had left: the answer the turn is recorded with.
+    // Nothing is lost if this one fails — the sampler still holds what the
+    // hops above counted.
+    Ok((exit, canceled, usage.sample().or(sampled)))
 }
 
 /// What the finished turn amounts to, and the one line the runner says about
