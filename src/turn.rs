@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -258,16 +260,77 @@ pub fn run(
 /// Everything the draw may choose from: every enabled repository its forge
 /// still lists, paired with that forge.
 fn pool(cfg: &Config) -> Result<Vec<(&Forge, String)>> {
+    let listed: Vec<(&Forge, Result<Vec<String>>)> = cfg
+        .forges
+        .iter()
+        .map(|forge| (forge, list_repos(forge)))
+        .collect();
+    pooled(listed)
+}
+
+/// The pool each forge's listing adds up to, dropping the forges that
+/// couldn't be read at all: one forge having a bad minute — an API that
+/// answers 502, a token that has just been revoked, a host that is briefly
+/// unreachable — must not stand the others down, the same way
+/// `events::watch` carries on polling the feeds it can read past one it
+/// can't, and the same way `cache::Probe` answers one repository's
+/// precondition as "nothing to do" rather than failing every other
+/// repository's.
+///
+/// A failure only comes back as an error when nothing was pooled: an empty
+/// pool is reported as [`Idle::NoListedRepos`], and that names a
+/// misconfiguration only a human can clear ("the forge doesn't list your
+/// repositories"), which is a different thing to tell someone than "the forge
+/// didn't answer". Where some forge did answer, its repositories are the
+/// draw.
+fn pooled(listed: Vec<(&Forge, Result<Vec<String>>)>) -> Result<Vec<(&Forge, String)>> {
     let mut pool = Vec::new();
-    for forge in &cfg.forges {
-        pool.extend(
-            list_repos(forge)?
-                .into_iter()
-                .filter(|repo| forge.enabled_repos.contains(repo))
-                .map(|repo| (forge, repo)),
-        );
+    let mut failed = None;
+    for (forge, repos) in listed {
+        match repos {
+            Ok(repos) => {
+                if unlistable().remove(&forge.kind) {
+                    info!("listing {}'s repositories works again", forge.kind.name());
+                }
+                pool.extend(
+                    repos
+                        .into_iter()
+                        .filter(|repo| forge.enabled_repos.contains(repo))
+                        .map(|repo| (forge, repo)),
+                );
+            }
+            Err(err) => {
+                let err = err.context(format!(
+                    "failed to list {}'s repositories",
+                    forge.kind.name()
+                ));
+                // Said once, not once per draw: a forge that is down stays
+                // down for as long as it takes someone to fix it, while the
+                // draw comes back around every minute.
+                if unlistable().insert(forge.kind) {
+                    warn!("{err:#}; drawing without it");
+                }
+                failed = failed.or(Some(err));
+            }
+        }
     }
-    Ok(pool)
+    match failed {
+        Some(err) if pool.is_empty() => Err(err),
+        _ => Ok(pool),
+    }
+}
+
+/// The forges whose repository listing is currently failing, so a persistent
+/// failure is logged once instead of once per draw. Kept here rather than
+/// threaded through `run`, which holds no state between turns; the activity
+/// watcher keeps the same bookkeeping for the notification feeds in its own
+/// loop.
+static UNLISTABLE: Mutex<BTreeSet<ForgeKind>> = Mutex::new(BTreeSet::new());
+
+fn unlistable() -> MutexGuard<'static, BTreeSet<ForgeKind>> {
+    UNLISTABLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The (task, forge, repository) triple this turn runs on, or None when
@@ -686,9 +749,74 @@ mod tests {
     use anyhow::{Result, bail};
 
     use super::{
-        ExitStatus, Outcome, PAGE_SIZE, Verdict, gitea_repo_path, open_log, outcome_of, paginate,
-        safe_repo_path,
+        ExitStatus, Forge, ForgeKind, Outcome, PAGE_SIZE, Verdict, gitea_repo_path, open_log,
+        outcome_of, paginate, pooled, safe_repo_path,
     };
+
+    /// A forge with `repos` enabled on it, which is all `pooled` reads.
+    fn enabled_on(kind: ForgeKind, repos: &[&str]) -> Forge {
+        Forge {
+            kind,
+            token: "tok".into(),
+            user: String::new(),
+            login: "codemine".into(),
+            email: "codemine@example.com".into(),
+            url: "https://forge.example.com".into(),
+            enabled_repos: repos.iter().map(|repo| (*repo).to_owned()).collect(),
+        }
+    }
+
+    /// One forge failing to list its repositories used to fail the whole
+    /// draw, so a GitHub that answered 502 — or a token revoked on one of
+    /// two forges — stopped the runner taking turns on the Gitea repository
+    /// sitting right next to it, every minute, for as long as the outage
+    /// lasted. The forge that did answer is the draw.
+    #[test]
+    fn a_forge_that_cannot_be_listed_sits_out_the_draw() {
+        let gitea = enabled_on(ForgeKind::Gitea, &["me/one", "me/two"]);
+        let github = enabled_on(ForgeKind::Github, &["me/three"]);
+        let pool = pooled(vec![
+            (&github, Err(anyhow::anyhow!("HTTP 502: Bad gateway"))),
+            (
+                &gitea,
+                Ok(vec!["me/one".to_owned(), "someone/else".to_owned()]),
+            ),
+        ])
+        .unwrap();
+        // Only the enabled repositories of the forge that answered, and the
+        // failure is not an error while there is still a turn to take.
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].0.kind, ForgeKind::Gitea);
+        assert_eq!(pool[0].1, "me/one");
+    }
+
+    /// An empty pool is reported as `Idle::NoListedRepos`, which tells the
+    /// user their enabled set is wrong. That claim can only be made when
+    /// every forge actually answered: with a listing missing, the failure
+    /// goes back to the caller as the error it is.
+    #[test]
+    fn an_empty_pool_with_a_failed_listing_is_an_error_not_an_empty_draw() {
+        let gitea = enabled_on(ForgeKind::Gitea, &["me/one"]);
+        let github = enabled_on(ForgeKind::Github, &["me/three"]);
+
+        // Nothing enabled came back anywhere, and one forge never answered.
+        // Matched rather than unwrapped: `Forge` deliberately carries no
+        // `Debug`, since what it holds is a token.
+        let said = match pooled(vec![
+            (&gitea, Ok(vec!["someone/else".to_owned()])),
+            (&github, Err(anyhow::anyhow!("HTTP 502: Bad gateway"))),
+        ]) {
+            Err(err) => format!("{err:#}"),
+            Ok(pool) => panic!("expected an error, pooled {} repositories", pool.len()),
+        };
+        assert!(said.contains("github"), "{said}");
+        assert!(said.contains("502"), "{said}");
+
+        // Every forge answered and still listed none of the enabled set:
+        // that is the empty draw the caller turns into a blocker.
+        let pool = pooled(vec![(&gitea, Ok(vec!["someone/else".to_owned()]))]).unwrap();
+        assert!(pool.is_empty());
+    }
 
     fn verdict(completed: bool, died: bool) -> Verdict {
         Verdict {
