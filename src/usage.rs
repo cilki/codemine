@@ -1,18 +1,14 @@
 //! Best-effort token accounting. opencode doesn't reliably print token counts
 //! in its run output, but it persists each message (with a `tokens` object)
-//! under its data directory: current versions in the `message` table of
-//! `opencode.db`, older ones as JSON files under `storage/`. Each turn runs
-//! in a fresh session, so summing the token objects recorded since the turn
-//! started attributes usage to the turn. Anything unexpected degrades to
-//! None rather than failing the turn.
+//! in the `message` table of `opencode*.db` under its data directory. Each
+//! turn runs in a fresh session, so summing the token objects recorded since
+//! the turn started attributes usage to the turn. Anything unexpected
+//! degrades to None rather than failing the turn.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::status::TokenUsage;
-
-const MAX_DEPTH: usize = 8;
-const MAX_FILES: usize = 10_000;
 
 /// How far past the turn's start the backwards walk keeps reading before it
 /// accepts that every remaining row is older still. The walk relies on the
@@ -50,7 +46,7 @@ pub struct Sampler {
     sum: Option<TokenUsage>,
     /// Which database the sum is being read from, and the rowid it is
     /// complete up to. None until one holding this turn's messages is
-    /// found — see [`look`](Self::look).
+    /// found — see [`read`](Self::read).
     cursor: Option<(PathBuf, i64)>,
 }
 
@@ -67,41 +63,28 @@ impl Sampler {
     /// for it. Cheap enough to call on a timer: once a database has been
     /// found, each call reads only the rows appended since the last one.
     pub fn sample(&mut self) -> Option<TokenUsage> {
-        let data = opencode_data_dir();
-        // Listed only while the sampler is still looking: once it has
-        // settled on a file, re-reading the directory every few seconds
-        // answers a question it has stopped asking.
-        match self.cursor.clone() {
-            Some((path, from)) => self.advance(&path, from),
-            None => self.look(&databases(&data)),
-        }
-        // Pre-database opencode, or a database that has recorded nothing for
-        // this turn yet. The file layout is not read incrementally: it is a
-        // dead layout, and a scan of it is bounded by `MAX_FILES` anyway.
-        if self.sum.is_none() {
-            self.sum = from_files(&data.join("storage"), self.since);
-        }
-        self.sum.clone()
+        self.read(&opencode_data_dir())
     }
 
-    /// Settle on the first of `candidates` with any of this turn's messages
-    /// in it — which file opencode writes depends on its release channel,
-    /// and a stale one from another channel can sort ahead of the live one.
-    fn look(&mut self, candidates: &[PathBuf]) {
-        for path in candidates {
-            if self.open_window(path) {
-                break;
+    /// A sample out of the databases under `data`, which is opencode's data
+    /// directory — the tests pass one of their own.
+    fn read(&mut self, data: &Path) -> Option<TokenUsage> {
+        match self.cursor.clone() {
+            Some((path, from)) => self.advance(&path, from),
+            // Settle on the first database with any of this turn's messages
+            // in it: which file opencode writes depends on its release
+            // channel, and a stale one from another channel can sort ahead
+            // of the live one. The directory is listed only while the
+            // sampler is still looking — once it has settled on a file,
+            // re-reading the directory every few seconds answers a question
+            // it has stopped asking.
+            None => {
+                for path in databases(data) {
+                    if self.open_window(&path) {
+                        break;
+                    }
+                }
             }
-        }
-    }
-
-    /// The database half of a sample, for the tests: `candidates` stand in
-    /// for what `databases` would have listed.
-    #[cfg(test)]
-    fn read(&mut self, candidates: &[PathBuf]) -> Option<TokenUsage> {
-        match self.cursor.clone() {
-            Some((path, from)) => self.advance(&path, from),
-            None => self.look(candidates),
         }
         self.sum.clone()
     }
@@ -231,56 +214,6 @@ fn databases(data: &Path) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
-}
-
-/// The pre-database layout: per-message JSON files under `storage/`, summed
-/// from the files modified since the turn started.
-fn from_files(storage: &Path, since: SystemTime) -> Option<TokenUsage> {
-    let mut sum = TokenUsage::default();
-    let mut found = false;
-    let mut budget = MAX_FILES;
-    let mut dirs = vec![(storage.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if budget == 0 {
-                break;
-            }
-            budget -= 1;
-            let path = entry.path();
-            if path.is_dir() {
-                // A fresh file only touches its immediate parent's mtime, so
-                // intermediate directories (storage/session/, say) look stale
-                // even when new messages landed below them; descend
-                // unconditionally and let the file budget bound the scan.
-                if depth < MAX_DEPTH {
-                    dirs.push((path, depth + 1));
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|ext| ext != "json") {
-                continue;
-            }
-            let recent = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .is_ok_and(|modified| modified >= since);
-            if !recent {
-                continue;
-            }
-            let Some(tokens) = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| tokens_in(&bytes))
-            else {
-                continue;
-            };
-            sum.add(&tokens);
-            found = true;
-        }
-    }
-    found.then_some(sum)
 }
 
 /// The one field of a recorded message this module is after. Deserializing
@@ -434,22 +367,24 @@ mod tests {
         );
         drop(db);
 
-        let files = [path.clone()];
-        let sum = Sampler::new(at(SINCE_MS)).read(&files).unwrap();
+        let sum = Sampler::new(at(SINCE_MS)).read(dir.path()).unwrap();
         assert_eq!(sum.input, 110);
         assert_eq!(sum.output, 25);
         assert_eq!(sum.reasoning, 7);
         assert_eq!(sum.cache_read, 4000);
         assert_eq!(sum.cache_write, 300);
 
-        // Nothing recent, or no database at all: nothing to report, so the
-        // sampler goes on to the file layout.
-        assert!(Sampler::new(at(SINCE_MS + 60_000)).read(&files).is_none());
+        // Nothing recorded for this turn, or no database at all, reports
+        // None and not a cost of zero: the page shows a turn opencode hasn't
+        // accounted for yet as unknown, and "unknown" is also what a turn
+        // that died before its first message is recorded with.
         assert!(
-            Sampler::new(at(SINCE_MS))
-                .read(&[dir.path().join("missing.db")])
+            Sampler::new(at(SINCE_MS + 60_000))
+                .read(dir.path())
                 .is_none()
         );
+        let empty = tempfile::tempdir().unwrap();
+        assert!(Sampler::new(at(SINCE_MS)).read(empty.path()).is_none());
     }
 
     /// The first sample walks the table backwards and ends on the first row
@@ -463,8 +398,7 @@ mod tests {
         let path = dir.path().join("opencode.db");
         let db = message_table(&path);
         let slack_ms = CLOCK_SLACK.as_millis() as i64;
-        let files = [path.clone()];
-        let fresh = || Sampler::new(at(SINCE_MS)).read(&files).unwrap().input;
+        let fresh = || Sampler::new(at(SINCE_MS)).read(dir.path()).unwrap().input;
 
         // Recorded in order, but the clock stepped back between the first
         // message and the second, putting a pre-turn stamp on a mid-turn row.
@@ -493,27 +427,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opencode.db");
         let db = message_table(&path);
-        let files = [path.clone()];
-        let fresh = || Sampler::new(at(SINCE_MS)).read(&files).map(|t| t.input);
+        let fresh = || Sampler::new(at(SINCE_MS)).read(dir.path()).map(|t| t.input);
 
         let mut live = Sampler::new(at(SINCE_MS));
         // Sampled before opencode has recorded anything: nothing to report,
         // and nothing remembered either, so the next sample still looks.
-        assert!(live.read(&files).is_none());
+        assert!(live.read(dir.path()).is_none());
         assert!(live.cursor.is_none());
 
         record(&db, "first", SINCE_MS + 1_000, &answer(100));
-        assert_eq!(live.read(&files).map(|t| t.input), Some(100));
+        assert_eq!(live.read(dir.path()).map(|t| t.input), Some(100));
         // A sample with nothing new to read repeats itself rather than
         // double-counting what it already has.
-        assert_eq!(live.read(&files).map(|t| t.input), Some(100));
+        assert_eq!(live.read(dir.path()).map(|t| t.input), Some(100));
         assert_eq!(fresh(), Some(100));
 
         // The rows that carry no cost — a user turn, a tool result — move
         // the cursor without moving the sum.
         record(&db, "tool", SINCE_MS + 2_000, r#"{ "role": "user" }"#);
         record(&db, "second", SINCE_MS + 3_000, &answer(20));
-        assert_eq!(live.read(&files).map(|t| t.input), Some(120));
+        assert_eq!(live.read(dir.path()).map(|t| t.input), Some(120));
         assert_eq!(fresh(), Some(120));
 
         // A row appended with a stamp from before the turn is the clock
@@ -522,14 +455,14 @@ mod tests {
         // that is going forwards through rows newer than everything counted.
         record(&db, "stepped", SINCE_MS - 1, &answer(999));
         record(&db, "third", SINCE_MS + 4_000, &answer(5));
-        assert_eq!(live.read(&files).map(|t| t.input), Some(125));
+        assert_eq!(live.read(dir.path()).map(|t| t.input), Some(125));
 
         // The database opencode was writing going away mid-turn leaves the
         // sum standing and sets the sampler looking again, where reporting
         // nothing from then on would blank the figure for the rest of the
         // turn.
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(live.read(&files).map(|t| t.input), Some(125));
+        assert_eq!(live.read(dir.path()).map(|t| t.input), Some(125));
         assert!(live.cursor.is_none());
     }
 
@@ -548,16 +481,16 @@ mod tests {
         record(&stale_db, "old", SINCE_MS - 10_000, &answer(999));
         record(&live_db, "first", SINCE_MS + 1_000, &answer(100));
 
-        let files = [stale.clone(), live.clone()];
+        // `databases` sorts, so the stale `-dev` file is the one tried first.
         let mut sampler = Sampler::new(at(SINCE_MS));
-        assert_eq!(sampler.read(&files).map(|t| t.input), Some(100));
+        assert_eq!(sampler.read(dir.path()).map(|t| t.input), Some(100));
         assert_eq!(sampler.cursor.as_ref().map(|(path, _)| path), Some(&live));
 
         // And it stays settled: a later write to the stale file is not this
         // turn's, however recently stamped.
         record(&stale_db, "intruder", SINCE_MS + 2_000, &answer(42));
         record(&live_db, "second", SINCE_MS + 3_000, &answer(20));
-        assert_eq!(sampler.read(&files).map(|t| t.input), Some(120));
+        assert_eq!(sampler.read(dir.path()).map(|t| t.input), Some(120));
     }
 
     #[test]
@@ -574,37 +507,5 @@ mod tests {
             ]
         );
         assert!(databases(&dir.path().join("missing")).is_empty());
-    }
-
-    #[test]
-    fn file_scan_sums_only_recent_files() {
-        let dir = tempfile::tempdir().unwrap();
-        // Both session directories predate the turn, so every directory
-        // mtime on the way to the new message is stale; only the message
-        // file itself is recent.
-        let old_session = dir.path().join("session/message/ses_old");
-        let live_session = dir.path().join("session/message/ses_live");
-        std::fs::create_dir_all(&old_session).unwrap();
-        std::fs::create_dir_all(&live_session).unwrap();
-        std::fs::write(
-            old_session.join("msg.json"),
-            r#"{ "tokens": { "input": 999, "output": 999 } }"#,
-        )
-        .unwrap();
-        // Let the old tree's mtimes land strictly before `since`.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let since = SystemTime::now();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(
-            live_session.join("msg.json"),
-            r#"{ "tokens": { "input": 40, "output": 2 } }"#,
-        )
-        .unwrap();
-
-        let sum = from_files(dir.path(), since).unwrap();
-        assert_eq!(sum.input, 40);
-        assert_eq!(sum.output, 2);
-        assert!(from_files(dir.path(), SystemTime::now()).is_none());
-        assert!(from_files(&dir.path().join("missing"), since).is_none());
     }
 }
