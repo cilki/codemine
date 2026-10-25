@@ -204,3 +204,11 @@ the project-specific tools/versions.
 Prefer `cargo check` over `cargo build` when you only need to know whether
 something compiles; always check the compilation succeeds except for trivial
 changes.
+
+When you run the project itself (a server, a daemon, a CLI that keeps state),
+give it a scratch home — `env HOME=/tmp/opencode/home
+XDG_CONFIG_HOME=/tmp/opencode/home/.config
+XDG_DATA_HOME=/tmp/opencode/home/.local/share` — rather than the real one. The
+real home holds the configuration of the tools running this session, and a
+program that writes its own defaults there on startup breaks the sessions that
+come after yours.

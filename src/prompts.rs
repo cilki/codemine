@@ -514,7 +514,7 @@ mod tests {
         }
         // Everything after the front matter survives, task sections included.
         assert!(prompt.contains("## \"rebase\""));
-        assert!(prompt.ends_with("changes.\n"));
+        assert!(prompt.ends_with("come after yours.\n"));
     }
 
     #[test]
@@ -653,6 +653,53 @@ mod tests {
         assert_eq!(config["theme"], "dark");
         assert_eq!(config["provider"]["anthropic"]["options"]["apiKey"], "k1");
         assert!(config["provider"]["anthropic"]["options"]["stale"].is_null());
+    }
+
+    /// The file is shared with whatever else runs under the same $HOME — a
+    /// turn on codemine's own repository starts the binary it built, and that
+    /// instance's startup writes the default proxy into it. Reasserting the
+    /// configured proxy has to take the file back to the settings while
+    /// leaving the MCP entry, and a file already in agreement is not
+    /// rewritten, since the runner does this before every turn.
+    #[test]
+    fn install_provider_takes_back_a_clobbered_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        let proxy = crate::settings::ProxySettings {
+            base_url: "https://proxy.example:8317".into(),
+            api_key: "k1".into(),
+            ..Default::default()
+        };
+        install_mcp(dir.path(), true).unwrap();
+        install_provider(dir.path(), &proxy).unwrap();
+
+        // What a default-settings instance leaves behind.
+        install_provider(dir.path(), &crate::settings::ProxySettings::default()).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            format!("{}/v1", crate::proxy::DEFAULT_BASE_URL)
+        );
+
+        install_provider(dir.path(), &proxy).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            "https://proxy.example:8317/v1"
+        );
+        assert_eq!(config["provider"]["anthropic"]["options"]["apiKey"], "k1");
+        assert_eq!(config["mcp"]["codegraph"]["type"], "local");
+
+        // In agreement: compared, not written.
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        install_provider(dir.path(), &proxy).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
     }
 
     #[test]

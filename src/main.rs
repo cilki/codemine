@@ -69,8 +69,9 @@ fn main() -> Result<()> {
     let _workspace = setup(&mut cli)?;
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
-    // Point opencode at the proxy before anything lists models; the web UI
-    // re-runs this whenever the proxy settings change.
+    // Point opencode at the proxy before anything lists models. The web UI
+    // re-runs this whenever the proxy settings change, and `runnable` before
+    // every turn, since a turn can leave the file pointing elsewhere.
     prompts::install_provider(&prompts::opencode_config_dir(), &store.snapshot().0.proxy)?;
     // A task that came up empty remembers the state it answered for — the
     // tree's commit, or the notification feed for `feedback` — so it isn't
@@ -451,6 +452,21 @@ fn runnable(
     if let Some(problem) = proxy::problem(&settings.proxy, &settings.model) {
         return Err(vec![problem]);
     }
+    // The proxy just probed is the one the settings name; the one the agent
+    // talks to is whatever opencode's config names, and nothing keeps the two
+    // together between turns. That config lives under $HOME, outside the
+    // workspace, and a turn on this very repository runs the binary it just
+    // built with a scratch `--workspace` but the runner's own $HOME — whose
+    // startup pointed the shared file at the default proxy. Every turn after
+    // it retried a refused connection for the whole of its timeout, since
+    // opencode neither gives up nor says so. Reasserted on every pass, so
+    // what was probed is what gets used; a correct file is read and left.
+    prompts::install_provider(&prompts::opencode_config_dir(), &settings.proxy).map_err(|err| {
+        vec![Problem::new(
+            "proxy-card",
+            format!("failed to point opencode at the proxy: {err:#}"),
+        )]
+    })?;
     let mut cfg = settings
         .to_config(cli)
         .expect("settings without problems are runnable");
