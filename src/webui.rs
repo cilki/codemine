@@ -594,9 +594,28 @@ async fn api_post_cancel(State(state): State<AppState>) -> Response {
     Json(json!({ "canceled": true })).into_response()
 }
 
+/// The repositories the picker offers for one forge, sorted: everything the
+/// forge lists, plus the enabled ones it didn't list, so a repository that
+/// was renamed or fell out of the token's reach can't silently drop out of
+/// the settings. Archived repositories are never offered, even enabled ones;
+/// their names stay in the settings, so unarchiving one brings it back
+/// already enabled.
+fn repo_choices(listing: crate::turn::Listing, enabled: &BTreeSet<String>) -> BTreeSet<String> {
+    let archived = listing.archived;
+    listing
+        .repos
+        .into_iter()
+        .chain(
+            enabled
+                .iter()
+                .filter(|repo| !archived.contains(*repo))
+                .cloned(),
+        )
+        .collect()
+}
+
 /// Live repository listing for one forge, merged with the enabled set so
-/// the UI can render checkboxes. Enabled repositories missing from the
-/// listing still appear, so an unreachable forge can't silently drop them.
+/// the UI can render checkboxes (see `repo_choices`).
 async fn api_repos(State(state): State<AppState>, Path(slug): Path<String>) -> Response {
     let Some(kind) = ForgeKind::from_slug(&slug) else {
         return (
@@ -618,10 +637,8 @@ async fn api_repos(State(state): State<AppState>, Path(slug): Path<String>) -> R
     // runtime so status polling stays responsive meanwhile.
     let listed = tokio::task::spawn_blocking(move || crate::turn::list_repos(&forge)).await;
     match listed {
-        Ok(Ok(repos)) => {
-            let names: BTreeSet<String> =
-                repos.into_iter().chain(enabled.iter().cloned()).collect();
-            let repos: Vec<_> = names
+        Ok(Ok(listing)) => {
+            let repos: Vec<_> = repo_choices(listing, &enabled)
                 .into_iter()
                 .map(|name| json!({ "enabled": enabled.contains(&name), "name": name }))
                 .collect();
@@ -1150,6 +1167,25 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
         let response = request(addr, "GET", "/api/repos/github", "");
         assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    }
+
+    /// The picker never offers an archived repository, enabled or not, but
+    /// an enabled repository the forge merely stopped listing stays on offer
+    /// so it can't silently drop out of the settings.
+    #[test]
+    fn archived_repositories_are_never_offered() {
+        let names = |repos: &[&str]| -> BTreeSet<String> {
+            repos.iter().map(|repo| (*repo).to_owned()).collect()
+        };
+        let listing = crate::turn::Listing {
+            repos: vec!["me/live".into(), "me/new".into()],
+            archived: names(&["me/old", "me/shelved"]),
+        };
+        let enabled = names(&["me/live", "me/old", "me/renamed"]);
+        assert_eq!(
+            repo_choices(listing, &enabled),
+            names(&["me/live", "me/new", "me/renamed"])
+        );
     }
 
     /// Stamping has to leave JSON behind whatever it is handed, since the

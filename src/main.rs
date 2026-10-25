@@ -324,8 +324,9 @@ const NOTHING_TO_DO: &str = "every enabled task has nothing to do on any enabled
 
 /// The blocker a pass that took no turn amounts to, if any. An enabled set
 /// that the forge lists none of is a misconfiguration — the repository was
-/// renamed, deleted, or has fallen out of the token's reach — and only a
-/// human can clear it, so it is tied to the repository picker that fixes it.
+/// renamed, deleted, archived, or has fallen out of the token's reach — and
+/// only a human can clear it, so it is tied to the repository picker that
+/// fixes it.
 /// A pool that is merely caught up is no problem at all, and mustn't flag the
 /// settings as if it were.
 fn idle_problem(idle: Option<turn::Idle>) -> Option<Problem> {
@@ -333,7 +334,7 @@ fn idle_problem(idle: Option<turn::Idle>) -> Option<Problem> {
         turn::Idle::NothingToDo => None,
         turn::Idle::NoListedRepos => Some(Problem::new(
             "forges",
-            "none of the enabled repositories are listed by their forge",
+            "none of the enabled repositories are listed by their forge, or all are archived",
         )),
     }
 }

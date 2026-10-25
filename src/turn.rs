@@ -35,7 +35,8 @@ pub enum Idle {
     /// Every enabled task has nothing to act on anywhere in the pool.
     NothingToDo,
     /// Not one enabled repository is listed by its forge — renamed, deleted,
-    /// or out of the token's reach — so there is nothing to draw from.
+    /// archived, or out of the token's reach — so there is nothing to draw
+    /// from.
     NoListedRepos,
 }
 
@@ -258,12 +259,12 @@ pub fn run(
 }
 
 /// Everything the draw may choose from: every enabled repository its forge
-/// still lists, paired with that forge.
+/// still lists and hasn't archived, paired with that forge.
 fn pool(cfg: &Config) -> Result<Vec<(&Forge, String)>> {
     let listed: Vec<(&Forge, Result<Vec<String>>)> = cfg
         .forges
         .iter()
-        .map(|forge| (forge, list_repos(forge)))
+        .map(|forge| (forge, list_repos(forge).map(|listing| listing.repos)))
         .collect();
     pooled(listed)
 }
@@ -592,32 +593,52 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 const PAGE_SIZE: usize = 50;
 
-/// The repositories the bot can reach on a forge, as `<owner>/<repo>`.
-/// Queried fresh each turn so new repositories join the pool without a
-/// restart. Names the forge reports that aren't usable as a path are dropped
-/// here, which is the one chokepoint every consumer draws from.
-pub fn list_repos(forge: &Forge) -> Result<Vec<String>> {
-    let listed = match forge.kind {
-        ForgeKind::Gitea => list_gitea_repos()?,
-        ForgeKind::Github => list_api_repos(forge, "gh", "user/repos", "full_name")?,
-        ForgeKind::Gitlab => list_api_repos(
-            forge,
-            "glab",
-            "projects?membership=true",
-            "path_with_namespace",
-        )?,
+/// One forge's repository listing, as `<owner>/<repo>` paths.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct Listing {
+    /// The repositories that may be shown and worked on.
+    pub repos: Vec<String>,
+    /// Archived repositories, which are never shown or drawn. They are kept
+    /// apart rather than dropped so that an enabled repository that was
+    /// archived can be told from one the forge simply stopped listing: the
+    /// latter stays visible in the picker, the former is hidden with the rest.
+    pub archived: BTreeSet<String>,
+}
+
+/// The repositories the bot can reach on a forge. Queried fresh each turn so
+/// new repositories join the pool without a restart. Names the forge reports
+/// that aren't usable as a path are dropped here, and archived repositories
+/// are set apart here, which is the one chokepoint every consumer draws from.
+pub fn list_repos(forge: &Forge) -> Result<Listing> {
+    let field = match forge.kind {
+        ForgeKind::Gitea | ForgeKind::Github => "full_name",
+        ForgeKind::Gitlab => "path_with_namespace",
     };
-    let mut repos = Vec::with_capacity(listed.len());
-    for repo in listed {
-        match safe_repo_path(&repo) {
-            true => repos.push(repo),
-            false => warn!(
+    let mut listing = Listing::default();
+    for row in list_rows(forge)? {
+        let Some((repo, archived)) = listed_repo(&row, field) else {
+            continue;
+        };
+        if !safe_repo_path(&repo) {
+            warn!(
                 "ignoring unusable repository name from {}: {repo:?}",
                 forge.kind.name()
-            ),
+            );
+        } else if archived {
+            listing.archived.insert(repo);
+        } else {
+            listing.repos.push(repo);
         }
     }
-    Ok(repos)
+    Ok(listing)
+}
+
+/// The path and archived flag of one row of a forge's repository listing;
+/// None for a row without the path. All three forges spell the flag
+/// `archived`, and a row that doesn't carry it is taken as not archived.
+fn listed_repo(row: &serde_json::Value, field: &str) -> Option<(String, bool)> {
+    let repo = row[field].as_str()?.to_owned();
+    Some((repo, row["archived"].as_bool().unwrap_or(false)))
 }
 
 /// Whether a forge-reported name is safe to use as the path it is treated as
@@ -666,71 +687,28 @@ fn paginate<R>(mut page: impl FnMut(usize) -> Result<Vec<R>>) -> Result<Vec<R>> 
     Ok(rows)
 }
 
-/// `tea` prints the requested fields whitespace-separated with no header, so
-/// owner and name come back as two columns and are rejoined into the
-/// `<owner>/<repo>` path the rest of the runner expects.
-fn list_gitea_repos() -> Result<Vec<String>> {
-    let lines = paginate(|page| {
-        let stdout = crate::child::output(
-            Command::new("tea")
-                .args([
-                    "repos",
-                    "ls",
-                    "--output",
-                    "simple",
-                    "--fields",
-                    "owner,name",
-                ])
-                .args([
-                    "--limit",
-                    &PAGE_SIZE.to_string(),
-                    "--page",
-                    &page.to_string(),
-                ]),
-        )?;
-        // Blank lines are tea's own padding rather than listed repositories,
-        // so they don't count toward the page either way.
-        Ok(String::from_utf8_lossy(&stdout)
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(str::to_owned)
-            .collect())
-    })?;
-    Ok(lines
-        .iter()
-        .filter_map(|line| gitea_repo_path(line))
-        .collect())
-}
-
-/// The `<owner>/<repo>` path from one `tea repos ls` line; None for the blank
-/// and malformed lines tea can emit, since neither field can contain spaces.
-fn gitea_repo_path(line: &str) -> Option<String> {
-    let mut fields = line.split_whitespace();
-    let (owner, name) = (fields.next()?, fields.next()?);
-    fields.next().is_none().then(|| format!("{owner}/{name}"))
-}
-
-/// Page through a REST listing and pluck one field per repository. gh and
-/// glab expose the same `api` subcommand shape, which `precheck::api_json`
-/// already drives — including authenticating from the forge's environment
-/// variables — so only the paging and the field belong here.
-fn list_api_repos(forge: &Forge, program: &str, path: &str, field: &str) -> Result<Vec<String>> {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    let rows = paginate(|page| {
-        let listing = precheck::api_json(
+/// Page through the forge's REST listing of the repositories the token can
+/// reach, one JSON object per repository. Gitea goes over its HTTP API rather
+/// than `tea repos ls`, whose output has no field for the archived flag; it
+/// is the same `user/repos` endpoint tea asks. GitLab is asked to leave
+/// archived projects out, while GitHub's `user/repos` has no such filter, so
+/// `list_repos` reads the flag on every row either way.
+fn list_rows(forge: &Forge) -> Result<Vec<serde_json::Value>> {
+    paginate(|page| {
+        let listing = precheck::forge_json(
             forge,
-            program,
-            &format!("{path}{separator}per_page={PAGE_SIZE}&page={page}"),
+            &format!("user/repos?limit={PAGE_SIZE}&page={page}"),
+            &format!("user/repos?per_page={PAGE_SIZE}&page={page}"),
+            &format!("projects?membership=true&archived=false&per_page={PAGE_SIZE}&page={page}"),
         )?;
         match listing {
             serde_json::Value::Array(rows) => Ok(rows),
-            _ => bail!("{program} api returned unexpected output"),
+            _ => bail!(
+                "{} returned an unexpected repository listing",
+                forge.kind.name()
+            ),
         }
-    })?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| row[field].as_str().map(String::from))
-        .collect())
+    })
 }
 
 /// The last `limit` bytes of the file, lossily decoded.
@@ -747,9 +725,10 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     use anyhow::{Result, bail};
+    use serde_json::json;
 
     use super::{
-        ExitStatus, Forge, ForgeKind, Outcome, PAGE_SIZE, Verdict, gitea_repo_path, open_log,
+        ExitStatus, Forge, ForgeKind, Outcome, PAGE_SIZE, Verdict, listed_repo, open_log,
         outcome_of, paginate, pooled, safe_repo_path,
     };
 
@@ -1011,17 +990,32 @@ mod tests {
         }
     }
 
+    /// Archived repositories are never shown or worked on, so every listing
+    /// row has to say whether it is one. All three forges spell the flag
+    /// `archived`; a row without it is an ordinary repository, and a row
+    /// without the path is no repository at all.
     #[test]
-    fn gitea_lines_become_owner_repo_paths() {
+    fn listing_rows_carry_the_archived_flag() {
+        let row = |value: serde_json::Value| listed_repo(&value, "full_name");
         assert_eq!(
-            gitea_repo_path("cilki turbine"),
-            Some("cilki/turbine".into())
+            row(json!({ "full_name": "cilki/turbine", "archived": false })),
+            Some(("cilki/turbine".into(), false))
         );
         assert_eq!(
-            gitea_repo_path("  cilki	turbine  "),
-            Some("cilki/turbine".into())
+            row(json!({ "full_name": "cilki/turbine", "archived": true })),
+            Some(("cilki/turbine".into(), true))
         );
-        assert_eq!(gitea_repo_path("turbine"), None);
-        assert_eq!(gitea_repo_path(""), None);
+        assert_eq!(
+            row(json!({ "full_name": "cilki/turbine" })),
+            Some(("cilki/turbine".into(), false))
+        );
+        assert_eq!(row(json!({ "name": "turbine", "archived": true })), None);
+        assert_eq!(
+            listed_repo(
+                &json!({ "path_with_namespace": "group/sub/project", "archived": true }),
+                "path_with_namespace"
+            ),
+            Some(("group/sub/project".into(), true))
+        );
     }
 }
