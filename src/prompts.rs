@@ -484,6 +484,50 @@ mod tests {
         assert!(!dir.path().join("commands").exists());
     }
 
+    /// The GitLab skill's commands have to be ones `glab` actually runs as
+    /// written. `glab api` has no `--jq`, and it sends a bracketed field name
+    /// such as `-f "position[new_line]=42"` as a literal JSON key, which
+    /// GitLab ignores. A review built that way lands as one plain comment
+    /// with no line anchors.
+    #[test]
+    fn gitlab_skill_commands_are_ones_glab_runs() {
+        let skill = std::str::from_utf8(GITLAB_SKILL).unwrap();
+        let commands = skill
+            .lines()
+            .filter(|line| line.trim_start().starts_with("glab "));
+        for line in commands {
+            assert!(!line.contains("--jq"), "glab has no --jq: {line}");
+        }
+        let tokens: Vec<&str> = skill.split_whitespace().collect();
+        for pair in tokens.windows(2) {
+            if ["-f", "-F", "--field", "--raw-field"].contains(&pair[0]) {
+                let name = pair[1].trim_matches(['"', '\'']);
+                let name = name.split('=').next().unwrap_or(name);
+                assert!(!name.contains('['), "bracketed glab field: {}", pair[1]);
+            }
+        }
+
+        // Findings go out as anchored drafts, published by the verdict.
+        let review = skill
+            .split("## Reviewing a merge request")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("the gitlab skill has a review section");
+        for needle in [
+            "draft_notes",
+            "--input",
+            "Content-Type: application/json",
+            "old_line",
+            "new_line",
+            "/submit_review",
+        ] {
+            assert!(
+                review.contains(needle),
+                "{needle} missing from the review section"
+            );
+        }
+    }
+
     #[test]
     fn sweep_prompt_fills_in_the_turn() {
         let prompt = sweep_prompt(

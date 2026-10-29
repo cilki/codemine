@@ -97,7 +97,9 @@ the user decide what to do.
   otherwise), a short summary of what the change does and what you checked, and
   a verdict — approve when nothing you found blocks the merge, request changes
   when something does. Submit everything in one go, so the author is notified
-  once
+  once. Where the forge supports inline comments, a single comment listing
+  every finding is not a review: if one anchor is rejected, cite that one
+  finding as `path:line` and keep the others on their lines
 - A review is comments and a verdict only. Never push to, rebase, close, or
   merge the PR under review — not even your own; fixing what you found is the
   `feedback` task's job — and never claim you ran something you didn't

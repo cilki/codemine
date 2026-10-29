@@ -61,7 +61,7 @@ To see your open merge requests and what reviewers have said about them:
 ```sh
 glab mr list --repo <namespace>/<project> --per-page 100 # open merge requests, with their branches
 glab mr view <number> --comments --repo <namespace>/<project> # the conversation under a merge request
-glab api "projects/:id/merge_requests?state=opened&author_username=<you>&per_page=100" --jq '.[] | {iid, source_branch, has_conflicts}' # which of your merge requests conflict with their base
+glab api "projects/:id/merge_requests?state=opened&author_username=<you>&per_page=100" | jq '.[] | {iid, source_branch, has_conflicts}' # which of your merge requests conflict with their base
 ```
 
 When a comment points at a file or line, read that spot in the diff
@@ -110,37 +110,94 @@ it. Submitting the review moves the state on, so a merge request you already
 answered stays out of the list until someone runs `/request_review @<you>` on
 it again.
 
+`glab api` has no `--jq` flag (that is `gh`); pipe its output through `jq`
+instead:
+
 ```sh
-glab api "projects/:id/merge_requests?state=opened&reviewer_username=<you>" --jq '.[] | {iid, title, author: .author.username, source_branch, target_branch}'
-glab api "projects/:id/merge_requests/<iid>/reviewers" --jq '.[] | select(.user.username == "<you>") | .state' # unreviewed means a review is owed
+glab api "projects/:id/merge_requests?state=opened&reviewer_username=<you>" | jq '.[] | {iid, title, author: .author.username, source_branch, target_branch}'
+glab api "projects/:id/merge_requests/<iid>/reviewers" | jq '.[] | select(.user.username == "<you>") | .state' # unreviewed means a review is owed
 glab mr view <iid> --comments     # the description and the conversation so far
 glab mr diff <iid>                # the whole diff against the target branch
 glab mr checkout <iid>            # to build it or run its tests
 ```
 
-Each finding goes in its own discussion, anchored to the line it is about
-where the diff allows it. The anchor needs the merge request's three SHAs
-(`glab api projects/:id/merge_requests/<iid> --jq .diff_refs`) and the new
-side's path and line. Only anchor lines the diff **adds**; a context line
-needs the old-side line number too and is rejected without it, so cite those
-in the summary as `path:line` instead:
+A review on GitLab is a set of **draft notes** that you publish all at once
+with the verdict, so the author is notified once and every finding lands as
+its own thread on the line it is about. A plain `glab mr note create` holding
+your findings is not a review: it is one unanchored comment, nobody can
+resolve the findings one by one, and it does not record a verdict. Nor is
+`glab mr note create --file … --line …`: each of those is published, and
+notifies the author, the moment you post it.
 
-```sh
-glab api --method POST "projects/:id/merge_requests/<iid>/discussions" \
-  -f body="<the finding>" \
-  -f "position[position_type]=text" \
-  -f "position[base_sha]=<base_sha>" -f "position[start_sha]=<start_sha>" -f "position[head_sha]=<head_sha>" \
-  -f "position[new_path]=src/lib.rs" -f "position[old_path]=src/lib.rs" -f "position[new_line]=42"
-```
+1. Clear out anything left over. Drafts are only visible to you and are all
+   published together, so a draft from an earlier attempt would go out with
+   this review. List yours and delete any you didn't just write:
 
-Then the summary, and the verdict as a note of its own — a quick action only
-takes effect when it is the whole note, and it is what moves your review
-state and notifies the author:
+   ```sh
+   glab api "projects/:id/merge_requests/<iid>/draft_notes" | jq '.[] | {id, note, path: .position.new_path, line: (.position.new_line // .position.old_line)}'
+   glab api --method DELETE "projects/:id/merge_requests/<iid>/draft_notes/<draft-id>"
+   ```
 
-```sh
-glab mr note create <iid> --message "<what the change does, what you checked, and the verdict>"
-glab mr note create <iid> --message "/submit_review requested_changes"   # or: /submit_review approve
-```
+2. Save the merge request's three diff SHAs; every anchor needs them:
+
+   ```sh
+   glab api "projects/:id/merge_requests/<iid>" | jq .diff_refs > refs.json   # base_sha, start_sha, head_sha
+   ```
+
+3. Draft one note per finding, anchored to its line. The anchor is a nested
+   `position` object, so build the body as JSON with `jq` and send it with
+   `--input` and an explicit JSON content type. `-f "position[new_line]=42"`
+   does **not** work: `glab` sends that name as a literal key, which GitLab
+   ignores, and you get an unanchored comment instead of a line comment.
+   Write each finding to a file first so its formatting survives:
+
+   ```sh
+   jq -n --slurpfile refs refs.json --rawfile note finding.md \
+     '{note: $note, position: ($refs[0] + {position_type: "text", old_path: "src/lib.rs", new_path: "src/lib.rs", new_line: 42})}' > draft.json
+   glab api --method POST "projects/:id/merge_requests/<iid>/draft_notes" \
+     --header "Content-Type: application/json" --input draft.json
+   ```
+
+   Which line numbers to give depends on the line in the diff
+   (`git diff <target>...<source>` shows them in each hunk's
+   `@@ -old,count +new,count @@` header):
+
+   - a line the diff **adds** (`+`): `new_line` only
+   - a line the diff **removes** (`-`): `old_line` only
+   - an unchanged context line shown in the hunk: **both** `old_line` and
+     `new_line`, which differ wherever lines were added or removed above it
+
+   `new_path` is the file as it is after the change; `old_path` is the same
+   unless the merge request renames it. Only lines inside a hunk can be
+   anchored. Check each response: it echoes the `position` back. If GitLab
+   rejects the anchor, or the `position` comes back without your path and
+   line, delete that draft and draft the finding again without `position`,
+   citing `path:line` at the top of the note. Never fold the findings into
+   one comment because one anchor failed.
+
+4. Draft the summary — what the change does, what you checked, and the
+   verdict — as one more note, without a `position`:
+
+   ```sh
+   jq -n --rawfile note summary.md '{note: $note}' > draft.json
+   glab api --method POST "projects/:id/merge_requests/<iid>/draft_notes" \
+     --header "Content-Type: application/json" --input draft.json
+   ```
+
+5. List your drafts again (the command in step 1) and check that every
+   finding is there with the path and line you meant.
+
+6. Submit the review. The verdict is a quick action, and a quick action only
+   takes effect when it is the whole note. It publishes every draft at once,
+   records the verdict, moves your review state, and notifies the author:
+
+   ```sh
+   glab mr note create <iid> --message "/submit_review requested_changes"   # or: /submit_review approve
+   ```
+
+   Afterwards, the draft list should be empty and your reviewer state should
+   no longer be `unreviewed`. If the drafts are still there, the review was not
+   submitted. Don't post the findings again any other way.
 
 Never push to, rebase, close, or merge the merge request you are reviewing,
 your own included; a review is comments and a verdict only. Once it is
