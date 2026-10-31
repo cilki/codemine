@@ -1,7 +1,7 @@
-//! Who the bot is on each forge, resolved from the forge's own "who am I"
+//! Who the bot is on the forge, resolved from the forge's own "who am I"
 //! endpoint instead of configured by hand: the account a token authenticates
-//! as already knows its own login and email, so turns on a forge commit as
-//! that account.
+//! as already knows its own login and email, so turns commit as that
+//! account.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -44,7 +44,9 @@ type Key = (ForgeKind, String, String);
 static CACHE: Mutex<BTreeMap<Key, Cached>> = Mutex::new(BTreeMap::new());
 
 fn lock() -> MutexGuard<'static, BTreeMap<Key, Cached>> {
-    CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The cache's answer for a key, if it still stands: a resolved identity, or
@@ -68,43 +70,41 @@ fn remember(key: Key, answer: Cached) {
     lock().insert(key, answer);
 }
 
-/// Fill each forge's author email — and Gitea's credential-line user — from
-/// its whoami endpoint, through the cache. Fails on the first forge that
-/// can't answer, naming it: a turn there would commit as nobody, so the
-/// caller holds turns like any other unrunnable configuration. The web UI's
-/// view of the same endpoint is [`health`], which keeps asking.
-pub fn resolve(forges: &mut [Forge]) -> Result<(), (ForgeKind, anyhow::Error)> {
-    for forge in forges.iter_mut() {
-        let key = (forge.kind, forge.url.clone(), forge.token.clone());
-        let identity = match cached(&key) {
-            Some(Ok(identity)) => identity,
-            Some(Err(why)) => return Err((forge.kind, anyhow!("{why}"))),
-            None => match whoami(forge) {
-                Ok(identity) => {
-                    tracing::info!(
-                        "{} commits as {} <{}>",
-                        forge.kind.name(),
-                        identity.login,
-                        identity.email
-                    );
-                    remember(key, Cached::Known(identity.clone()));
-                    identity
-                }
-                Err(err) => {
-                    let err = err.context(format!(
-                        "could not identify the {} account",
-                        forge.kind.name()
-                    ));
-                    remember(key, Cached::Failed(Instant::now(), format!("{err:#}")));
-                    return Err((forge.kind, err));
-                }
-            },
-        };
-        forge.email = identity.email.clone();
-        forge.login = identity.login.clone();
-        if forge.kind == ForgeKind::Gitea {
-            forge.user = identity.login.clone();
-        }
+/// Fill the forge's author email — and Gitea's credential-line user — from
+/// its whoami endpoint, through the cache. Fails when the forge can't
+/// answer: a turn there would commit as nobody, so the caller holds turns
+/// like any other unrunnable configuration. The web UI's view of the same
+/// endpoint is [`health`], which keeps asking.
+pub fn resolve(forge: &mut Forge) -> Result<()> {
+    let key = (forge.kind, forge.url.clone(), forge.token.clone());
+    let identity = match cached(&key) {
+        Some(Ok(identity)) => identity,
+        Some(Err(why)) => return Err(anyhow!("{why}")),
+        None => match whoami(forge) {
+            Ok(identity) => {
+                tracing::info!(
+                    "{} commits as {} <{}>",
+                    forge.kind.name(),
+                    identity.login,
+                    identity.email
+                );
+                remember(key, Cached::Known(identity.clone()));
+                identity
+            }
+            Err(err) => {
+                let err = err.context(format!(
+                    "could not identify the {} account",
+                    forge.kind.name()
+                ));
+                remember(key, Cached::Failed(Instant::now(), format!("{err:#}")));
+                return Err(err);
+            }
+        },
+    };
+    forge.email = identity.email.clone();
+    forge.login = identity.login.clone();
+    if forge.kind == ForgeKind::Gitea {
+        forge.user = identity.login.clone();
     }
     Ok(())
 }
@@ -134,13 +134,12 @@ pub enum Reach {
     /// The token works, but the account came back without a login or email
     /// to commit as.
     Incomplete,
-    /// Nothing to probe: the forge is switched off, or lacks what it needs.
-    Disabled,
+    /// Nothing to probe: the forge lacks what it needs.
     NoToken,
     NoUrl,
 }
 
-/// One forge's reading for the web UI.
+/// The forge's reading for the web UI.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct ForgeHealth {
     pub state: Reach,
@@ -178,29 +177,23 @@ struct Reading {
 static READINGS: Mutex<BTreeMap<Key, Reading>> = Mutex::new(BTreeMap::new());
 
 fn readings() -> MutexGuard<'static, BTreeMap<Key, Reading>> {
-    READINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    READINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Each forge's reachability for the web UI, keyed by forge slug. Never
-/// blocks: a stale or missing reading is refreshed on a thread of its own and
-/// the last one (or `Checking`) is handed back meanwhile. The caller is the
-/// event stream's tick, and a forge that never answers would otherwise stall
-/// it for the whole of Gitea's request timeout — or forever, for gh and glab,
-/// which have none.
-pub fn health(settings: &Settings) -> BTreeMap<String, ForgeHealth> {
-    ForgeKind::ALL
-        .into_iter()
-        .map(|kind| {
-            let stored = settings.forge(kind);
-            let health = match settings.runtime_forge(kind) {
-                Some(forge) => reading(forge),
-                None if !stored.enabled => ForgeHealth::bare(Reach::Disabled),
-                None if stored.token.is_empty() => ForgeHealth::bare(Reach::NoToken),
-                None => ForgeHealth::bare(Reach::NoUrl),
-            };
-            (kind.name().to_owned(), health)
-        })
-        .collect()
+/// The forge's reachability for the web UI. Never blocks: a stale or missing
+/// reading is refreshed on a thread of its own and the last one (or
+/// `Checking`) is handed back meanwhile. The caller is the event stream's
+/// tick, and a forge that never answers would otherwise stall it for the
+/// whole of Gitea's request timeout — or forever, for gh and glab, which
+/// have none.
+pub fn health(settings: &Settings) -> ForgeHealth {
+    match settings.runtime_forge() {
+        Some(forge) => reading(forge),
+        None if settings.forge.token.is_empty() => ForgeHealth::bare(Reach::NoToken),
+        None => ForgeHealth::bare(Reach::NoUrl),
+    }
 }
 
 /// The standing reading for a forge, sending a probe out when it is stale.
@@ -300,7 +293,9 @@ fn parse_identity(kind: ForgeKind, value: &serde_json::Value) -> Result<Identity
                 // noreply address is what its web editor commits as.
                 None => format!(
                     "{}+{login}@users.noreply.github.com",
-                    value["id"].as_u64().context("the user response has no id")?
+                    value["id"]
+                        .as_u64()
+                        .context("the user response has no id")?
                 ),
             };
             Ok(Identity { login, email })
@@ -320,7 +315,6 @@ fn parse_identity(kind: ForgeKind, value: &serde_json::Value) -> Result<Identity
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::BTreeSet;
 
     fn forge(kind: ForgeKind, user: &str, token: &str) -> Forge {
         Forge {
@@ -330,7 +324,7 @@ mod tests {
             login: String::new(),
             email: String::new(),
             url: "https://forge.example.com".into(),
-            enabled_repos: BTreeSet::new(),
+            repos: BTreeMap::new(),
         }
     }
 
@@ -363,7 +357,9 @@ mod tests {
         .unwrap();
         assert_eq!(private.email, "123+bot@users.noreply.github.com");
         // Without the id the noreply address can't be built.
-        assert!(parse_identity(ForgeKind::Github, &json!({"login": "bot", "email": null})).is_err());
+        assert!(
+            parse_identity(ForgeKind::Github, &json!({"login": "bot", "email": null})).is_err()
+        );
         assert!(parse_identity(ForgeKind::Github, &json!({"id": 123})).is_err());
     }
 
@@ -392,11 +388,9 @@ mod tests {
     fn resolve_fills_from_the_cache() {
         // Tokens are unique per test: the cache is one static shared across
         // the test binary's threads.
-        let mut forges = vec![
-            forge(ForgeKind::Gitea, "", "cache-test-gitea"),
-            forge(ForgeKind::Github, "x-access-token", "cache-test-github"),
-        ];
-        for f in &forges {
+        let mut gitea = forge(ForgeKind::Gitea, "", "cache-test-gitea");
+        let mut github = forge(ForgeKind::Github, "x-access-token", "cache-test-github");
+        for f in [&gitea, &github] {
             lock().insert(
                 (f.kind, f.url.clone(), f.token.clone()),
                 Cached::Known(Identity {
@@ -405,16 +399,17 @@ mod tests {
                 }),
             );
         }
-        resolve(&mut forges).unwrap();
+        resolve(&mut gitea).unwrap();
+        resolve(&mut github).unwrap();
         // Gitea's credential-line user is the resolved login; the other
         // forges keep their fixed pseudo-users. The login lands on every
         // forge either way.
-        assert_eq!(forges[0].user, "gitea-bot");
-        assert_eq!(forges[0].login, "gitea-bot");
-        assert_eq!(forges[0].email, "bot@gitea.example.com");
-        assert_eq!(forges[1].user, "x-access-token");
-        assert_eq!(forges[1].login, "github-bot");
-        assert_eq!(forges[1].email, "bot@github.example.com");
+        assert_eq!(gitea.user, "gitea-bot");
+        assert_eq!(gitea.login, "gitea-bot");
+        assert_eq!(gitea.email, "bot@gitea.example.com");
+        assert_eq!(github.user, "x-access-token");
+        assert_eq!(github.login, "github-bot");
+        assert_eq!(github.email, "bot@github.example.com");
     }
 
     /// The cache-miss path: `resolve` asks the forge, records the answer, and
@@ -425,13 +420,12 @@ mod tests {
     /// without asking again.
     #[test]
     fn a_fresh_lookup_records_its_answer() {
-        let mut forges = vec![forge(ForgeKind::Gitea, "", "fresh-lookup-test")];
+        let mut gitea = forge(ForgeKind::Gitea, "", "fresh-lookup-test");
         // Nothing listens on port 1, so whoami fails as fast as the request
         // can be refused.
-        forges[0].url = "http://127.0.0.1:1".into();
+        gitea.url = "http://127.0.0.1:1".into();
 
-        let (kind, err) = resolve(&mut forges).unwrap_err();
-        assert_eq!(kind, ForgeKind::Gitea);
+        let err = resolve(&mut gitea).unwrap_err();
         let first = format!("{err:#}");
         assert!(
             first.contains("could not identify the gitea account"),
@@ -440,7 +434,7 @@ mod tests {
 
         // Held, rather than re-asked: the same message comes back verbatim,
         // which it only can if the failing lookup made it to the cache.
-        let (_, err) = resolve(&mut forges).unwrap_err();
+        let err = resolve(&mut gitea).unwrap_err();
         assert_eq!(format!("{err:#}"), first);
     }
 
@@ -467,17 +461,13 @@ mod tests {
     }
 
     #[test]
-    fn forges_with_nothing_to_probe_say_why() {
+    fn a_forge_with_nothing_to_probe_says_why() {
         let mut settings = Settings::default();
-        settings.github.token = "unused".into();
-        settings.gitea.enabled = true;
-        settings.gitea.token = "unused".into();
-        settings.gitlab.enabled = true;
-        let health = health(&settings);
-        // Only enabled forges are probed, token or not.
-        assert_eq!(health["github"].state, Reach::Disabled);
-        assert_eq!(health["gitea"].state, Reach::NoUrl);
-        assert_eq!(health["gitlab"].state, Reach::NoToken);
+        settings.forge.kind = ForgeKind::Gitlab;
+        assert_eq!(health(&settings).state, Reach::NoToken);
+        settings.forge.kind = ForgeKind::Gitea;
+        settings.forge.token = "unused".into();
+        assert_eq!(health(&settings).state, Reach::NoUrl);
     }
 
     /// The first reading is `Checking`, handed back without waiting; the
@@ -485,14 +475,14 @@ mod tests {
     #[test]
     fn a_probe_lands_without_blocking_the_caller() {
         let mut settings = Settings::default();
-        settings.gitea.enabled = true;
-        settings.gitea.token = "health-probe-test".into();
+        settings.forge.kind = ForgeKind::Gitea;
+        settings.forge.token = "health-probe-test".into();
         // Nothing listens on port 1, so the probe fails fast.
-        settings.gitea.url = "http://127.0.0.1:1".into();
-        assert_eq!(health(&settings)["gitea"].state, Reach::Checking);
+        settings.forge.url = "http://127.0.0.1:1".into();
+        assert_eq!(health(&settings).state, Reach::Checking);
         let deadline = Instant::now() + Duration::from_secs(10);
         let landed = loop {
-            let gitea = health(&settings).remove("gitea").unwrap();
+            let gitea = health(&settings);
             if gitea.state != Reach::Checking || Instant::now() > deadline {
                 break gitea;
             }
@@ -504,13 +494,12 @@ mod tests {
 
     #[test]
     fn a_recent_failure_is_held_without_asking_again() {
-        let mut forges = vec![forge(ForgeKind::Github, "x-access-token", "failed-test")];
+        let mut github = forge(ForgeKind::Github, "x-access-token", "failed-test");
         lock().insert(
-            (ForgeKind::Github, forges[0].url.clone(), "failed-test".into()),
+            (ForgeKind::Github, github.url.clone(), "failed-test".into()),
             Cached::Failed(Instant::now(), "the token is bad".into()),
         );
-        let (kind, err) = resolve(&mut forges).unwrap_err();
-        assert_eq!(kind, ForgeKind::Github);
+        let err = resolve(&mut github).unwrap_err();
         assert_eq!(format!("{err:#}"), "the token is bad");
     }
 }

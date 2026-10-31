@@ -2,7 +2,7 @@
 //! the workspace root. The main loop takes a snapshot before each turn, so
 //! changes apply at the next turn boundary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -20,13 +20,10 @@ pub struct Settings {
     /// the section stopped being Claude-specific.
     #[serde(alias = "claude")]
     pub proxy: ProxySettings,
-    pub gitea: ForgeSettings,
-    pub github: ForgeSettings,
-    pub gitlab: ForgeSettings,
+    /// The one forge the runner sweeps.
+    pub forge: ForgeSettings,
     /// Model to run turns with, as provider/model; empty means unconfigured.
     pub model: String,
-    /// The task pool the runner draws from each turn.
-    pub tasks: Vec<String>,
     /// Completed (not skipped) tasks allowed per hour; None is unlimited.
     /// Fractional rates are the point of the unit: 0.5 is one task every
     /// two hours. The runner spends them from a bucket, so a whole hour's
@@ -42,11 +39,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             proxy: ProxySettings::default(),
-            gitea: ForgeSettings::default(),
-            github: ForgeSettings::default(),
-            gitlab: ForgeSettings::default(),
+            forge: ForgeSettings::default(),
             model: String::new(),
-            tasks: crate::prompts::default_tasks(),
             hourly_limit: None,
             turn_timeout_secs: 21600,
             schedule: Schedule::default(),
@@ -85,39 +79,73 @@ impl Default for ProxySettings {
     }
 }
 
+/// The forge section: which forge, how to reach it, and what to sweep there.
+/// There is no enable switch — the dropdown picks the forge, and a forge
+/// without a token simply isn't active yet.
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct ForgeSettings {
-    pub enabled: bool,
+    pub kind: ForgeKind,
     /// Personal access token; empty means no token stored. Never serialized
     /// to the UI — see [`Settings::redacted`].
     pub token: String,
     /// Base URL; empty means the forge's default (github.com / gitlab.com).
     pub url: String,
-    /// Repositories included in sweeping. Everything starts disabled — a
-    /// fresh login sweeps nothing, and new repositories stay out of the pool
-    /// until they're enabled by hand.
-    pub enabled_repos: BTreeSet<String>,
+    /// The repositories the picker has touched, by full name. Everything
+    /// starts disabled — a fresh login sweeps nothing, and new repositories
+    /// stay out of the pool until they're enabled by hand. A disabled
+    /// repository keeps its task picks, so turning it back on restores them.
+    pub repos: BTreeMap<String, RepoSettings>,
+}
+
+/// One repository's place in the sweep: whether it is in, and which tasks
+/// are drawn on it.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct RepoSettings {
+    pub enabled: bool,
+    pub tasks: BTreeSet<String>,
 }
 
 impl ForgeSettings {
-    /// Whether the forge takes part in sweeps: enabled with a token, plus a
-    /// URL for Gitea, which has no default instance.
-    pub fn active(&self, kind: ForgeKind) -> bool {
-        self.enabled
-            && !self.token.is_empty()
-            && (kind != ForgeKind::Gitea || !self.url.is_empty())
+    /// Whether the forge takes part in sweeps: it has a token, plus a URL
+    /// for Gitea, which has no default instance.
+    pub fn active(&self) -> bool {
+        !self.token.is_empty() && (self.kind != ForgeKind::Gitea || !self.url.is_empty())
     }
 
-    fn url(&self, kind: ForgeKind) -> String {
+    fn url(&self) -> String {
         if !self.url.is_empty() {
             return self.url.clone();
         }
-        match kind {
+        match self.kind {
             ForgeKind::Gitea => String::new(),
             ForgeKind::Github => "https://github.com".into(),
             ForgeKind::Gitlab => "https://gitlab.com".into(),
         }
+    }
+
+    /// The enabled repositories, each with the tasks on it that the sweep
+    /// command still defines. The turn passes the slug to the command and
+    /// the command looks up the section named by it, so a slug with no
+    /// section — one an older sweep command defined — reaches the agent as
+    /// a bare word with nothing to do; dropped here rather than drawn, while
+    /// the stored pick stays so a hand-edited config.json isn't rewritten
+    /// behind the user's back.
+    fn runnable_repos(&self) -> BTreeMap<String, BTreeSet<String>> {
+        self.repos
+            .iter()
+            .filter(|(_, repo)| repo.enabled)
+            .map(|(name, repo)| {
+                let tasks = repo
+                    .tasks
+                    .iter()
+                    .filter(|task| crate::prompts::defines(task))
+                    .cloned()
+                    .collect();
+                (name.clone(), tasks)
+            })
+            .collect()
     }
 }
 
@@ -179,33 +207,17 @@ impl Problem {
 }
 
 impl Settings {
-    pub fn forge(&self, kind: ForgeKind) -> &ForgeSettings {
-        match kind {
-            ForgeKind::Gitea => &self.gitea,
-            ForgeKind::Github => &self.github,
-            ForgeKind::Gitlab => &self.gitlab,
-        }
-    }
-
-    fn forge_mut(&mut self, kind: ForgeKind) -> &mut ForgeSettings {
-        match kind {
-            ForgeKind::Gitea => &mut self.gitea,
-            ForgeKind::Github => &mut self.github,
-            ForgeKind::Gitlab => &mut self.gitlab,
-        }
-    }
-
-    /// The runtime forge for an active forge kind, with the fixed pseudo-user
-    /// and default URL filled in; None when the forge is not active.
-    pub fn runtime_forge(&self, kind: ForgeKind) -> Option<Forge> {
-        let forge = self.forge(kind);
-        if !forge.active(kind) {
+    /// The runtime forge, with the fixed pseudo-user and default URL filled
+    /// in; None while the forge is not active.
+    pub fn runtime_forge(&self) -> Option<Forge> {
+        let forge = &self.forge;
+        if !forge.active() {
             return None;
         }
         Some(Forge {
-            kind,
+            kind: forge.kind,
             token: forge.token.clone(),
-            user: match kind {
+            user: match forge.kind {
                 // Filled with the account login by `identity::resolve`
                 // before the credential line is written.
                 ForgeKind::Gitea => String::new(),
@@ -214,8 +226,8 @@ impl Settings {
             },
             login: String::new(),
             email: String::new(),
-            url: forge.url(kind),
-            enabled_repos: forge.enabled_repos.clone(),
+            url: forge.url(),
+            repos: forge.runnable_repos(),
         })
     }
 
@@ -223,66 +235,41 @@ impl Settings {
     /// Empty means the settings are runnable.
     pub fn problems(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
-        for kind in ForgeKind::ALL {
-            let forge = self.forge(kind);
-            if !forge.enabled {
-                continue;
-            }
-            let name = kind.name();
-            if forge.token.is_empty() {
+        let forge = &self.forge;
+        let name = forge.kind.name();
+        if forge.token.is_empty() {
+            problems.push(Problem::new("f-token", format!("{name} has no token")));
+        }
+        if forge.kind == ForgeKind::Gitea && forge.url.is_empty() {
+            problems.push(Problem::new("f-url", "gitea needs a URL"));
+        }
+        if forge.active() {
+            let repos = forge.runnable_repos();
+            if repos.is_empty() {
+                // Every repository starts disabled, so this is where a fresh
+                // install sits once the forge is set up. Without it the
+                // runner looked healthy — "sleeping" between empty draws —
+                // while relisting the forge every minute to rediscover that
+                // it has nothing to sweep.
                 problems.push(Problem::new(
-                    &format!("f-{name}-token"),
-                    format!("{name} is enabled but has no token"),
+                    "repos",
+                    "no repositories are enabled for sweeping",
+                ));
+            } else if repos.values().all(BTreeSet::is_empty) {
+                // Reachable from stored picks alone: a task the sweep command
+                // used to define stays in config.json after it is dropped
+                // from the command. Without this the runner drew it anyway
+                // and spent a turn on a task with no instructions.
+                problems.push(Problem::new(
+                    "repos",
+                    "no enabled repository has a task the sweep command defines",
                 ));
             }
-            if kind == ForgeKind::Gitea && forge.url.is_empty() {
-                problems.push(Problem::new("f-gitea-url", "gitea needs a URL"));
-            }
-        }
-        let active: Vec<&ForgeSettings> = ForgeKind::ALL
-            .iter()
-            .filter(|&&kind| self.forge(kind).active(kind))
-            .map(|&kind| self.forge(kind))
-            .collect();
-        if active.is_empty() {
-            problems.push(Problem::new("forges", "no forge is enabled with a token"));
-        } else if active.iter().all(|forge| forge.enabled_repos.is_empty()) {
-            // Every repository starts disabled, so this is where a fresh
-            // install sits once the forge is set up. Without it the runner
-            // looked healthy — "sleeping" between empty draws — while relisting
-            // the forge every minute to rediscover that it has nothing to
-            // sweep.
-            problems.push(Problem::new(
-                "forges",
-                "no repositories are enabled for sweeping",
-            ));
         }
         if self.model.is_empty() {
             problems.push(Problem::new("s-model", "model is not set"));
         }
-        if self.runnable_tasks().is_empty() {
-            // Reachable from a stored pool alone: a task the sweep command
-            // used to define stays in config.json after it is dropped from
-            // the command. Without this the runner drew it anyway and spent a
-            // turn on a task with no instructions.
-            problems.push(Problem::new(
-                "s-tasks",
-                "no task in the pool is one the sweep command defines",
-            ));
-        }
         problems
-    }
-
-    /// The pool slugs the sweep command still defines, in pool order. The
-    /// turn passes the slug to the command and the command looks up the
-    /// section named by it, so a slug with no section reaches the agent as a
-    /// bare word with nothing to do — dropped here rather than drawn.
-    fn runnable_tasks(&self) -> Vec<String> {
-        self.tasks
-            .iter()
-            .filter(|task| crate::prompts::defines(task))
-            .cloned()
-            .collect()
     }
 
     /// The runnable snapshot for a turn; None while `problems` is nonempty.
@@ -291,12 +278,10 @@ impl Settings {
             return None;
         }
         Some(Config {
-            forges: ForgeKind::ALL
-                .iter()
-                .filter_map(|&kind| self.runtime_forge(kind))
-                .collect(),
+            forge: self
+                .runtime_forge()
+                .expect("a forge without problems is active"),
             model: self.model.clone(),
-            tasks: self.runnable_tasks(),
             hourly_limit: self.hourly_limit,
             // Commits are attributed to the model that authored them; the
             // email comes from each forge's account via identity::resolve.
@@ -311,9 +296,7 @@ impl Settings {
     /// `*_set` flag so secrets are write-only.
     pub fn redacted(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(self).expect("settings serialize to JSON");
-        for kind in ForgeKind::ALL {
-            redact(&mut value[kind.name()], "token");
-        }
+        redact(&mut value["forge"], "token");
         for key in ["api_key", "management_key"] {
             redact(&mut value["proxy"], key);
         }
@@ -322,15 +305,19 @@ impl Settings {
 
     /// Replace these settings with `incoming` from the UI. An empty incoming
     /// secret keeps the stored one (the UI never sees secrets back), a
-    /// nonempty one overwrites it.
+    /// nonempty one overwrites it — unless the forge itself changed, when
+    /// the stored token belongs to the old forge and would only ever be
+    /// rejected by the new one.
     pub fn apply_update(&mut self, mut incoming: Settings) -> Result<()> {
         incoming.model = incoming.model.trim().to_owned();
-        for kind in ForgeKind::ALL {
-            let stored = &self.forge(kind).token;
-            let forge = incoming.forge_mut(kind);
-            forge.url = normalize_url(&forge.url);
-            keep_stored(&mut forge.token, stored);
-        }
+        let forge = &mut incoming.forge;
+        forge.url = normalize_url(&forge.url);
+        let stored = if forge.kind == self.forge.kind {
+            self.forge.token.as_str()
+        } else {
+            ""
+        };
+        keep_stored(&mut forge.token, stored);
         let proxy = &mut incoming.proxy;
         proxy.base_url = normalize_url(&proxy.base_url);
         if proxy.base_url.is_empty() {
@@ -354,17 +341,15 @@ impl Settings {
         if self.turn_timeout_secs == 0 {
             bail!("turn timeout must be positive");
         }
-        if self.tasks.iter().all(|task| task.trim().is_empty()) {
-            bail!("task pool must not be empty");
-        }
         self.schedule.validate()?;
-        for kind in ForgeKind::ALL {
-            // Empty is how a forge asks for its default instance; Gitea has
-            // none, which `problems` reports instead.
-            let url = &self.forge(kind).url;
-            if !url.is_empty() && !is_http_url(url) {
-                bail!("{} URL must start with http:// or https://", kind.name());
-            }
+        // Empty is how a forge asks for its default instance; Gitea has
+        // none, which `problems` reports instead.
+        let url = &self.forge.url;
+        if !url.is_empty() && !is_http_url(url) {
+            bail!(
+                "{} URL must start with http:// or https://",
+                self.forge.kind.name()
+            );
         }
         if !is_http_url(&self.proxy.base_url) {
             bail!("the CLIProxyAPI URL must start with http:// or https://");
@@ -462,16 +447,23 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn repo(enabled: bool, tasks: &[&str]) -> RepoSettings {
+        RepoSettings {
+            enabled,
+            tasks: tasks.iter().map(|task| (*task).to_owned()).collect(),
+        }
+    }
+
     fn configured() -> Settings {
         Settings {
             proxy: ProxySettings {
                 api_key: "proxy-key".into(),
                 ..Default::default()
             },
-            github: ForgeSettings {
-                enabled: true,
+            forge: ForgeSettings {
+                kind: ForgeKind::Github,
                 token: "tok".into(),
-                enabled_repos: ["owner/repo".to_owned()].into(),
+                repos: [("owner/repo".to_owned(), repo(true, &["docs", "review"]))].into(),
                 ..Default::default()
             },
             model: "anthropic/claude".into(),
@@ -493,8 +485,10 @@ mod tests {
     fn defaults_are_unconfigured() {
         let settings = Settings::default();
         assert_eq!(settings.turn_timeout_secs, 21600);
-        assert!(!settings.tasks.is_empty());
-        assert!(!settings.problems().is_empty());
+        assert_eq!(settings.forge.kind, ForgeKind::Github);
+        assert!(settings.forge.repos.is_empty());
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert_eq!(fields, ["f-token", "s-model"]);
         assert!(settings.to_config(&cli()).is_none());
     }
 
@@ -518,37 +512,68 @@ mod tests {
         let settings = configured();
         assert!(settings.problems().is_empty());
         let config = settings.to_config(&cli()).unwrap();
-        assert_eq!(config.forges.len(), 1);
-        assert_eq!(config.forges[0].url, "https://github.com");
-        assert_eq!(config.forges[0].user, "x-access-token");
+        assert_eq!(config.forge.kind, ForgeKind::Github);
+        assert_eq!(config.forge.url, "https://github.com");
+        assert_eq!(config.forge.user, "x-access-token");
         // The author email is resolved from the forge account before any
         // turn runs, never from the settings.
-        assert_eq!(config.forges[0].email, "");
+        assert_eq!(config.forge.email, "");
+        assert!(config.forge.runs("docs", "owner/repo"));
+        assert!(!config.forge.runs("bump", "owner/repo"));
         // Commits are authored as the model, prettified.
         assert_eq!(config.author_name, "Claude");
         assert_eq!(config.workspace, PathBuf::from("/tmp/ws"));
     }
 
-    /// A stored pool outlives the sweep command that defined it: dropping a
+    /// A stored pick outlives the sweep command that defined it: dropping a
     /// task from the command leaves its slug in config.json, and a turn drawn
     /// on a slug with no section reaches the agent with no instructions. The
     /// snapshot the runner draws from carries only slugs the command still
-    /// defines, and a pool with nothing left says so on the field that fixes
+    /// defines, and a sweep with nothing left says so on the field that fixes
     /// it instead of running empty turns.
     #[test]
-    fn a_pool_slug_the_sweep_command_dropped_is_not_drawn() {
+    fn a_task_slug_the_sweep_command_dropped_is_not_drawn() {
         let mut settings = configured();
-        settings.tasks = vec!["lint".into(), "docs".into()];
+        settings
+            .forge
+            .repos
+            .insert("owner/repo".into(), repo(true, &["lint", "docs"]));
         assert!(settings.problems().is_empty());
-        assert_eq!(settings.to_config(&cli()).unwrap().tasks, ["docs"]);
-        // The stored pool is left alone, so a hand-edited config.json isn't
+        let config = settings.to_config(&cli()).unwrap();
+        assert_eq!(config.forge.repos["owner/repo"], ["docs".to_owned()].into());
+        // The stored picks are left alone, so a hand-edited config.json isn't
         // rewritten behind the user's back.
-        assert_eq!(settings.tasks, ["lint", "docs"]);
+        assert_eq!(
+            settings.forge.repos["owner/repo"],
+            repo(true, &["lint", "docs"])
+        );
 
-        settings.tasks = vec!["lint".into()];
+        settings
+            .forge
+            .repos
+            .insert("owner/repo".into(), repo(true, &["lint"]));
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert_eq!(fields, ["s-tasks"]);
+        assert_eq!(fields, ["repos"]);
         assert!(settings.to_config(&cli()).is_none());
+    }
+
+    /// A disabled repository is out of the sweep whatever tasks it has
+    /// picked, and the picks survive so turning it back on restores them.
+    #[test]
+    fn a_disabled_repository_keeps_its_picks_but_is_not_swept() {
+        let mut settings = configured();
+        settings
+            .forge
+            .repos
+            .insert("owner/other".into(), repo(false, &["docs"]));
+        let config = settings.to_config(&cli()).unwrap();
+        assert!(!config.forge.repos.contains_key("owner/other"));
+        assert!(!config.forge.runs("docs", "owner/other"));
+
+        settings.forge.repos.get_mut("owner/repo").unwrap().enabled = false;
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert_eq!(fields, ["repos"]);
+        assert_eq!(settings.forge.repos["owner/repo"].tasks.len(), 2);
     }
 
     #[test]
@@ -612,13 +637,19 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_enabled_forge_is_a_problem() {
+    fn gitea_without_a_url_is_a_problem() {
         let mut settings = configured();
-        settings.gitea.enabled = true;
-        settings.gitea.token = "tok".into();
+        settings.forge.kind = ForgeKind::Gitea;
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert!(fields.iter().any(|f| f == "f-gitea-url"), "{fields:?}");
+        assert_eq!(fields, ["f-url"]);
         assert!(settings.to_config(&cli()).is_none());
+
+        settings.forge.url = "https://git.example.com".into();
+        assert!(settings.problems().is_empty());
+        let config = settings.to_config(&cli()).unwrap();
+        assert_eq!(config.forge.url, "https://git.example.com");
+        // Gitea's credential user is the login, read off the forge later.
+        assert_eq!(config.forge.user, "");
     }
 
     #[test]
@@ -626,42 +657,37 @@ mod tests {
         // Repositories start disabled, so a forge that is otherwise fully
         // set up still cannot sweep anything.
         let mut settings = configured();
-        settings.github.enabled_repos.clear();
+        settings.forge.repos.clear();
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert_eq!(fields, ["forges"], "{fields:?}");
+        assert_eq!(fields, ["repos"], "{fields:?}");
         assert!(settings.to_config(&cli()).is_none());
 
-        // One enabled repository anywhere is enough; the other forges are
-        // allowed to sit empty.
-        settings.gitea = ForgeSettings {
-            enabled: true,
-            token: "tok".into(),
-            url: "https://git.example.com".into(),
-            enabled_repos: ["owner/repo".to_owned()].into(),
-        };
-        assert!(settings.problems().is_empty());
+        // The problem is the forge's, not the repositories', while there is
+        // no token: nothing can be listed to enable yet.
+        settings.forge.token.clear();
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert_eq!(fields, ["f-token"], "{fields:?}");
     }
 
     /// Every URL the settings hold is stored the same way, so a caller can
-    /// append a path without having to know whose URL it has. The forge URLs
+    /// append a path without having to know whose URL it has. The forge URL
     /// used to be normalized by one copy of that rule and the proxy's by
     /// another, and neither copy was covered here.
     #[test]
     fn every_url_is_stored_without_its_trailing_slash() {
         let mut settings = configured();
         let mut incoming = configured();
-        incoming.gitea.url = "  https://git.example.com/  ".into();
-        incoming.github.url = "https://github.example.com//".into();
+        incoming.forge.url = "  https://github.example.com//  ".into();
         incoming.proxy.base_url = " http://box:9000/ ".into();
         settings.apply_update(incoming).unwrap();
-        assert_eq!(settings.gitea.url, "https://git.example.com");
-        assert_eq!(settings.github.url, "https://github.example.com");
+        assert_eq!(settings.forge.url, "https://github.example.com");
         assert_eq!(settings.proxy.base_url, "http://box:9000");
 
-        // The scheme is required of all of them too, and the message names
-        // which one is wrong.
+        // The scheme is required of both too, and the message names which
+        // one is wrong.
         let mut bad = configured();
-        bad.gitlab.url = "gitlab.example.com".into();
+        bad.forge.kind = ForgeKind::Gitlab;
+        bad.forge.url = "gitlab.example.com".into();
         let err = settings.apply_update(bad).unwrap_err();
         assert!(err.to_string().contains("gitlab"), "{err}");
     }
@@ -669,27 +695,58 @@ mod tests {
     #[test]
     fn redaction_strips_tokens() {
         let value = configured().redacted();
-        for forge in ["gitea", "github", "gitlab"] {
-            assert!(value[forge].get("token").is_none(), "{forge} leaks token");
-        }
-        assert_eq!(value["github"]["token_set"], true);
-        assert_eq!(value["gitea"]["token_set"], false);
+        assert!(value["forge"].get("token").is_none(), "leaks token");
+        assert_eq!(value["forge"]["token_set"], true);
+        assert_eq!(value["forge"]["kind"], "github");
+        assert_eq!(Settings::default().redacted()["forge"]["token_set"], false);
     }
 
     #[test]
     fn empty_incoming_token_keeps_stored_one() {
         let mut settings = configured();
         let mut incoming = configured();
-        incoming.github.token = String::new();
+        incoming.forge.token = String::new();
         incoming.model = "anthropic/other".into();
         settings.apply_update(incoming).unwrap();
-        assert_eq!(settings.github.token, "tok");
+        assert_eq!(settings.forge.token, "tok");
         assert_eq!(settings.model, "anthropic/other");
 
         let mut overwrite = configured();
-        overwrite.github.token = " newtok ".into();
+        overwrite.forge.token = " newtok ".into();
         settings.apply_update(overwrite).unwrap();
-        assert_eq!(settings.github.token, "newtok");
+        assert_eq!(settings.forge.token, "newtok");
+    }
+
+    /// Switching forge is a clean slate: the stored token was issued by the
+    /// old forge, so keeping it behind an empty field would only have the
+    /// new forge reject it — and the health dot would say "token rejected"
+    /// about a token the page shows as set.
+    #[test]
+    fn switching_forge_drops_the_stored_token() {
+        let mut settings = configured();
+        let mut incoming = configured();
+        incoming.forge.kind = ForgeKind::Gitlab;
+        incoming.forge.token = String::new();
+        incoming.forge.repos.clear();
+        settings.apply_update(incoming).unwrap();
+        assert_eq!(settings.forge.kind, ForgeKind::Gitlab);
+        assert_eq!(settings.forge.token, "");
+        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
+        assert_eq!(fields, ["f-token"]);
+    }
+
+    #[test]
+    fn repositories_round_trip_through_json_with_their_tasks() {
+        let settings = configured();
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["forge"]["kind"], "github");
+        assert_eq!(value["forge"]["repos"]["owner/repo"]["enabled"], true);
+        assert_eq!(
+            value["forge"]["repos"]["owner/repo"]["tasks"],
+            serde_json::json!(["docs", "review"])
+        );
+        let back: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(back.forge.repos, settings.forge.repos);
     }
 
     #[test]
@@ -702,10 +759,7 @@ mod tests {
         bad.turn_timeout_secs = 0;
         assert!(settings.apply_update(bad).is_err());
         let mut bad = configured();
-        bad.tasks = vec![];
-        assert!(settings.apply_update(bad).is_err());
-        let mut bad = configured();
-        bad.github.url = "github.example.com".into();
+        bad.forge.url = "github.example.com".into();
         assert!(settings.apply_update(bad).is_err());
         let mut bad = configured();
         bad.schedule.enabled = true;
@@ -749,7 +803,8 @@ mod tests {
         let reloaded = SettingsStore::load(path.clone()).unwrap();
         let (settings, generation) = reloaded.snapshot();
         assert_eq!(generation, 0);
-        assert_eq!(settings.github.token, "tok");
+        assert_eq!(settings.forge.token, "tok");
+        assert_eq!(settings.forge.repos, configured().forge.repos);
         assert_eq!(settings.model, "anthropic/claude");
 
         std::fs::write(&path, "not json").unwrap();

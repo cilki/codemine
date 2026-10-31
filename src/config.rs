@@ -1,10 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ForgeKind {
@@ -16,11 +17,10 @@ pub enum ForgeKind {
 impl ForgeKind {
     /// Every forge the runner knows, in the order the UI lists them.
     ///
-    /// The one place the set is written down. The settings validate each of
-    /// these and build the runtime forges from them, the activity watcher
-    /// polls each feed, the web UI's health cards read each, and
-    /// `workspace::clear_clones` wipes the clones under each. All four used
-    /// to spell the three kinds out for themselves — `clear_clones` as bare
+    /// The one place the set is written down. The settings offer each of
+    /// these in the forge dropdown, `from_slug` reads a stored one back, and
+    /// `workspace::clear_clones` wipes the clones under each. They used to
+    /// spell the three kinds out for themselves — `clear_clones` as bare
     /// slug strings that had to be kept in step with `name` by hand, where
     /// a forge missing from its copy would quietly keep its clones across
     /// every restart.
@@ -40,6 +40,30 @@ impl ForgeKind {
     /// what a forge is called.
     pub fn from_slug(slug: &str) -> Option<Self> {
         ForgeKind::ALL.into_iter().find(|kind| kind.name() == slug)
+    }
+}
+
+/// The kind is stored in config.json as its slug — the same word the web UI
+/// puts in its dropdown and the sweep prompt names the forge by.
+impl Serialize for ForgeKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for ForgeKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let slug = String::deserialize(deserializer)?;
+        ForgeKind::from_slug(&slug)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown forge: {slug}")))
+    }
+}
+
+/// GitHub needs no URL and is the forge most tokens are for, so a fresh
+/// install's dropdown starts there.
+impl Default for ForgeKind {
+    fn default() -> Self {
+        ForgeKind::Github
     }
 }
 
@@ -143,7 +167,7 @@ fn parse_models(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// One code forge the bot sweeps.
+/// The code forge the bot sweeps.
 pub struct Forge {
     pub kind: ForgeKind,
     pub token: String,
@@ -161,13 +185,29 @@ pub struct Forge {
     /// endpoint, which the main loop does before any turn runs.
     pub email: String,
     pub url: String,
-    /// Repositories included in sweeping; everything else the account can
-    /// reach is left alone, so a fresh login starts with nothing swept until
-    /// repositories are enabled by hand.
-    pub enabled_repos: BTreeSet<String>,
+    /// The repositories included in sweeping, each with the tasks it is
+    /// swept for; everything else the account can reach is left alone, so a
+    /// fresh login starts with nothing swept until repositories are enabled
+    /// by hand. Only tasks the sweep command defines are here — the settings
+    /// drop the rest on the way in — so a drawn task always has
+    /// instructions.
+    pub repos: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Forge {
+    /// Whether `task` is on for `repo`; a repository that isn't enabled has
+    /// nothing on.
+    pub fn runs(&self, task: &str, repo: &str) -> bool {
+        self.repos
+            .get(repo)
+            .is_some_and(|tasks| tasks.contains(task))
+    }
+
+    /// Whether any enabled repository has `task` on.
+    pub fn runs_anywhere(&self, task: &str) -> bool {
+        self.repos.values().any(|tasks| tasks.contains(task))
+    }
+
     /// Environment for child processes that talk to this forge: `gh` and
     /// `glab` (run both directly and inside the agent session) authenticate
     /// from these variables. Gitea needs none; `tea` reads its login file.
@@ -202,11 +242,8 @@ impl Forge {
 /// A runnable snapshot of the settings, rebuilt from the store before each
 /// turn so UI changes apply at the next turn boundary.
 pub struct Config {
-    pub forges: Vec<Forge>,
+    pub forge: Forge,
     pub model: String,
-    /// The task pool the runner draws from each turn; the slugs name the task
-    /// sections in the sweep command template.
-    pub tasks: Vec<String>,
     /// Completed (not skipped) tasks allowed per hour; None is unlimited.
     /// Spent from a bucket holding an hour's worth, so the rate can be
     /// fractional: 0.5 is one turn every two hours.
@@ -361,16 +398,22 @@ mod tests {
     }
 
     /// `ALL` is the one place the set of forges is written down — the
-    /// settings validate each of these, the watcher polls each feed, and
-    /// `workspace::clear_clones` wipes the clones under each — and
-    /// `from_slug` reads back off it, so a kind left out of the list is a
-    /// forge the web UI could never name back to the runner.
+    /// settings offer each in the dropdown and `workspace::clear_clones`
+    /// wipes the clones under each — and `from_slug` reads back off it, so a
+    /// kind left out of the list is a forge the web UI could never name back
+    /// to the runner. The JSON form is the same slug, so config.json and the
+    /// dropdown agree on the word.
     #[test]
     fn every_forge_kind_round_trips_through_its_slug() {
         for kind in ForgeKind::ALL {
             let slug = kind.name();
             assert_eq!(ForgeKind::from_slug(slug), Some(kind), "{slug}");
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{slug}\""));
+            let back: ForgeKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
         }
+        assert!(serde_json::from_str::<ForgeKind>("\"bitbucket\"").is_err());
         // No duplicates, so a slug names exactly one kind.
         let slugs: BTreeSet<&str> = ForgeKind::ALL.iter().map(|kind| kind.name()).collect();
         assert_eq!(slugs.len(), ForgeKind::ALL.len());
@@ -402,7 +445,7 @@ mod tests {
             login: String::new(),
             email: String::new(),
             url: url.into(),
-            enabled_repos: BTreeSet::new(),
+            repos: BTreeMap::new(),
         };
         assert!(
             forge(ForgeKind::Gitea, "https://git.example.com")

@@ -15,38 +15,42 @@ use crate::config::{Forge, ForgeKind};
 /// is asked to review, fit well inside one page.
 const PR_LIMIT: usize = 20;
 
-/// Draw a (task, forge, repo) triple worth an agent turn. The gated tasks are
-/// probed first — every enabled one against every repository, in a shuffled
-/// order — and the first pair with work wins, so responsive work (a
-/// conflicting PR, a review comment, a review request) is never waiting on a
-/// lucky draw. Only once nothing is pending do the rest get their turn, as
-/// one shuffled pass over every (task, repository) pair: `check` waves most
-/// of them straight through, so this is the uniform draw it used to be, but
-/// a pair the skip cache has already answered for is passed over instead of
-/// drawn. The cache applies to the gated pass too — every gated task is
-/// probed out of the same state its memory is keyed on — so a gated task can
-/// no longer monopolize the draw on a precondition that stays true. None
-/// when nothing at all is worth a turn.
+/// Draw a (task, repo) pair worth an agent turn. The pairs are every
+/// repository in `pool` with every task it has on (`Forge::repos`). The gated
+/// tasks are probed first, in a shuffled order, and the first pair with work
+/// wins, so responsive work (a conflicting PR, a review comment, a review
+/// request) is never waiting on a lucky draw. Only once nothing is pending do
+/// the rest get their turn, as one shuffled pass over every remaining pair:
+/// `check` waves most of them straight through, so this is the uniform draw
+/// it used to be, but a pair the skip cache has already answered for is
+/// passed over instead of drawn. The cache applies to the gated pass too —
+/// every gated task is probed out of the same state its memory is keyed on —
+/// so a gated task can no longer monopolize the draw on a precondition that
+/// stays true. None when nothing at all is worth a turn.
 pub fn draw<'a>(
-    tasks: &'a [String],
-    pool: &'a [(&'a Forge, String)],
-    check: impl Fn(&str, &Forge, &str) -> bool,
-) -> Option<(&'a str, &'a Forge, &'a str)> {
+    forge: &'a Forge,
+    pool: &'a [String],
+    check: impl Fn(&str, &str) -> bool,
+) -> Option<(&'a str, &'a str)> {
     let candidates = |want_gated: bool| {
-        let mut candidates: Vec<(&'a str, &'a Forge, &'a str)> = tasks
+        let mut candidates: Vec<(&'a str, &'a str)> = pool
             .iter()
-            .filter(|task| gated(task) == want_gated)
-            .flat_map(|task| {
-                pool.iter()
-                    .map(move |(forge, repo)| (task.as_str(), *forge, repo.as_str()))
+            .flat_map(|repo| {
+                forge
+                    .repos
+                    .get(repo)
+                    .into_iter()
+                    .flatten()
+                    .filter(|task| gated(task) == want_gated)
+                    .map(move |task| (task.as_str(), repo.as_str()))
             })
             .collect();
         fastrand::shuffle(&mut candidates);
         candidates
     };
-    for (task, forge, repo) in candidates(true).into_iter().chain(candidates(false)) {
-        if check(task, forge, repo) {
-            return Some((task, forge, repo));
+    for (task, repo) in candidates(true).into_iter().chain(candidates(false)) {
+        if check(task, repo) {
+            return Some((task, repo));
         }
         // A gated miss is worth a line of its own: there are few of them and
         // each cost a forge round trip. The ungated pass can cover every task
@@ -311,7 +315,7 @@ fn pr_key(pr: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use serde_json::json;
 
@@ -467,7 +471,7 @@ mod tests {
             login: String::new(),
             email: String::new(),
             url: "https://github.com".into(),
-            enabled_repos: BTreeSet::new(),
+            repos: BTreeMap::new(),
         }
     }
 
@@ -483,13 +487,26 @@ mod tests {
         }
     }
 
+    /// A forge with the same tasks on every one of `repos`, and the pool
+    /// listing all of them.
+    fn sweep(repos: &[&str], tasks: &[&str]) -> (Forge, Vec<String>) {
+        let tasks: BTreeSet<String> = tasks.iter().map(|task| (*task).to_owned()).collect();
+        let forge = Forge {
+            repos: repos
+                .iter()
+                .map(|repo| ((*repo).to_owned(), tasks.clone()))
+                .collect(),
+            ..forge()
+        };
+        let pool = repos.iter().map(|repo| (*repo).to_owned()).collect();
+        (forge, pool)
+    }
+
     #[test]
     fn draw_prefers_a_gated_task_that_has_work() {
-        let tasks = ["bump".to_owned(), "rebase".to_owned()];
-        let forge = forge();
-        let pool = [(&forge, "me/repo".to_owned())];
+        let (forge, pool) = sweep(&["me/repo"], &["bump", "rebase"]);
         for _ in 0..16 {
-            let (task, ..) = draw(&tasks, &pool, |task, _, _| task == "rebase").unwrap();
+            let (task, _) = draw(&forge, &pool, |task, _| task == "rebase").unwrap();
             assert_eq!(task, "rebase");
         }
     }
@@ -497,44 +514,30 @@ mod tests {
     /// Every (gated task, repo) pair is probed before giving up on them.
     #[test]
     fn draw_probes_every_repository() {
-        let tasks = ["feedback".to_owned(), "rebase".to_owned()];
-        let forge = forge();
-        let pool = [
-            (&forge, "me/one".to_owned()),
-            (&forge, "me/two".to_owned()),
-            (&forge, "me/three".to_owned()),
-        ];
+        let (forge, pool) = sweep(&["me/one", "me/two", "me/three"], &["feedback", "rebase"]);
         let seen = std::cell::RefCell::new(BTreeSet::new());
         assert!(
-            draw(&tasks, &pool, |task, _, repo| {
+            draw(&forge, &pool, |task, repo| {
                 seen.borrow_mut().insert(format!("{task} {repo}"));
                 false
             })
             .is_none()
         );
-        assert_eq!(seen.borrow().len(), tasks.len() * pool.len());
+        assert_eq!(seen.borrow().len(), 2 * pool.len());
     }
 
     #[test]
     fn draw_returns_an_actionable_pair() {
-        let tasks = ["feedback".to_owned(), "rebase".to_owned()];
-        let forge = forge();
-        let pool = [(&forge, "me/repo".to_owned())];
-        let (task, _, repo) = draw(&tasks, &pool, |_, _, _| true).unwrap();
+        let (forge, pool) = sweep(&["me/repo"], &["feedback", "rebase"]);
+        let (task, repo) = draw(&forge, &pool, |_, _| true).unwrap();
         assert!(gated(task));
         assert_eq!(repo, "me/repo");
     }
 
     #[test]
     fn draw_falls_back_to_an_ungated_task() {
-        let tasks = [
-            "feedback".to_owned(),
-            "rebase".to_owned(),
-            "bump".to_owned(),
-        ];
-        let forge = forge();
-        let pool = [(&forge, "me/repo".to_owned())];
-        let (task, ..) = draw(&tasks, &pool, |task, _, _| !gated(task)).unwrap();
+        let (forge, pool) = sweep(&["me/repo"], &["feedback", "rebase", "bump"]);
+        let (task, _) = draw(&forge, &pool, |task, _| !gated(task)).unwrap();
         assert_eq!(task, "bump");
     }
 
@@ -542,34 +545,28 @@ mod tests {
     /// back; only once nothing is left does the draw come up empty.
     #[test]
     fn draw_skips_an_ungated_task_the_check_rejects() {
-        let tasks = ["docs".to_owned(), "bump".to_owned()];
-        let forge = forge();
-        let pool = [(&forge, "me/repo".to_owned())];
+        let (forge, pool) = sweep(&["me/repo"], &["docs", "bump"]);
         for _ in 0..16 {
-            let (task, ..) = draw(&tasks, &pool, |task, _, _| task != "docs").unwrap();
+            let (task, _) = draw(&forge, &pool, |task, _| task != "docs").unwrap();
             assert_eq!(task, "bump");
         }
-        assert!(draw(&tasks, &pool, |_, _, _| false).is_none());
+        assert!(draw(&forge, &pool, |_, _| false).is_none());
     }
 
     #[test]
     fn draw_gives_up_when_every_task_is_gated_and_idle() {
-        let tasks = ["feedback".to_owned(), "rebase".to_owned()];
-        let forge = forge();
-        let pool = [(&forge, "me/repo".to_owned())];
-        assert!(draw(&tasks, &pool, |_, _, _| false).is_none());
+        let (forge, pool) = sweep(&["me/repo"], &["feedback", "rebase"]);
+        assert!(draw(&forge, &pool, |_, _| false).is_none());
     }
 
     /// Every gated pair is probed before an ungated task is considered, so a
     /// cheap cached task can never outrank a review comment.
     #[test]
     fn draw_probes_every_gated_pair_first() {
-        let tasks = ["docs".to_owned(), "rebase".to_owned()];
-        let forge = forge();
-        let pool = [(&forge, "me/one".to_owned()), (&forge, "me/two".to_owned())];
+        let (forge, pool) = sweep(&["me/one", "me/two"], &["docs", "rebase"]);
         for _ in 0..16 {
             let probed = std::cell::RefCell::new(Vec::new());
-            let (task, ..) = draw(&tasks, &pool, |task, _, repo| {
+            let (task, _) = draw(&forge, &pool, |task, repo| {
                 probed.borrow_mut().push(format!("{task} {repo}"));
                 task == "docs"
             })
@@ -579,6 +576,32 @@ mod tests {
             assert_eq!(probed.len(), 3, "{probed:?}");
             assert!(probed[..2].iter().all(|entry| entry.starts_with("rebase")));
         }
+    }
+
+    /// Tasks are picked per repository: a task that is off for one
+    /// repository is never drawn there, however often it is on elsewhere,
+    /// and a repository the forge lists but the settings don't enable
+    /// contributes no pairs at all.
+    #[test]
+    fn draw_only_pairs_a_task_with_the_repositories_that_have_it_on() {
+        let (mut forge, mut pool) = sweep(&["me/one", "me/two"], &["docs", "bump"]);
+        forge.repos.get_mut("me/two").unwrap().remove("docs");
+        pool.push("me/unlisted".into());
+        let seen = std::cell::RefCell::new(BTreeSet::new());
+        assert!(
+            draw(&forge, &pool, |task, repo| {
+                seen.borrow_mut().insert(format!("{task} {repo}"));
+                false
+            })
+            .is_none()
+        );
+        let seen = seen.borrow();
+        assert_eq!(
+            *seen,
+            ["docs me/one", "bump me/one", "bump me/two"]
+                .map(str::to_owned)
+                .into()
+        );
     }
 
     #[test]

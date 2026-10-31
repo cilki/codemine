@@ -397,13 +397,14 @@ fn describe(lines: &[&str]) -> String {
     bullets.join("\n")
 }
 
-/// The default task pool: every task the sweep command defines.
+/// Every task slug the sweep command defines, in command order — what a
+/// freshly enabled repository is swept for.
 pub fn default_tasks() -> Vec<String> {
     tasks().into_iter().map(|task| task.slug).collect()
 }
 
-/// Whether the sweep command defines this task. A pool slug it doesn't define
-/// — a task that has since been removed, or a typo in a hand-edited
+/// Whether the sweep command defines this task. A stored slug it doesn't
+/// define — a task that has since been removed, or a typo in a hand-edited
 /// config.json — carries no instructions, so drawing it would spend a whole
 /// agent session on a bare word. Parsed once: this is asked on the status
 /// poll, not just at the turn boundary.

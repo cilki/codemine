@@ -125,16 +125,19 @@ are compressed to save tokens.
 With a schedule enabled, turns can only _start_ inside a daily window. You can
 also limit the number of turns that can run per hour.
 
-#### Multiple forge support
+#### Forge support
 
-**codemine** works with Gitea, GitHub, and GitLab. Add an access token and
-select what repos **codemine** is enabled for (none by default).
+**codemine** works with Gitea, GitHub, or GitLab — one at a time. Pick the forge,
+add an access token, and tick the repositories **codemine** should sweep (none by
+default). Each repository has its own set of tasks, toggled by clicking the task
+labels in its row; the labels along the top turn a task on or off for every
+repository at once. A freshly ticked repository starts with every task on.
 
 #### Web interface
 
 You can view and manage the **codemine** instance via a simple web UI on
 port 8080. This is where you configure your forge settings, rate limits, select
-a model, choose what task types are run, view agent logs, etc.
+a model, choose which tasks run on which repositories, view agent logs, etc.
 
 #### Skip caching
 

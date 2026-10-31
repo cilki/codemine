@@ -1,5 +1,5 @@
 //! Continuously run opencode on the sweep prompt to sweep repositories on our code
-//! forges. Each turn runs in a fresh session against a per-repo clone that
+//! forge. Each turn runs in a fresh session against a per-repo clone that
 //! stays cloned and codegraph-indexed across turns (but not across restarts),
 //! back-to-back with the previous one. Everything except the CLI flags is
 //! configured through the always-on web UI and persisted in the workspace.
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
         .name("models".into())
         .spawn(move || drop(config::models(&warm_against)))?;
 
-    // Watch the forges for activity: a comment on a PR or issue queues that
+    // Watch the forge for activity: a comment on a PR or issue queues that
     // repository for a feedback turn ahead of the draw, and ends the
     // between-turn sleep early.
     let pending = events::Pending::new();
@@ -226,8 +226,8 @@ fn main() -> Result<()> {
                     idle_draws = 0;
                     report_blocker(&cli, &mut blocked, &status, vec![problem])?;
                     // Re-asked on the turn interval rather than the settings
-                    // one: this answer costs a repository listing per forge,
-                    // where re-reading the settings costs nothing. Sliced and
+                    // one: this answer costs a repository listing, where
+                    // re-reading the settings costs nothing. Sliced and
                     // cut short by an edit, so a corrected enabled set
                     // applies at once.
                     wait(POOL_RETRY, 5, || store.generation() != generation);
@@ -311,10 +311,10 @@ fn main() -> Result<()> {
 /// a fix takes to be noticed.
 const UNCONFIGURED_RETRY: Duration = Duration::from_secs(5);
 
-/// How long the loop waits before re-asking the forges for their repository
-/// listings when not one enabled repository came back. Longer than
-/// `UNCONFIGURED_RETRY`, because this blocker costs a listing per forge to
-/// re-ask where the settings cost nothing to re-read.
+/// How long the loop waits before re-asking the forge for its repository
+/// listing when not one enabled repository came back. Longer than
+/// `UNCONFIGURED_RETRY`, because this blocker costs a listing to re-ask
+/// where the settings cost nothing to re-read.
 const POOL_RETRY: u64 = 60;
 
 /// Said when the draw has nothing to work with. Not a blocker — this is what
@@ -333,8 +333,8 @@ fn idle_problem(idle: Option<turn::Idle>) -> Option<Problem> {
     match idle? {
         turn::Idle::NothingToDo => None,
         turn::Idle::NoListedRepos => Some(Problem::new(
-            "forges",
-            "none of the enabled repositories are listed by their forge, or all are archived",
+            "repos",
+            "none of the enabled repositories are listed by the forge, or all are archived",
         )),
     }
 }
@@ -432,9 +432,9 @@ impl Blocked {
 }
 
 /// Everything that has to hold before a turn can run, asked in the order
-/// that costs the least to find out: the proxy is reachable, each forge
+/// that costs the least to find out: the proxy is reachable, the forge
 /// token's account is known (its login and commit email come from the forge,
-/// not the settings), and git and tea have been taught the current tokens.
+/// not the settings), and git and tea have been taught the current token.
 /// `blocking` is what the caller already knows stands in the way — unsound
 /// settings, or the hold after a turn died on proxy auth — and short-circuits
 /// the rest, since every check below costs a round trip. The error side is
@@ -475,12 +475,8 @@ fn runnable(
     // Cached, so resolving is a map lookup on every pass but the first.
     // Errors are returned rather than logged here: the caller logs whatever
     // blocks turns, once per distinct set, and this runs on every pass.
-    identity::resolve(&mut cfg.forges).map_err(|(kind, err)| {
-        vec![Problem::new(
-            &format!("f-{}-token", kind.name()),
-            format!("{err:#}"),
-        )]
-    })?;
+    identity::resolve(&mut cfg.forge)
+        .map_err(|err| vec![Problem::new("f-token", format!("{err:#}"))])?;
 
     if *applied_generation != Some(generation) {
         apply_forge_auth(cli, &cfg).map_err(|err| {
@@ -649,21 +645,17 @@ fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Let git and tea authenticate to every configured forge; re-run whenever
-/// the settings change so new tokens and URLs take effect on the next turn.
+/// Let git and tea authenticate to the configured forge; re-run whenever
+/// the settings change so a new token, URL, or forge takes effect on the
+/// next turn.
 fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
-    let credentials: String = cfg
-        .forges
-        .iter()
-        .map(|forge| {
-            format!(
-                "{}\n",
-                forge
-                    .url
-                    .replacen("://", &format!("://{}:{}@", forge.user, forge.token), 1)
-            )
-        })
-        .collect();
+    let forge = &cfg.forge;
+    let credentials = format!(
+        "{}\n",
+        forge
+            .url
+            .replacen("://", &format!("://{}:{}@", forge.user, forge.token), 1)
+    );
     let path = workspace::git_credentials(&cli.workspace);
     OpenOptions::new()
         .write(true)
@@ -678,7 +670,7 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
     // no login because the runner passes GITHUB_TOKEN and GITLAB_TOKEN to
     // them directly. Drop any previous login first, since `tea login add`
     // refuses to update an existing name.
-    if let Some(gitea) = cfg.forges.iter().find(|f| f.kind == ForgeKind::Gitea) {
+    if forge.kind == ForgeKind::Gitea {
         Command::new("tea")
             .args(["login", "delete", "gitea"])
             .stdin(Stdio::null())
@@ -695,8 +687,8 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
         // request (`crate::http`) instead of handing a token to a child.
         child::output(
             Command::new("tea")
-                .args(["login", "add", "--name", "gitea", "--url", &gitea.url])
-                .env("GITEA_SERVER_TOKEN", &gitea.token),
+                .args(["login", "add", "--name", "gitea", "--url", &forge.url])
+                .env("GITEA_SERVER_TOKEN", &forge.token),
         )?;
     }
     Ok(())
@@ -718,7 +710,7 @@ const MAX_USAGE_HOLD: u64 = 7 * 24 * 3600;
 const TURN_GAP: u64 = 60;
 
 /// The longest gap between draws on a runner that keeps finding nothing. A
-/// draw is not free — it asks every forge for its repository listing, its
+/// draw is not free — it asks the forge for its repository listing, its
 /// notification feed, the bot's open PRs on each repository, and each
 /// repository's head commit — so a pool that has been caught up for a quarter
 /// of an hour is asked every ten minutes rather than every minute.
@@ -728,7 +720,7 @@ const MAX_IDLE_GAP: u64 = 10 * TURN_GAP;
 /// found nothing, doubling from `TURN_GAP` up to `MAX_IDLE_GAP`.
 ///
 /// Backing off costs nothing a caught-up runner needs, because the draw is
-/// not what notices work arriving: the activity watcher polls each forge's
+/// not what notices work arriving: the activity watcher polls the forge's
 /// feed on its own thread and pushes onto `pending`, which cuts this wait
 /// short, and a settings edit cuts it short too. What is left to wait for is
 /// a commit landing on a default branch, which ungates the tasks that read
@@ -1018,9 +1010,9 @@ mod tests {
         let problem = idle_problem(Some(turn::Idle::NoListedRepos)).expect("a blocker");
         // The field is what the page outlines, so it has to name the
         // repository picker rather than the forge's token or URL.
-        assert_eq!(problem.field, "forges");
+        assert_eq!(problem.field, "repos");
         assert!(
-            problem.message.contains("listed by their forge"),
+            problem.message.contains("listed by the forge"),
             "{}",
             problem.message
         );

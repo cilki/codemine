@@ -1,4 +1,4 @@
-//! Forge activity watching: a background thread polls each configured
+//! Forge activity watching: a background thread polls the configured
 //! forge's account-wide feed and queues repositories with fresh activity, so
 //! a comment on a PR or issue gets a feedback turn, and a review request a
 //! review turn, ahead of the random draw — immediately when the runner is
@@ -6,14 +6,14 @@
 //! when one is already running.
 //!
 //! Polling rather than webhooks on purpose: webhooks would need the runner
-//! to be reachable from every forge and a hook registered on every
-//! repository, while the feeds are readable with the tokens the runner
+//! to be reachable from the forge and a hook registered on every
+//! repository, while the feed is readable with the token the runner
 //! already holds. The feed is the same signal the feedback precheck reads,
 //! and a queued repository is still put through each task's own precheck
 //! before it is drawn, so an event can never queue work a turn wouldn't
 //! have found.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use crate::config::{Forge, ForgeKind};
 use crate::settings::SharedSettings;
 
-/// How often each forge's feed is polled. GitHub asks notification pollers
+/// How often the forge's feed is polled. GitHub asks notification pollers
 /// for at most one request a minute, and the others are in no hurry either.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -38,7 +38,10 @@ pub const QUEUED_TASKS: [&str; 2] = ["review", "feedback"];
 
 /// Repositories with fresh forge activity, queued to jump the next draw.
 /// The watcher pushes, the turn runner pops, and the between-turn sleep
-/// checks `is_empty` so activity ends it early.
+/// checks `is_empty` so activity ends it early. Each entry names its forge:
+/// the settings can switch forge between the push and the pop, and a
+/// repository queued under the old one must not be drawn on the new one
+/// just because the name is the same.
 pub struct Pending {
     inner: Mutex<VecDeque<(ForgeKind, String)>>,
 }
@@ -76,9 +79,9 @@ impl Pending {
     }
 }
 
-/// Start the watcher thread. It reads the settings fresh every poll, so
-/// forges come and go with them; a forge that stops being configured simply
-/// stops being polled.
+/// Start the watcher thread. It reads the settings fresh every poll, so the
+/// forge comes and goes with them; a forge that stops being configured
+/// simply stops being polled.
 pub fn spawn(store: SharedSettings, pending: SharedPending) -> Result<()> {
     std::thread::Builder::new()
         .name("events".into())
@@ -87,54 +90,44 @@ pub fn spawn(store: SharedSettings, pending: SharedPending) -> Result<()> {
 }
 
 fn watch(store: SharedSettings, pending: SharedPending) -> ! {
-    // What the previous poll saw, so only movement queues work; and which
-    // forges are currently failing to poll, so a persistent failure logs
-    // once instead of every minute.
+    // What the previous poll saw, so only movement queues work; and whether
+    // the poll is currently failing, so a persistent failure logs once
+    // instead of every minute.
     let mut seen: BTreeMap<(ForgeKind, String), String> = BTreeMap::new();
-    let mut failing: BTreeSet<ForgeKind> = BTreeSet::new();
+    let mut failing = false;
     loop {
         std::thread::sleep(POLL_INTERVAL);
         let (settings, _) = store.snapshot();
+        let Some(forge) = settings.runtime_forge() else {
+            continue;
+        };
         // Activity only ever leads to the queued tasks' turns; with none of
-        // them in the pool there is nothing to queue.
-        if !settings
-            .tasks
-            .iter()
-            .any(|task| QUEUED_TASKS.contains(&task.as_str()))
-        {
+        // them on for any repository there is nothing to queue. The turn
+        // checks the repository's own picks again when it pops the entry.
+        if !QUEUED_TASKS.iter().any(|task| forge.runs_anywhere(task)) {
             continue;
         }
-        let mut current: BTreeMap<(ForgeKind, String), String> = BTreeMap::new();
-        for kind in ForgeKind::ALL {
-            let Some(forge) = settings.runtime_forge(kind) else {
-                continue;
-            };
-            match unread(&forge) {
-                Ok(repos) => {
-                    if failing.remove(&kind) {
-                        info!("polling {} activity works again", kind.name());
-                    }
-                    current.extend(
-                        repos
-                            .into_iter()
-                            .filter(|(repo, _)| forge.enabled_repos.contains(repo))
-                            .map(|(repo, stamp)| ((kind, repo), stamp)),
-                    );
+        let kind = forge.kind;
+        let current: BTreeMap<(ForgeKind, String), String> = match unread(&forge) {
+            Ok(repos) => {
+                if std::mem::replace(&mut failing, false) {
+                    info!("polling {} activity works again", kind.name());
                 }
-                Err(err) => {
-                    if failing.insert(kind) {
-                        warn!("failed to poll {} activity: {err:#}", kind.name());
-                    }
-                    // Carry the last poll forward, so old notifications
-                    // don't read as fresh when the forge comes back.
-                    current.extend(
-                        seen.iter()
-                            .filter(|((k, _), _)| *k == kind)
-                            .map(|(key, stamp)| (key.clone(), stamp.clone())),
-                    );
-                }
+                repos
+                    .into_iter()
+                    .filter(|(repo, _)| forge.repos.contains_key(repo))
+                    .map(|(repo, stamp)| ((kind, repo), stamp))
+                    .collect()
             }
-        }
+            Err(err) => {
+                if !std::mem::replace(&mut failing, true) {
+                    warn!("failed to poll {} activity: {err:#}", kind.name());
+                }
+                // Carry the last poll forward, so old notifications don't
+                // read as fresh when the forge comes back.
+                seen.clone()
+            }
+        };
         for (kind, repo) in fresh(&seen, &current) {
             info!(
                 "activity on {} {repo}; queueing it for the next draw",
@@ -160,9 +153,9 @@ fn fresh(
         .collect()
 }
 
-/// The repositories with unread activity on one forge, each with the newest
-/// stamp on its feed. One request per forge — every feed is account-scoped —
-/// over notification threads on Gitea and GitHub, todos on GitLab (which fire
+/// The repositories with unread activity on the forge, each with the newest
+/// stamp on its feed. One request — every feed is account-scoped — over
+/// notification threads on Gitea and GitHub, todos on GitLab (which fire
 /// on mentions and assignments rather than every comment; that is all GitLab
 /// offers across projects).
 ///

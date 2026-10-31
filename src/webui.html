@@ -156,17 +156,52 @@
   .times { display: flex; align-items: center; gap: 8px; }
   .times input { flex: 1; min-width: 0; }
   .times input:disabled { opacity: 0.4; }
-  .forges { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
   .forge { border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
   .forge-head { display: flex; align-items: center; justify-content: space-between; }
   .forge-head .name { font-weight: bold; display: flex; align-items: center; gap: 8px; }
   .forge-icon { width: 18px; height: 18px; }
+  /* The forge dropdown sits in the card's head beside its brand mark, so it
+     is dressed like a field without the field's label above it. */
+  .forge-head select {
+    background: rgb(38, 42, 43); color: #e8eaed;
+    border: 1px solid rgb(62, 68, 70); border-radius: 6px;
+    padding: 5px 8px; font-size: 0.9em; font-family: inherit; font-weight: bold;
+  }
+  .forge-head select:focus { outline: none; border-color: var(--accent); }
   .check { display: flex; align-items: center; gap: 6px; font-size: 0.85em; color: #9aa0a6; }
   .check input { accent-color: var(--accent); }
   .repos-head { display: flex; align-items: center; justify-content: space-between; }
-  .repos { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+  /* The repository picker is a matrix: one row per repository, one column
+     per task, each cell the task's badge as a toggle. The list can run to
+     hundreds of rows and the sweep command to a dozen tasks, so the box
+     scrolls both ways, with the task header and the repository names
+     pinned so a toggle deep in the matrix still reads against both. */
+  .repos { max-height: 320px; overflow: auto; border: 1px solid rgb(62, 68, 70); border-radius: 6px; }
+  .repos:empty, .repos > .muted { display: block; padding: 8px 10px; border: none; }
+  .repos table { border-collapse: separate; border-spacing: 0; white-space: nowrap; }
+  .repos th, .repos td { padding: 3px 6px; text-align: left; font-weight: normal; }
+  .repos thead th { position: sticky; top: 0; background: rgb(24, 26, 27); z-index: 2; border-bottom: 1px solid rgb(62, 68, 70); }
+  .repos th:first-child, .repos td:first-child {
+    position: sticky; left: 0; background: rgb(24, 26, 27); z-index: 1;
+    border-right: 1px solid rgb(62, 68, 70); padding-right: 12px;
+  }
+  .repos thead th:first-child { z-index: 3; }
   .repos .check { color: #e8eaed; font-size: 0.9em; }
-  .repos .check.off { color: #9aa0a6; text-decoration: line-through; }
+  .repos tr.off .check { color: #9aa0a6; text-decoration: line-through; }
+  /* A task toggle is the badge itself, as a button; off is dimmed, and a
+     header toggle that is on for some rows but not all is half-dimmed. */
+  .repos button.task { cursor: pointer; font-family: inherit; }
+  /* The generic button hover would recolor the badge copper; keep its hue
+     and brighten the fill instead. */
+  .repos button.task:hover {
+    color: hsl(var(--task-hue) 65% var(--task-light, 70%));
+    background: hsl(var(--task-hue) 65% var(--task-light, 70%) / 0.3);
+    border-color: hsl(var(--task-hue) 65% var(--task-light, 70%));
+  }
+  .repos button.task.off { filter: saturate(0.25); opacity: 0.4; }
+  .repos button.task.partial { opacity: 0.7; }
+  .repos button.task[title] { cursor: help; }
+  .repos tr.off button.task { opacity: 0.25; filter: saturate(0.25); }
   button {
     background: rgb(62, 68, 70); color: #e8eaed; border: 1px solid transparent; border-radius: 6px;
     padding: 8px 16px; font-size: 0.9em; font-family: inherit; cursor: pointer;
@@ -174,19 +209,10 @@
   button:hover { background: rgba(200, 113, 55, 0.15); border-color: var(--accent); color: var(--accent); }
   button.small { padding: 4px 10px; font-size: 0.8em; }
   button:disabled { opacity: 0.4; pointer-events: none; }
-  .tasks { margin-top: 12px; }
-  .tasks .checks-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 4px 12px;
-  }
-  .tasks .check { color: #e8eaed; font-size: 0.9em; }
-  .tasks .check[title] { cursor: help; }
-  .tasks .check.off .task { filter: saturate(0.25); opacity: 0.5; }
   /* Unrunnable settings are marked on the field that fixes them, so the
      collapsed panel has to advertise that there is something to fix. */
   .field input.invalid, .field select.invalid { border-color: #e74c3c; }
-  /* The task pool is a checkbox grid rather than a control with a border. */
-  .tasks .checks-grid.invalid { outline: 1px solid #e74c3c; outline-offset: 6px; }
-  .forges.invalid { outline: 1px solid #e74c3c; outline-offset: 8px; }
+  .repos.invalid { border-color: #e74c3c; }
   /* The settings live in a modal so they never overlap the main content.
      Dialogs don't inherit the body's color (the UA default is black), so
      the light text is restated here. */
@@ -214,7 +240,7 @@
   #settings-status.err { color: #e74c3c; }
   #proxy-card { margin-bottom: 16px; }
   #proxy-card.invalid { outline: 1px solid #e74c3c; outline-offset: 4px; }
-  /* A service's health — the proxy's, each forge's — as a dot beside the URL
+  /* A service's health — the proxy's, the forge's — as a dot beside the URL
      it was probed at; what the probe found is the dot's tooltip. */
   .health {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%;
@@ -290,9 +316,6 @@
         </div>
       </div>
     </div>
-    <div class="field tasks"><label>Tasks</label>
-      <div class="checks-grid" id="s-tasks"></div>
-    </div>
     <div class="forge" id="proxy-card">
       <div class="forge-head">
         <span class="name">CLIProxyAPI</span>
@@ -312,7 +335,24 @@
       </div>
       <div class="muted" id="proxy-note"></div>
     </div>
-    <div class="forges" id="forges"></div>
+    <div class="forge" id="forge-card">
+      <div class="forge-head">
+        <span class="name"><svg class="forge-icon" id="f-icon" viewBox="0 0 24 24"><path/></svg>Forge</span>
+        <select id="f-kind" aria-label="forge"></select>
+      </div>
+      <div class="field"><label for="f-token">Token</label>
+        <input id="f-token" type="password" autocomplete="off"></div>
+      <div class="field"><label for="f-url">URL
+          <span class="health" id="f-health" role="img" aria-label="forge checking" title="checking…"></span></label>
+        <input id="f-url"></div>
+      <div class="field">
+        <div class="repos-head"><label>Repositories</label>
+          <button type="button" class="small" id="repos-refresh">refresh</button></div>
+        <input id="repos-filter" type="search" placeholder="search repositories" hidden>
+        <div class="repos" id="repos"><span class="muted">Not loaded.</span></div>
+        <span class="muted" id="repos-note"></span>
+      </div>
+    </div>
     <div id="settings-status"></div>
   </dialog>
 </div>
@@ -543,10 +583,12 @@
   const TASK_HUES = [205, 30, 155, 330, 265, 95, 0, 180, 240, 55, 300, 120];
   const taskHues = new Map();
 
-  function badge(slug) {
+  // A badge is a span wherever it is only read; the repository matrix asks
+  // for a button, which it is then free to toggle.
+  function badge(slug, tag = "span") {
     if (!taskHues.has(slug)) taskHues.set(slug, taskHues.size);
     const rank = taskHues.get(slug);
-    const el = document.createElement("span");
+    const el = document.createElement(tag);
     el.className = "task";
     el.textContent = slug;
     el.style.setProperty("--task-hue", TASK_HUES[rank % TASK_HUES.length]);
@@ -557,7 +599,7 @@
 
   // The forge as its brand mark: the turn's own facts are what the meta line
   // is for, and the name is still there on hover. `FORGE_ICONS` is the same
-  // table the settings cards draw from; a forge without one keeps its name.
+  // table the settings card draws from; a forge without one keeps its name.
   function forgeIcon(forge) {
     const icon = FORGE_ICONS[forge];
     if (!icon) return forge + " · ";
@@ -785,7 +827,7 @@
       setLog((liveLog + JSON.parse(event.data)).slice(-LOG_WINDOW)));
     events.addEventListener("host", event => renderHost(JSON.parse(event.data)));
     events.addEventListener("proxy", event => renderProxy(JSON.parse(event.data)));
-    events.addEventListener("forges", event => renderForgeHealth(JSON.parse(event.data)));
+    events.addEventListener("forge", event => renderForgeHealth(JSON.parse(event.data)));
     events.onopen = () => $("disconnected").hidden = true;
     events.onerror = () => $("disconnected").hidden = false;
   }
@@ -808,16 +850,15 @@
     github: "https://github.com (default)",
     gitlab: "https://gitlab.com (default)",
   };
-  // Per forge: Set of enabled repo names, edited by the checkboxes. Repos
-  // start out unchecked, so a fresh login sweeps nothing until repositories
-  // are picked by hand.
-  const enabledRepos = {};
+  // The repositories the picker has touched, by name: whether each is in
+  // the sweep and the Set of tasks on it. Edited by the matrix. Repos start
+  // out unchecked, so a fresh login sweeps nothing until repositories are
+  // picked by hand.
+  const repos = new Map();
 
   // The choices from /api/options: the model IDs opencode can resolve right
-  // now, and the task pool parsed out of the sweep command.
+  // now, and the tasks parsed out of the sweep command.
   let options = { models: [], tasks: [] };
-  // The enabled tasks, edited by the checkboxes.
-  const enabledTasks = new Set();
 
   // A stored value that is no longer on offer (auth that stopped loading, a
   // task slug an older sweep.md defined) is kept as an extra choice rather
@@ -836,37 +877,31 @@
     $("s-model").value = selected;
   }
 
-  // One checkbox row, for both pickers in the settings dialog: the task pool
-  // and each forge's repositories are the same control over different sets —
-  // `name` is in `set` or it isn't, ticking it moves it, and a row that is
-  // off is dimmed by the `off` class its own panel styles. `label` is
-  // whatever shows beside the box (a task badge, a repository's name) and
-  // `title` the optional tooltip.
-  function checkRow(set, name, label, title) {
-    const row = document.createElement("label");
-    if (title) row.title = title;
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = set.has(name);
-    const paint = () => row.className = "check" + (box.checked ? "" : " off");
-    box.onchange = () => {
-      box.checked ? set.add(name) : set.delete(name);
-      paint();
-    };
-    paint();
-    row.append(box, label);
-    return row;
+  // The task columns of the matrix: every task the sweep command defines,
+  // with its instructions as the tooltip, plus any slug a stored pick still
+  // names that the command no longer defines — kept as a column rather than
+  // silently dropped, so a hand-edited config.json isn't rewritten behind
+  // the user's back, and labelled as the no-op it is.
+  function taskColumns() {
+    const offered = new Map(options.tasks.map(t => [t.slug, t.description]));
+    for (const { tasks } of repos.values())
+      for (const slug of tasks)
+        if (!offered.has(slug))
+          offered.set(slug, "not in the sweep command — the runner skips it");
+    return [...offered];
   }
 
-  function renderTasks(selected) {
-    enabledTasks.clear();
-    for (const task of selected) enabledTasks.add(task);
-    const offered = new Map(options.tasks.map(t => [t.slug, t.description]));
-    const extra = selected.filter(slug => !offered.has(slug))
-      .map(slug => [slug, "not in the sweep command — the runner skips it"]);
-    // The tooltip is the sweep command's own instructions for the task.
-    $("s-tasks").replaceChildren(...[...offered, ...extra]
-      .map(([slug, description]) => checkRow(enabledTasks, slug, badge(slug), description)));
+  // A task badge as a toggle. `state` is "on", "off", or "partial" (the
+  // header's word for a column that is on in some rows and off in others).
+  function taskToggle(slug, title, state, onclick) {
+    const button = badge(slug, "button");
+    button.type = "button";
+    if (title) button.title = title;
+    button.classList.toggle("off", state === "off");
+    button.classList.toggle("partial", state === "partial");
+    button.setAttribute("aria-pressed", state === "on");
+    button.onclick = onclick;
+    return button;
   }
 
   // The schedule is stored as minutes past local midnight, which is what a
@@ -894,75 +929,152 @@
     $("s-schedule-end").disabled = off;
   }
 
-  function forgeCard(name) {
-    const card = document.createElement("div");
-    card.className = "forge";
-    card.innerHTML = `
-      <div class="forge-head">
-        <span class="name"><svg class="forge-icon" viewBox="0 0 24 24" fill="${FORGE_ICONS[name].color}"><path d="${FORGE_ICONS[name].path}"/></svg>${name}</span>
-        <label class="check"><input type="checkbox" id="f-${name}-enabled"> enabled</label>
-      </div>
-      <div class="field"><label for="f-${name}-token">Token</label>
-        <input id="f-${name}-token" type="password" autocomplete="off"></div>
-      <div class="field"><label for="f-${name}-url">URL
-          <span class="health" id="f-${name}-health" role="img" aria-label="${name} checking" title="checking…"></span></label>
-        <input id="f-${name}-url" placeholder="${URL_PLACEHOLDER[name]}"></div>
-      <div class="field">
-        <div class="repos-head"><label>Repositories</label>
-          <button type="button" class="small" id="f-${name}-repos-refresh">refresh</button></div>
-        <input id="f-${name}-repos-filter" type="search" placeholder="search repositories" hidden>
-        <div class="repos" id="f-${name}-repos"><span class="muted">Not loaded.</span></div>
-        <span class="muted" id="f-${name}-repos-note"></span>
-      </div>`;
-    // The search box narrows the list client-side; it is not a setting, so
-    // its typing must not bubble up to the dialog's autosave listeners.
-    const filter = card.querySelector(`#f-${name}-repos-filter`);
-    for (const type of ["input", "change"])
-      filter.addEventListener(type, event => event.stopPropagation());
-    filter.addEventListener("input", () => applyRepoFilter(name));
-    // The auto-load only runs once per forge, so a listing fetched when the
-    // page opened goes stale; the button re-fetches it on demand.
-    card.querySelector(`#f-${name}-repos-refresh`).onclick = () => loadRepos(name);
-    return card;
+  // The dropdown's choices are the forges the runner knows, in the order
+  // the backend lists them; the brand mark beside it follows the choice.
+  function renderForgeKind(kind) {
+    const select = $("f-kind");
+    if (!select.options.length)
+      select.replaceChildren(...FORGES.map(name =>
+        Object.assign(document.createElement("option"), { value: name, textContent: name })));
+    select.value = kind;
+    const icon = $("f-icon");
+    icon.setAttribute("fill", FORGE_ICONS[kind].color);
+    icon.querySelector("path").setAttribute("d", FORGE_ICONS[kind].path);
+    $("f-url").placeholder = URL_PLACEHOLDER[kind];
+  }
+
+  // Switching forge is a clean slate: the token was the old forge's, the
+  // URL and repositories too. The server drops the stored token on its own
+  // when the kind changes; the form clears the rest so the next save
+  // doesn't send the old forge's picks under the new one's name.
+  function switchForge(kind) {
+    renderForgeKind(kind);
+    $("f-token").value = "";
+    $("f-token").placeholder = "no token";
+    $("f-url").value = "";
+    repos.clear();
+    loadedRepos = false;
+    $("repos-note").textContent = "";
+    renderRepos([]);
   }
 
   // Hide the rows the search box's text doesn't match. Unchecking a hidden
   // row is impossible, so a filtered save can't silently drop repos.
-  function applyRepoFilter(forge) {
-    const needle = $(`f-${forge}-repos-filter`).value.trim().toLowerCase();
-    for (const row of $(`f-${forge}-repos`).children)
-      row.hidden = !row.textContent.toLowerCase().includes(needle);
+  function applyRepoFilter() {
+    const needle = $("repos-filter").value.trim().toLowerCase();
+    const body = $("repos").querySelector("tbody");
+    if (!body) return;
+    for (const row of body.rows)
+      row.hidden = !row.cells[0].textContent.toLowerCase().includes(needle);
   }
 
-  function renderRepos(forge, names) {
-    const rows = names.map(name => checkRow(enabledRepos[forge], name, name));
-    $(`f-${forge}-repos`).replaceChildren(
-      ...(rows.length ? rows : [Object.assign(document.createElement("span"),
-        { className: "muted", textContent: "No repositories." })]));
+  // The picker's state for one repository, made on first touch. It starts
+  // with nothing on, which is what an untouched row shows; ticking the row's
+  // box is what hands a fresh repository every task.
+  function repoState(name) {
+    if (!repos.has(name)) repos.set(name, { enabled: false, tasks: new Set() });
+    return repos.get(name);
+  }
+
+  // The matrix: a header row of task toggles that act on every listed
+  // repository at once, then a row per repository with its own checkbox and
+  // its own toggles. Rebuilt whole on every toggle — it is a few hundred
+  // cells at most, and repainting is simpler than keeping each header's
+  // partial state in step by hand.
+  function renderRepos(names) {
+    const box = $("repos");
+    if (!names.length) {
+      box.replaceChildren(Object.assign(document.createElement("span"), {
+        className: "muted",
+        textContent: loadedRepos ? "No repositories." : "Not loaded.",
+      }));
+      $("repos-filter").hidden = true;
+      return;
+    }
+    const columns = taskColumns();
+    // A toggle is a setting, so it saves at once like a checkbox would; it
+    // isn't an input, so the dialog's autosave listeners don't see it.
+    const toggled = () => { renderRepos(names); scheduleSave(0); };
+
+    const table = document.createElement("table");
+    const head = table.createTHead().insertRow();
+    head.append(document.createElement("th"));
+    for (const [slug, description] of columns) {
+      const on = names.filter(name => repos.get(name)?.tasks.has(slug)).length;
+      const state = on === 0 ? "off" : on === names.length ? "on" : "partial";
+      const th = document.createElement("th");
+      // The column header selects all, or deselects all once it is all on.
+      th.append(taskToggle(slug, description, state, () => {
+        const all = state === "on";
+        for (const name of names) {
+          const repo = repoState(name);
+          all ? repo.tasks.delete(slug) : repo.tasks.add(slug);
+        }
+        toggled();
+      }));
+      head.append(th);
+    }
+
+    const body = table.createTBody();
+    for (const name of names) {
+      const repo = repos.get(name);
+      const row = body.insertRow();
+      row.className = repo?.enabled ? "" : "off";
+      const label = document.createElement("label");
+      label.className = "check";
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.checked = repo?.enabled ?? false;
+      check.onchange = () => {
+        // A repository ticked for the first time is swept for everything,
+        // as it was under the old global task pool; one ticked again keeps
+        // the picks it had when it was unticked.
+        const fresh = !repos.has(name);
+        const state = repoState(name);
+        state.enabled = check.checked;
+        if (fresh) state.tasks = new Set(options.tasks.map(t => t.slug));
+        renderRepos(names);
+      };
+      label.append(check, name);
+      row.insertCell().append(label);
+      for (const [slug, description] of columns) {
+        const state = repo?.tasks.has(slug) ? "on" : "off";
+        row.insertCell().append(taskToggle(slug, description, state, () => {
+          const tasks = repoState(name).tasks;
+          tasks.has(slug) ? tasks.delete(slug) : tasks.add(slug);
+          toggled();
+        }));
+      }
+    }
+    box.replaceChildren(table);
     // The search box only appears once the list outgrows its scrollbox.
-    const filter = $(`f-${forge}-repos-filter`);
-    filter.hidden = rows.length <= 10;
+    const filter = $("repos-filter");
+    filter.hidden = names.length <= 10;
     if (filter.hidden) filter.value = "";
-    applyRepoFilter(forge);
+    applyRepoFilter();
   }
 
-  // Forges whose live listing already came in, so edits and saves don't
-  // refetch it on every keystroke.
-  const loadedRepos = new Set();
+  // Whether the live listing already came in, so edits and saves don't
+  // refetch it on every keystroke. Reset when the forge changes.
+  let loadedRepos = false;
 
-  async function loadRepos(forge) {
-    const note = $(`f-${forge}-repos-note`);
-    const button = $(`f-${forge}-repos-refresh`);
+  async function loadRepos() {
+    const note = $("repos-note");
+    const button = $("repos-refresh");
+    const asked = $("f-kind").value;
     button.disabled = true;
     note.textContent = "loading…";
     note.title = "";
     try {
-      const res = await fetch(`/api/repos/${forge}`);
+      const res = await fetch("/api/repos");
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || res.status);
+      // The dropdown may have moved on while the old forge was answering;
+      // its listing is not the new forge's.
+      if (body.forge !== asked || $("f-kind").value !== asked) return;
       note.textContent = "";
-      loadedRepos.add(forge);
-      renderRepos(forge, body.repos.map(r => r.name));
+      loadedRepos = true;
+      renderRepos(body.repos.map(r => r.name));
     } catch (err) {
       // The forge's own complaint can run to a CLI's whole stderr; the card
       // says that the listing failed and the hover says why.
@@ -973,20 +1085,16 @@
     }
   }
 
-  // Fetch each configured forge's repositories as soon as its settings allow
-  // it: on page load, and again after a save makes a forge newly listable.
+  // Fetch the forge's repositories as soon as its settings allow it: on page
+  // load, and again after a save makes the forge newly listable.
   function autoLoadRepos(s) {
-    for (const forge of FORGES) {
-      const f = s[forge];
-      const listable = f.enabled && f.token_set
-        && (forge !== "gitea" || f.url);
-      if (listable && !loadedRepos.has(forge)) loadRepos(forge);
-    }
+    const f = s.forge;
+    const listable = f.token_set && (f.kind !== "gitea" || f.url);
+    if (listable && !loadedRepos) loadRepos();
   }
 
   function renderSettings(s) {
     renderModels(s.model);
-    renderTasks(s.tasks);
     $("proxy-base-url").value = s.proxy.base_url;
     // Both keys are optional, and each is useless for a different reason
     // when unset, so the empty placeholder says which.
@@ -1003,18 +1111,18 @@
     $("s-hourly-limit").value = s.hourly_limit ?? "";
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     renderSchedule(s.schedule);
-    for (const forge of FORGES) {
-      const f = s[forge];
-      enabledRepos[forge] = new Set(f.enabled_repos);
-      $(`f-${forge}-enabled`).checked = f.enabled;
-      const token = $(`f-${forge}-token`);
-      token.value = "";
-      token.placeholder = f.token_set ? "token set — leave blank to keep" : "no token";
-      $(`f-${forge}-url`).value = f.url;
-      // Show the stored enables even before a live listing is loaded, so an
-      // unreachable forge can't silently drop them.
-      renderRepos(forge, [...enabledRepos[forge]].sort());
-    }
+    const f = s.forge;
+    renderForgeKind(f.kind);
+    const token = $("f-token");
+    token.value = "";
+    token.placeholder = f.token_set ? "token set — leave blank to keep" : "no token";
+    $("f-url").value = f.url;
+    repos.clear();
+    for (const [name, repo] of Object.entries(f.repos))
+      repos.set(name, { enabled: repo.enabled, tasks: new Set(repo.tasks) });
+    // Show the stored picks even before a live listing is loaded, so an
+    // unreachable forge can't silently drop them.
+    renderRepos([...repos.keys()].sort());
     autoLoadRepos(s);
   }
 
@@ -1045,7 +1153,6 @@
         management_key: $("proxy-management-key").value,
       },
       model: $("s-model").value,
-      tasks: [...enabledTasks],
       hourly_limit: num($("s-hourly-limit").value),
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
       schedule: {
@@ -1053,16 +1160,16 @@
         start_minute: toMinutes($("s-schedule-start").value),
         end_minute: toMinutes($("s-schedule-end").value),
       },
+      forge: {
+        kind: $("f-kind").value,
+        // Empty means "keep the stored token"; the server never sends it
+        // back — unless the kind changed, when it drops the old one.
+        token: $("f-token").value,
+        url: $("f-url").value,
+        repos: Object.fromEntries([...repos].map(([name, repo]) =>
+          [name, { enabled: repo.enabled, tasks: [...repo.tasks].sort() }])),
+      },
     };
-    for (const forge of FORGES) {
-      body[forge] = {
-        enabled: $(`f-${forge}-enabled`).checked,
-        // Empty means "keep the stored token"; the server never sends it back.
-        token: $(`f-${forge}-token`).value,
-        url: $(`f-${forge}-url`).value,
-        enabled_repos: [...enabledRepos[forge]].sort(),
-      };
-    }
     return body;
   }
 
@@ -1094,18 +1201,16 @@
       });
       const returned = await res.json();
       if (!res.ok) throw new Error(returned.error || res.status);
-      // Tokens are write-only: once stored, drop what was typed and say so.
-      for (const forge of FORGES) {
-        const token = $(`f-${forge}-token`);
-        if (token.value) {
-          token.value = "";
-          token.placeholder = returned[forge].token_set
-            ? "token set — leave blank to keep" : "no token";
-        }
+      // The token is write-only: once stored, drop what was typed and say so.
+      const token = $("f-token");
+      if (token.value) {
+        token.value = "";
+        token.placeholder = returned.forge.token_set
+          ? "token set — leave blank to keep" : "no token";
       }
       status.className = "ok";
       status.textContent = "saved — applies from the next turn";
-      // A save can make a forge newly listable (enabled, token stored).
+      // A save can make the forge newly listable (token stored, URL set).
       autoLoadRepos(returned);
     } catch (err) {
       status.className = "err";
@@ -1166,7 +1271,7 @@
       ? "turns held until " + new Date(state.oauth_gated_until * 1000).toLocaleString() : "";
   }
 
-  // Each forge's reachability, as the dot beside its URL: the server asks the
+  // The forge's reachability, as the dot beside its URL: the server asks the
   // forge who its token is, so a dead host and a rejected token both show,
   // and the forge's own complaint is the tooltip rather than card text.
   const FORGE_REACH = {
@@ -1175,36 +1280,41 @@
     "unreachable": ["err", h => "can't connect: " + h.error],
     "incomplete": ["warn", h => "connected, but " + h.error],
     "checking": ["", () => "checking…"],
-    "disabled": ["", () => "disabled"],
     "no-token": ["", () => "no token"],
     "no-url": ["", () => "needs a URL"],
   };
 
-  function renderForgeHealth(forges) {
-    for (const forge of FORGES) {
-      const h = forges?.[forge] ?? { state: "checking" };
-      const [cls, describe] = FORGE_REACH[h.state] ?? FORGE_REACH.checking;
-      const text = describe(h);
-      const dot = $(`f-${forge}-health`);
-      dot.className = "health " + cls;
-      dot.title = text;
-      dot.setAttribute("aria-label", `${forge} ${text}`);
-    }
+  function renderForgeHealth(h) {
+    h = h ?? { state: "checking" };
+    const [cls, describe] = FORGE_REACH[h.state] ?? FORGE_REACH.checking;
+    const text = describe(h);
+    const dot = $("f-health");
+    dot.className = "health " + cls;
+    dot.title = text;
+    dot.setAttribute("aria-label", "forge " + text);
   }
 
-  $("forges").append(...FORGES.map(forgeCard));
-  // Delegated, so the repo and task checkboxes built later are covered too.
-  // Typing debounces; committed choices save at once. Secret fields (forge
-  // tokens, proxy keys) are left to `change` alone, so a partial secret is
+  // The search box narrows the list client-side; it is not a setting, so
+  // its typing must not bubble up to the dialog's autosave listeners.
+  for (const type of ["input", "change"])
+    $("repos-filter").addEventListener(type, event => event.stopPropagation());
+  $("repos-filter").addEventListener("input", applyRepoFilter);
+  // The auto-load only runs once per forge, so a listing fetched when the
+  // page opened goes stale; the button re-fetches it on demand.
+  $("repos-refresh").onclick = loadRepos;
+  // Delegated, so the repo checkboxes built later are covered too. Typing
+  // debounces; committed choices save at once. Secret fields (the forge
+  // token, proxy keys) are left to `change` alone, so a partial secret is
   // never stored.
   $("settings").addEventListener("input", event => {
     if (event.target.type !== "password") scheduleSave(600);
   });
   $("settings").addEventListener("change", event => {
     if (event.target.id === "s-schedule-enabled") paintSchedule();
+    if (event.target.id === "f-kind") switchForge(event.target.value);
     scheduleSave(0);
   });
-  // The octocat is already inlined for the forge cards; reuse it.
+  // The octocat is already inlined for the forge card; reuse it.
   $("github-link").querySelector("path").setAttribute("d", FORGE_ICONS.github.path);
   $("settings-open").onclick = () => $("settings").showModal();
   $("settings-close").onclick = () => $("settings").close();

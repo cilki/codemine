@@ -404,7 +404,7 @@ mod tests {
             login: String::new(),
             email: String::new(),
             url: "https://github.com".into(),
-            enabled_repos: BTreeSet::new(),
+            repos: BTreeMap::new(),
         }
     }
 

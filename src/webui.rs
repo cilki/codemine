@@ -23,7 +23,6 @@ use axum::routing::get;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::config::ForgeKind;
 use crate::settings::{Settings, SharedSettings};
 use crate::status::{Activity, Shared, Status, epoch_now};
 
@@ -98,7 +97,7 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/api/paused", axum::routing::put(api_put_paused))
         .route("/api/cancel", axum::routing::post(api_post_cancel))
         .route("/api/options", get(api_options))
-        .route("/api/repos/{forge}", get(api_repos));
+        .route("/api/repos", get(api_repos));
     #[cfg(feature = "hostinfo")]
     let app = app.route("/api/host", get(api_host));
     let app = app.with_state(state);
@@ -171,7 +170,7 @@ async fn api_turn_log(State(state): State<AppState>, Path(started): Path<u64>) -
 /// Push state to the page so it never has to poll: a `status` event on every
 /// change to the shared state, a `turns` event whenever a turn joins or
 /// leaves the history, a `log` or `log-append` event whenever the tail
-/// moves, and `proxy`, `forges` and `host` events as those readings drift.
+/// moves, and `proxy`, `forge` and `host` events as those readings drift.
 /// All carry JSON,
 /// which keeps a log line's own newlines and carriage returns out of the SSE
 /// framing.
@@ -181,7 +180,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         let mut changes = state.status.subscribe();
         // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
-        let (mut sent_status, mut sent_proxy, mut sent_forges) = (None, None, None);
+        let (mut sent_status, mut sent_proxy, mut sent_forge) = (None, None, None);
         let mut sent_turns: Option<u64> = None;
         let mut log_cursor = None;
         #[cfg(feature = "hostinfo")]
@@ -203,9 +202,9 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             // the status it owns. The probe makes a blocking request (behind
             // a short cache), so it runs off this current-thread runtime.
             let settings = state.settings.snapshot().0;
-            // Each forge's reachability, for the dot on its card. Never
-            // blocks: the probes run on threads of their own.
-            let forges = serde_json::to_string(&crate::identity::health(&settings))
+            // The forge's reachability, for the dot on its card. Never
+            // blocks: the probe runs on a thread of its own.
+            let forge = serde_json::to_string(&crate::identity::health(&settings))
                 .unwrap_or_else(|_| "{}".into());
             let proxy_settings = settings.proxy;
             let proxy = tokio::task::spawn_blocking(move || {
@@ -223,7 +222,10 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             // find them unchanged is the cost this is here to avoid.
             let revision = state.status.lock().turns_revision;
             if sent_turns != Some(revision) {
-                if send(&tx, "turns", &turns_json(&state.status)).await.is_err() {
+                if send(&tx, "turns", &turns_json(&state.status))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 sent_turns = Some(revision);
@@ -232,7 +234,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             let mut channels = vec![
                 ("status", &snapshot, &status, &mut sent_status),
                 ("proxy", &proxy, &proxy, &mut sent_proxy),
-                ("forges", &forges, &forges, &mut sent_forges),
+                ("forge", &forge, &forge, &mut sent_forge),
             ];
             #[cfg(feature = "hostinfo")]
             channels.push(("host", &host, &host, &mut sent_host));
@@ -468,9 +470,9 @@ fn appended(file: &mut std::fs::File, offset: u64) -> std::io::Result<(String, u
 /// The choices the settings form renders: the models that can actually run a
 /// turn (an `opencode models` listing fetched once and cached, narrowed to
 /// what the proxy serves, so a provider whose auth didn't load and a model
-/// the proxy won't answer for are both visibly absent) and the task pool,
-/// which comes from the embedded sweep command so the checkboxes can't drift
-/// from the prompt.
+/// the proxy won't answer for are both visibly absent) and the tasks, which
+/// come from the embedded sweep command so the per-repository toggles can't
+/// drift from the prompt.
 async fn api_options(State(state): State<AppState>) -> Json<serde_json::Value> {
     let proxy = state.settings.snapshot().0.proxy;
     // A cache miss shells out to opencode, and the narrowing makes a blocking
@@ -614,25 +616,21 @@ fn repo_choices(listing: crate::turn::Listing, enabled: &BTreeSet<String>) -> BT
         .collect()
 }
 
-/// Live repository listing for one forge, merged with the enabled set so
-/// the UI can render checkboxes (see `repo_choices`).
-async fn api_repos(State(state): State<AppState>, Path(slug): Path<String>) -> Response {
-    let Some(kind) = ForgeKind::from_slug(&slug) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("unknown forge: {slug}") })),
-        )
-            .into_response();
-    };
+/// Live repository listing for the configured forge, merged with the enabled
+/// set so the UI can render the picker (see `repo_choices`). The forge is
+/// named in the answer so a listing that arrives after the dropdown moved
+/// on can be told apart from the new forge's.
+async fn api_repos(State(state): State<AppState>) -> Response {
     let (settings, _) = state.settings.snapshot();
-    let Some(forge) = settings.runtime_forge(kind) else {
+    let Some(forge) = settings.runtime_forge() else {
         return (
             StatusCode::CONFLICT,
-            Json(json!({ "error": format!("{} is not configured", kind.name()) })),
+            Json(json!({ "error": format!("{} is not configured", settings.forge.kind.name()) })),
         )
             .into_response();
     };
-    let enabled = forge.enabled_repos.clone();
+    let kind = forge.kind;
+    let enabled: BTreeSet<String> = forge.repos.keys().cloned().collect();
     // The listing shells out to the forge CLI; keep it off the current-thread
     // runtime so status polling stays responsive meanwhile.
     let listed = tokio::task::spawn_blocking(move || crate::turn::list_repos(&forge)).await;
@@ -642,7 +640,7 @@ async fn api_repos(State(state): State<AppState>, Path(slug): Path<String>) -> R
                 .into_iter()
                 .map(|name| json!({ "enabled": enabled.contains(&name), "name": name }))
                 .collect();
-            Json(json!({ "repos": repos })).into_response()
+            Json(json!({ "forge": kind.name(), "repos": repos })).into_response()
         }
         Ok(Err(err)) => (
             StatusCode::BAD_GATEWAY,
@@ -733,11 +731,16 @@ mod tests {
         let response = request(addr, "GET", "/api/settings", "");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let value = body_json(&response);
-        assert_eq!(value["github"]["token_set"], false);
-        assert!(value["github"].get("token").is_none());
+        assert_eq!(value["forge"]["kind"], "github");
+        assert_eq!(value["forge"]["token_set"], false);
+        assert!(value["forge"].get("token").is_none());
 
         let update = json!({
-            "github": { "enabled": true, "token": "secret" },
+            "forge": {
+                "kind": "gitlab",
+                "token": "secret",
+                "repos": { "me/repo": { "enabled": true, "tasks": ["docs"] } },
+            },
             "model": "anthropic/claude",
             "hourly_limit": 0.5,
         });
@@ -750,8 +753,10 @@ mod tests {
         assert_eq!(status["allowance"]["capacity"], 1.0);
         assert_eq!(status["allowance"]["available"], 1.0);
         let value = body_json(&response);
-        assert_eq!(value["github"]["token_set"], true);
-        assert!(value["github"].get("token").is_none());
+        assert_eq!(value["forge"]["kind"], "gitlab");
+        assert_eq!(value["forge"]["token_set"], true);
+        assert!(value["forge"].get("token").is_none());
+        assert_eq!(value["forge"]["repos"]["me/repo"]["tasks"], json!(["docs"]));
         assert!(!response.contains("secret"));
 
         // Raising the limit hands over the extra turns at once rather than
@@ -773,10 +778,19 @@ mod tests {
         assert_eq!(status["allowance"]["capacity"], 2.0);
         assert_eq!(status["allowance"]["available"], 2.0);
 
-        // Persisted to the workspace, and the token survives a token-less PUT.
+        // Persisted to the workspace, and the token survives a token-less PUT
+        // to the same forge.
         assert!(dir.path().join("config.json").exists());
-        let response = request(addr, "PUT", "/api/settings", &update.to_string());
-        assert_eq!(body_json(&response)["github"]["token_set"], true);
+        let mut tokenless = update.clone();
+        tokenless["forge"]["token"] = json!("");
+        let response = request(addr, "PUT", "/api/settings", &tokenless.to_string());
+        assert_eq!(body_json(&response)["forge"]["token_set"], true);
+
+        // Switching forge is a clean slate: the old forge's token goes.
+        tokenless["forge"]["kind"] = json!("github");
+        let response = request(addr, "PUT", "/api/settings", &tokenless.to_string());
+        assert_eq!(body_json(&response)["forge"]["kind"], "github");
+        assert_eq!(body_json(&response)["forge"]["token_set"], false);
     }
 
     /// The scheduler state letter from /proc/pid/stat, polled until it
@@ -1163,10 +1177,26 @@ mod tests {
     #[test]
     fn repos_endpoint_guards() {
         let (addr, _dir) = serve_in_tempdir();
-        let response = request(addr, "GET", "/api/repos/bogus", "");
-        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
-        let response = request(addr, "GET", "/api/repos/github", "");
+        // No token stored, so there is no forge to list.
+        let response = request(addr, "GET", "/api/repos", "");
         assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("github is not configured"), "{response}");
+        // A forge the dropdown doesn't offer is refused at the door.
+        let update = json!({ "forge": { "kind": "bitbucket" } });
+        let response = request(addr, "PUT", "/api/settings", &update.to_string());
+        assert!(response.starts_with("HTTP/1.1 4"), "{response}");
+    }
+
+    /// The health event names the one forge's reading, not a map keyed by
+    /// forge: the page has one dot to paint.
+    #[test]
+    fn events_stream_pushes_forge_health() {
+        let (addr, _dir) = serve_in_tempdir();
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
+        let seen = read_until(&mut stream, r#""state":"no-token""#);
+        assert!(seen.contains("event: forge\n"), "{seen}");
+        assert!(seen.contains(r#""state":"no-token""#), "{seen}");
     }
 
     /// The picker never offers an archived repository, enabled or not, but
