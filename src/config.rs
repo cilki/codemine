@@ -244,10 +244,9 @@ impl Forge {
 pub struct Config {
     pub forge: Forge,
     pub model: String,
-    /// Completed (not skipped) tasks allowed per hour; None is unlimited.
-    /// Spent from a bucket holding an hour's worth, so the rate can be
-    /// fractional: 0.5 is one turn every two hours.
-    pub hourly_limit: Option<f64>,
+    /// At most this many completed (not skipped) tasks in any rolling
+    /// window; None is unlimited.
+    pub rate_limit: Option<crate::settings::RateLimit>,
     pub author_name: String,
     pub turn_timeout: Duration,
     /// The daily window turns may start in.

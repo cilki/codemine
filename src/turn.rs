@@ -48,7 +48,7 @@ pub struct Report {
     /// whatever became of it.
     pub idle: Option<Idle>,
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
-    /// only these turns count toward the hourly limit.
+    /// only these turns count toward the rate limit.
     pub completed: bool,
     /// The turn died on proxy authentication (a rejected client key or a
     /// proxy with no usable login); the main loop briefly gates further
@@ -671,7 +671,7 @@ mod tests {
     /// How a turn ended outranks what its log says, and the log only gets the
     /// last word once the agent exited cleanly and quietly. Every one of
     /// these arms decides something: `Completed` is the only outcome that
-    /// spends from the hourly limit, `Skipped` the only one a skip is
+    /// counts toward the rate limit, `Skipped` the only one a skip is
     /// remembered against, and `Canceled` the only one the next turn starts
     /// right after.
     #[test]

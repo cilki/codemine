@@ -24,11 +24,11 @@ pub struct Settings {
     pub forge: ForgeSettings,
     /// Model to run turns with, as provider/model; empty means unconfigured.
     pub model: String,
-    /// Completed (not skipped) tasks allowed per hour; None is unlimited.
-    /// Fractional rates are the point of the unit: 0.5 is one task every
-    /// two hours. The runner spends them from a bucket, so a whole hour's
-    /// worth can run back to back.
-    pub hourly_limit: Option<f64>,
+    /// At most this many completed (not skipped) tasks in any rolling
+    /// window; None is unlimited. Configs written while this was a
+    /// fractional `hourly_limit` still load: the old key is ignored, so the
+    /// limit starts out unset and the next save drops it.
+    pub rate_limit: Option<RateLimit>,
     /// Seconds before a turn is cut off.
     pub turn_timeout_secs: u64,
     /// The daily window turns may start in; off by default.
@@ -41,10 +41,48 @@ impl Default for Settings {
             proxy: ProxySettings::default(),
             forge: ForgeSettings::default(),
             model: String::new(),
-            hourly_limit: None,
+            rate_limit: None,
             turn_timeout_secs: 21600,
             schedule: Schedule::default(),
         }
+    }
+}
+
+/// The longest window a rate limit may span. The runner keeps completion
+/// times this far back, so a window edited up to the cap still sees exactly
+/// what happened inside it.
+pub const MAX_WINDOW_HOURS: u32 = 24;
+
+/// "At most `tasks` completed tasks in any `hours` hours", counted over a
+/// sliding window: a turn may start once fewer than `tasks` completions fall
+/// inside the last `hours` hours. Whole numbers on both sides, so a slow rate
+/// is a wider window rather than a fraction — one every two hours is
+/// `{ tasks: 1, hours: 2 }`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimit {
+    pub tasks: u32,
+    #[serde(default = "RateLimit::default_hours")]
+    pub hours: u32,
+}
+
+impl RateLimit {
+    fn default_hours() -> u32 {
+        1
+    }
+
+    /// The window's length in seconds.
+    pub fn window_secs(&self) -> u64 {
+        u64::from(self.hours) * 3600
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.tasks == 0 {
+            bail!("rate limit must allow at least one task");
+        }
+        if !(1..=MAX_WINDOW_HOURS).contains(&self.hours) {
+            bail!("rate limit window must be between 1 and {MAX_WINDOW_HOURS} hours");
+        }
+        Ok(())
     }
 }
 
@@ -282,7 +320,7 @@ impl Settings {
                 .runtime_forge()
                 .expect("a forge without problems is active"),
             model: self.model.clone(),
-            hourly_limit: self.hourly_limit,
+            rate_limit: self.rate_limit,
             // Commits are attributed to the model that authored them; the
             // email comes from each forge's account via identity::resolve.
             author_name: model_author_name(&self.model),
@@ -333,10 +371,8 @@ impl Settings {
     }
 
     fn validate(&self) -> Result<()> {
-        if let Some(limit) = self.hourly_limit
-            && !(limit.is_finite() && limit > 0.0)
-        {
-            bail!("hourly limit must be a positive number");
+        if let Some(limit) = &self.rate_limit {
+            limit.validate()?;
         }
         if self.turn_timeout_secs == 0 {
             bail!("turn timeout must be positive");
@@ -752,9 +788,17 @@ mod tests {
     #[test]
     fn validation_rejects_bad_values() {
         let mut settings = configured();
-        let mut bad = configured();
-        bad.hourly_limit = Some(0.0);
-        assert!(settings.apply_update(bad).is_err());
+        for (tasks, hours) in [(0, 1), (1, 0), (1, MAX_WINDOW_HOURS + 1)] {
+            let mut bad = configured();
+            bad.rate_limit = Some(RateLimit { tasks, hours });
+            assert!(settings.apply_update(bad).is_err(), "{tasks} per {hours}h");
+        }
+        let mut good = configured();
+        good.rate_limit = Some(RateLimit {
+            tasks: 1,
+            hours: MAX_WINDOW_HOURS,
+        });
+        assert!(settings.clone().apply_update(good).is_ok());
         let mut bad = configured();
         bad.turn_timeout_secs = 0;
         assert!(settings.apply_update(bad).is_err());
@@ -767,7 +811,33 @@ mod tests {
         assert!(settings.apply_update(bad).is_err());
         // The failed updates changed nothing.
         assert_eq!(settings.turn_timeout_secs, 21600);
-        assert_eq!(settings.hourly_limit, None);
+        assert_eq!(settings.rate_limit, None);
+    }
+
+    /// The limit used to be a fractional `hourly_limit` spent from a token
+    /// bucket. A config.json written then still loads, with the limit unset
+    /// rather than guessed at, and the next save drops the old key.
+    #[test]
+    fn a_config_with_the_retired_hourly_limit_still_loads() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "model": "anthropic/claude",
+            "hourly_limit": 0.5,
+        }))
+        .unwrap();
+        assert_eq!(settings.model, "anthropic/claude");
+        assert_eq!(settings.rate_limit, None);
+        let value = serde_json::to_value(&settings).unwrap();
+        assert!(value.get("hourly_limit").is_none());
+    }
+
+    /// A limit without a window is a limit per hour.
+    #[test]
+    fn a_rate_limit_window_defaults_to_an_hour() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "rate_limit": { "tasks": 3 },
+        }))
+        .unwrap();
+        assert_eq!(settings.rate_limit, Some(RateLimit { tasks: 3, hours: 1 }));
     }
 
     /// CPU and I/O priority used to be settings; they belong to the service

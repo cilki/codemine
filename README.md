@@ -123,7 +123,11 @@ are compressed to save tokens.
 #### Scheduling and rate limiting
 
 With a schedule enabled, turns can only _start_ inside a daily window. You can
-also limit the number of turns that can run per hour.
+also set a rate limit: at most _N_ completed tasks in any rolling _W_ hours
+(up to 24). Once _N_ tasks have completed inside the window, the next turn
+waits until the oldest of them is _W_ hours old. Only turns that make real
+changes count; skipped, failed, timed-out and cancelled turns don't. For a
+slow rate, widen the window: one task every two hours is 1 per 2h.
 
 #### Forge support
 

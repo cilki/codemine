@@ -175,10 +175,10 @@ fn main() -> Result<()> {
             }
         };
 
-        // Off-hours holds come before the bucket so the allowance keeps
-        // growing across the closed stretch, the same as any idle time; a
-        // turn already under way is left to finish, since the window gates
-        // when turns start, not how long they may run.
+        // Off-hours holds come before the rate limit, whose completions age
+        // out across the closed stretch the same as any idle time; a turn
+        // already under way is left to finish, since the window gates when
+        // turns start, not how long they may run.
         if let Some(closed) = cfg.schedule.hold(schedule::local_second_of_day()) {
             let until = status::epoch_now() + closed;
             Status::update(&status, |s| s.activity = Activity::OffHours { until });
@@ -190,23 +190,20 @@ fn main() -> Result<()> {
             continue;
         }
 
-        // Bring the bucket up to date and ask whether it can pay for a turn:
-        // an edited limit resizes it rather than waiting for the old one to
-        // run out, and its clock advances every pass, so the time it grew
-        // for is counted once whether or not this pass gets to run a turn.
-        // The bucket is the one in the shared status, which the web UI
-        // resizes too — see `status::Bucket`.
+        // Ask the rate limit whether its window has room for another
+        // completed task. The window is the one in the shared status, which
+        // the web UI sets the limit of too — see `status::Window` — so an
+        // edit applies to the completions on record at once.
         let now = status::epoch_now();
         let hold = Status::update(&status, |s| {
-            s.allowance.resize(cfg.hourly_limit);
-            s.allowance.refill(now);
-            s.allowance.hold()
+            s.allowance.set_limit(cfg.rate_limit);
+            s.allowance.hold(now)
         });
         if let Some(left) = hold {
             Status::update(&status, |s| {
                 s.activity = Activity::RateLimited { until: now + left }
             });
-            once_only(&cli, "the hourly limit is spent")?;
+            once_only(&cli, "the rate limit's window is full")?;
             // Sleep in slices and fall back into the loop, cut short by an
             // edit, so a limit raised in the web UI applies at once instead
             // of at the end of the wait.
@@ -268,13 +265,17 @@ fn main() -> Result<()> {
                     rejected_model = Some((cfg.model.clone(), complaint));
                 }
                 if report.completed {
-                    let left = Status::update(&status, |s| s.allowance.spend());
-                    // Both are Some together: the bucket only spends under a
-                    // limit, which is also the only case worth logging.
-                    if let (Some(left), Some(limit)) = (left, cfg.hourly_limit) {
+                    // Recorded with or without a limit, so one set later
+                    // counts what actually ran; only logged under one.
+                    let now = status::epoch_now();
+                    let used = Status::update(&status, |s| {
+                        s.allowance.record(now);
+                        s.allowance.used(now)
+                    });
+                    if let Some((used, limit)) = used {
                         info!(
-                            "{:.1} of {} turns left at {limit}/hour",
-                            left.available, left.capacity
+                            "{used} of {} completed tasks in the last {}h",
+                            limit.tasks, limit.hours
                         );
                     }
                 }
@@ -390,8 +391,8 @@ const INSTALL_RETRY: Duration = Duration::from_secs(60);
 
 /// What `--once` does when a turn can't start at all. The flag promises a
 /// single turn and an exit, so every hold the loop would otherwise sit out —
-/// unsound settings, an unreachable proxy, a closed schedule window, a spent
-/// allowance — has to end the process rather than be waited on: all of them
+/// unsound settings, an unreachable proxy, a closed schedule window, a full
+/// rate-limit window — has to end the process rather than be waited on: all of them
 /// need either an edit in the web UI or the clock to move, and under `--once`
 /// there is nobody watching the UI. A turn that ran and found nothing to do
 /// is not this: that one took its turn, and still exits successfully.

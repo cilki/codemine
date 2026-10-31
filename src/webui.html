@@ -272,7 +272,7 @@
 
   <div class="stats">
     <div class="stat"><div class="stat-label" id="stat-state-label">Runner</div><div class="stat-value" id="stat-state">–</div></div>
-    <div class="stat"><div class="stat-label">Hourly limit</div><div class="stat-value" id="stat-allowance">–</div></div>
+    <div class="stat"><div class="stat-label" id="stat-allowance-label">Rate limit</div><div class="stat-value" id="stat-allowance">–</div></div>
     <div class="stat"><div class="stat-label">Completed</div><div class="stat-value" id="stat-completed">–</div></div>
     <div class="stat"><div class="stat-label">Skipped</div><div class="stat-value" id="stat-skipped">–</div></div>
     <div class="stat"><div class="stat-label">Failed</div><div class="stat-value" id="stat-failed">–</div></div>
@@ -304,7 +304,15 @@
     <div class="panel-title log-head"><span>Settings</span>
       <button type="button" class="small" id="settings-close">close</button></div>
     <div class="general-grid">
-      <div class="field"><label for="s-hourly-limit">Hourly task limit</label><input id="s-hourly-limit" type="number" min="0" step="any" placeholder="unlimited"></div>
+      <div class="field" title="Skipped, failed, timed-out and cancelled turns don't count. Once the limit is reached, the next turn waits until the oldest completed task in the window is that many hours old.">
+        <label for="s-rate-tasks">At most N completed tasks per W hours</label>
+        <div class="times">
+          <input id="s-rate-tasks" type="number" min="1" step="1" placeholder="unlimited" aria-label="completed tasks">
+          <span class="muted">per</span>
+          <input id="s-rate-hours" type="number" min="1" max="24" step="1" placeholder="1" aria-label="hours">
+          <span class="muted">h</span>
+        </div>
+      </div>
       <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
       <div class="field">
         <label class="check" for="s-schedule-enabled"><input type="checkbox" id="s-schedule-enabled">
@@ -406,11 +414,6 @@
     return (u ? n.toFixed(1) : n) + " " + units[u];
   }
 
-  // The bucket refills continuously, so its figures are fractional; one
-  // decimal shows it climbing without the tile jittering on a last digit
-  // nobody reads. A whole number stays whole.
-  const fmtTurns = n => (Math.round(n * 10) / 10).toFixed(1).replace(/\.0$/, "");
-
   // The two largest units that carry information, so a week of uptime reads
   // as "7d 3h" rather than 171 hours.
   function fmtDuration(secs) {
@@ -476,7 +479,7 @@
     idle: "every enabled task has nothing to do on any enabled repository",
     sleeping: "pausing between turns",
     off_hours: "outside the schedule's daily window",
-    rate_limited: "the hourly task limit is spent",
+    rate_limited: "the rate limit's window is full; waiting for its oldest completed task to age out",
     usage_limit: "the model's usage window is exhausted",
     unconfigured: "something in the settings has to be fixed first",
   };
@@ -506,9 +509,41 @@
         : "–";
   }
 
+  // The rate limit's tile: completed tasks inside the window out of how
+  // many it allows, and while it is full, how long until the oldest of them
+  // ages out. Counted against the clock rather than the last event, so the
+  // figures move on their own as completions leave the window.
+  function renderAllowance() {
+    const w = state.allowance;
+    const label = $("stat-allowance-label"), value = $("stat-allowance");
+    if (!w) {
+      label.textContent = "Rate limit";
+      value.textContent = "∞";
+      value.title = "no rate limit: turns run back to back";
+      return;
+    }
+    const now = serverNow();
+    const inside = w.completions.filter(t => t + w.window_secs > now);
+    const per = w.hours === 1 ? "hour" : w.hours + " hours";
+    label.textContent = "Tasks per " + (w.hours === 1 ? "hour" : w.hours + "h");
+    let text = inside.length + " / " + w.tasks;
+    let note = inside.length + " of " + w.tasks
+      + " completed tasks used in the last " + per;
+    if (inside.length >= w.tasks) {
+      // The server sends the newest `tasks` completions, so the first one
+      // still inside is the one whose ageing out frees the next slot.
+      const next = inside[inside.length - w.tasks] + w.window_secs - now;
+      text += " · " + fmtCoarse(next);
+      note += "; the next slot opens in " + fmtDuration(next);
+    }
+    value.textContent = text;
+    value.title = note;
+  }
+
   function renderClock() {
     const a = state.activity;
     renderRunnerState();
+    renderAllowance();
     const elapsed = $("running-elapsed");
     if (elapsed && a.state === "running") {
       // Tokens sit beside the clock because the row's other slot is the
@@ -533,11 +568,6 @@
     $("cancel").disabled = a.state === "running" && a.started === canceling;
     renderClock();
 
-    // Turns the rate limiter will let through right now, out of what its
-    // bucket holds when full; no limit configured means no bucket.
-    const bucket = state.allowance;
-    $("stat-allowance").textContent = bucket
-      ? fmtTurns(bucket.available) + " / " + fmtTurns(bucket.capacity) : "∞";
     $("stat-completed").textContent = state.totals.completed;
     $("stat-skipped").textContent = state.totals.skipped;
     $("stat-failed").textContent = state.totals.failed + state.totals.timeout;
@@ -1108,7 +1138,8 @@
       input.placeholder = s.proxy[key.replace("-", "_") + "_set"]
         ? "key set — leave blank to keep" : UNSET[key];
     }
-    $("s-hourly-limit").value = s.hourly_limit ?? "";
+    $("s-rate-tasks").value = s.rate_limit?.tasks ?? "";
+    $("s-rate-hours").value = s.rate_limit?.hours ?? "";
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     renderSchedule(s.schedule);
     const f = s.forge;
@@ -1145,6 +1176,16 @@
   function settingsBody() {
     const num = value => value === "" ? null : Number(value);
     const minutes = num($("s-timeout").value);
+    // No task count means no limit, whatever the window says; an empty
+    // window is an hour.
+    const tasks = num($("s-rate-tasks").value);
+    const hours = num($("s-rate-hours").value);
+    // The server reads both as whole numbers and would refuse a fraction
+    // with a parse error nobody can act on, so say what is wrong here.
+    // The range itself is the server's to check.
+    for (const n of [tasks, hours])
+      if (n !== null && !Number.isInteger(n))
+        throw new Error("the rate limit takes whole numbers of tasks and hours");
     const body = {
       proxy: {
         base_url: $("proxy-base-url").value,
@@ -1153,7 +1194,7 @@
         management_key: $("proxy-management-key").value,
       },
       model: $("s-model").value,
-      hourly_limit: num($("s-hourly-limit").value),
+      rate_limit: tasks === null ? null : { tasks, hours: hours ?? 1 },
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
       schedule: {
         enabled: $("s-schedule-enabled").checked,

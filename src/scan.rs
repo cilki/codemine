@@ -16,7 +16,7 @@
 /// only witness to, read together because they are read from one text.
 pub struct Verdict {
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
-    /// only these turns count toward the hourly limit.
+    /// only these turns count toward the rate limit.
     pub completed: bool,
     /// The session ended on an opencode error report rather than on the
     /// agent's own marker, which it does while still exiting 0.
@@ -113,7 +113,7 @@ const SKIPPED: &str = "TASK SKIPPED";
 
 /// Whether the agent reported real forge changes: a `TASK COMPLETED` marker
 /// line. Only this marker counts as completed, so a turn that skipped, forgot
-/// the marker, or died halfway can't eat into the hourly limit.
+/// the marker, or died halfway can't eat into the rate limit.
 fn reported_completed(closing: &str) -> bool {
     closing
         .lines()

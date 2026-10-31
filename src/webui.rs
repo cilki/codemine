@@ -531,11 +531,12 @@ async fn api_put_settings(
                     .ok();
             }
             // The main loop is inside a turn for hours at a time, so the new
-            // ceiling has to land now rather than at the next turn boundary
-            // — a raised limit is spendable immediately, a lowered one
-            // spills what no longer fits. This is the loop's own bucket, so
-            // it needs no arithmetic of its own.
-            Status::update(&state.status, |s| s.allowance.resize(settings.hourly_limit));
+            // limit has to land now rather than at the next turn boundary,
+            // for the page to show it against the completions on record.
+            // This is the loop's own window, so it needs nothing else.
+            Status::update(&state.status, |s| {
+                s.allowance.set_limit(settings.rate_limit)
+            });
             Json(settings.redacted()).into_response()
         }
         Err(err) => (
@@ -742,16 +743,18 @@ mod tests {
                 "repos": { "me/repo": { "enabled": true, "tasks": ["docs"] } },
             },
             "model": "anthropic/claude",
-            "hourly_limit": 0.5,
+            "rate_limit": { "tasks": 1, "hours": 2 },
         });
         let response = request(addr, "PUT", "/api/settings", &update.to_string());
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
-        // The hourly limit lands in the status right away, not at the next
-        // turn boundary; half a turn an hour still buys a bucket of one.
+        // The rate limit lands in the status right away, not at the next
+        // turn boundary, with no completions on record yet.
         let status = body_json(&request(addr, "GET", "/api/status", ""));
-        assert_eq!(status["allowance"]["capacity"], 1.0);
-        assert_eq!(status["allowance"]["available"], 1.0);
+        assert_eq!(status["allowance"]["tasks"], 1);
+        assert_eq!(status["allowance"]["hours"], 2);
+        assert_eq!(status["allowance"]["window_secs"], 7200);
+        assert_eq!(status["allowance"]["completions"], json!([]));
         let value = body_json(&response);
         assert_eq!(value["forge"]["kind"], "gitlab");
         assert_eq!(value["forge"]["token_set"], true);
@@ -759,24 +762,29 @@ mod tests {
         assert_eq!(value["forge"]["repos"]["me/repo"]["tasks"], json!(["docs"]));
         assert!(!response.contains("secret"));
 
-        // Raising the limit hands over the extra turns at once rather than
-        // trickling them in, and lowering it spills what no longer fits.
+        // An edited limit replaces the old one in the status at once, and
+        // a cleared one shows as no limit at all.
         let mut raised = update.clone();
-        raised["hourly_limit"] = json!(4);
+        raised["rate_limit"] = json!({ "tasks": 4, "hours": 1 });
         assert!(
             request(addr, "PUT", "/api/settings", &raised.to_string()).starts_with("HTTP/1.1 200")
         );
         let status = body_json(&request(addr, "GET", "/api/status", ""));
-        assert_eq!(status["allowance"]["capacity"], 4.0);
-        assert_eq!(status["allowance"]["available"], 4.0);
-        let mut lowered = update.clone();
-        lowered["hourly_limit"] = json!(2);
+        assert_eq!(status["allowance"]["tasks"], 4);
+        assert_eq!(status["allowance"]["window_secs"], 3600);
+        let mut cleared = update.clone();
+        cleared["rate_limit"] = json!(null);
         assert!(
-            request(addr, "PUT", "/api/settings", &lowered.to_string()).starts_with("HTTP/1.1 200")
+            request(addr, "PUT", "/api/settings", &cleared.to_string()).starts_with("HTTP/1.1 200")
         );
         let status = body_json(&request(addr, "GET", "/api/status", ""));
-        assert_eq!(status["allowance"]["capacity"], 2.0);
-        assert_eq!(status["allowance"]["available"], 2.0);
+        assert!(status["allowance"].is_null());
+
+        // A limit of no tasks at all is refused, not stored.
+        let mut zero = update.clone();
+        zero["rate_limit"] = json!({ "tasks": 0, "hours": 1 });
+        let response = request(addr, "PUT", "/api/settings", &zero.to_string());
+        assert!(response.starts_with("HTTP/1.1 422"), "{response}");
 
         // Persisted to the workspace, and the token survives a token-less PUT
         // to the same forge.
