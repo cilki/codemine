@@ -97,9 +97,9 @@ the user decide what to do.
   otherwise), a short summary of what the change does and what you checked, and
   a verdict — approve when nothing you found blocks the merge, request changes
   when something does. Submit everything in one go, so the author is notified
-  once. Where the forge supports inline comments, a single comment listing
-  every finding is not a review: if one anchor is rejected, cite that one
-  finding as `path:line` and keep the others on their lines
+  once. Where the forge supports inline comments, a single comment listing every
+  finding is not a review: if one anchor is rejected, cite that one finding as
+  `path:line` and keep the others on their lines
 - A review is comments and a verdict only. Never push to, rebase, close, or
   merge the PR under review — not even your own; fixing what you found is the
   `feedback` task's job — and never claim you ran something you didn't
@@ -124,6 +124,7 @@ the user decide what to do.
   repeatedly
 - If you find a feature that's probably not worth the weight of its complexity,
   then open an issue for the user to decide whether to delete it.
+- Always include the non-test lines added/removed in the PR description.
 
 ## "todo"
 
@@ -208,9 +209,8 @@ something compiles; always check the compilation succeeds except for trivial
 changes.
 
 When you run the project itself (a server, a daemon, a CLI that keeps state),
-give it a scratch home — `env HOME=/tmp/opencode/home
-XDG_CONFIG_HOME=/tmp/opencode/home/.config
-XDG_DATA_HOME=/tmp/opencode/home/.local/share` — rather than the real one. The
-real home holds the configuration of the tools running this session, and a
-program that writes its own defaults there on startup breaks the sessions that
-come after yours.
+give it a scratch home —
+`env HOME=/tmp/opencode/home XDG_CONFIG_HOME=/tmp/opencode/home/.config XDG_DATA_HOME=/tmp/opencode/home/.local/share`
+— rather than the real one. The real home holds the configuration of the tools
+running this session, and a program that writes its own defaults there on
+startup breaks the sessions that come after yours.

@@ -438,7 +438,6 @@ fn spawn_agent(
     log: &File,
 ) -> Result<Child> {
     let mut argv = crate::sandbox::wrap(&turn.dir, &turn.log_path);
-    argv.extend(workspace::throttle_argv(cfg));
     argv.extend(["opencode", "run"].map(String::from));
     // Which flags keep the session inside the sandbox and pre-approved
     // depends on the opencode: see `Version::run_flags`.

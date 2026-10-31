@@ -278,22 +278,8 @@
     <div class="panel-title log-head"><span>Settings</span>
       <button type="button" class="small" id="settings-close">close</button></div>
     <div class="general-grid">
-      <div class="field"><label for="s-hourly-limit">Hourly task limit (blank = unlimited)</label><input id="s-hourly-limit" type="number" min="0" step="any"></div>
+      <div class="field"><label for="s-hourly-limit">Hourly task limit</label><input id="s-hourly-limit" type="number" min="0" step="any" placeholder="unlimited"></div>
       <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
-      <div class="field"><label for="s-nice">CPU priority</label>
-        <select id="s-nice">
-          <option value="high">high</option>
-          <option value="normal">normal</option>
-          <option value="low">low</option>
-        </select>
-      </div>
-      <div class="field"><label for="s-ionice">I/O class</label>
-        <select id="s-ionice">
-          <option value="">full priority</option>
-          <option value="best-effort">best-effort</option>
-          <option value="idle">idle</option>
-        </select>
-      </div>
       <div class="field">
         <label class="check" for="s-schedule-enabled"><input type="checkbox" id="s-schedule-enabled">
           Only start turns between</label>
@@ -883,13 +869,6 @@
       .map(([slug, description]) => checkRow(enabledTasks, slug, badge(slug), description)));
   }
 
-  // Niceness is presented as a priority, since the numbers in between make no
-  // practical difference to a background agent. A hand-edited config.json
-  // lands on the nearest level and is rewritten to it on the next save.
-  const NICE = { high: null, normal: 10, low: 19 };
-  const nicePriority = nice =>
-    nice == null ? "high" : nice <= 14 ? "normal" : "low";
-
   // The schedule is stored as minutes past local midnight, which is what a
   // time input reads and writes once the two are spelled the same way. A
   // cleared input has no minute to offer, so it stands for midnight.
@@ -1023,8 +1002,6 @@
     }
     $("s-hourly-limit").value = s.hourly_limit ?? "";
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
-    $("s-nice").value = nicePriority(s.nice);
-    $("s-ionice").value = s.ionice ?? "";
     renderSchedule(s.schedule);
     for (const forge of FORGES) {
       const f = s[forge];
@@ -1071,8 +1048,6 @@
       tasks: [...enabledTasks],
       hourly_limit: num($("s-hourly-limit").value),
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
-      nice: NICE[$("s-nice").value] ?? null,
-      ionice: $("s-ionice").value || null,
       schedule: {
         enabled: $("s-schedule-enabled").checked,
         start_minute: toMinutes($("s-schedule-start").value),

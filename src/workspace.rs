@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use tracing::warn;
 use wait_timeout::ChildExt;
 
-use crate::config::{Config, Forge, ForgeKind, IoClass};
+use crate::config::{Config, Forge, ForgeKind};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(600);
 const CODEGRAPH_SYNC_TIMEOUT: Duration = Duration::from_secs(600);
@@ -189,7 +189,7 @@ pub fn prepare(cfg: &Config, forge: &Forge, repo: &str, log: &File) -> Result<Pa
     } else {
         reclone(&cfg.workspace, &url, &dir, log)?;
     }
-    codegraph(cfg, &dir, log);
+    codegraph(&dir, log);
     Ok(dir)
 }
 
@@ -568,16 +568,13 @@ fn remove_codegraph_index(dir: &Path) -> Result<()> {
 /// Keep the repository's codegraph index current so the agent can explore it
 /// through the `codegraph_explore` tool instead of reading files. On failure
 /// the turn still runs; the agent falls back to normal exploration.
-fn codegraph(cfg: &Config, dir: &Path, log: &File) {
+fn codegraph(dir: &Path, log: &File) {
     if !codegraph_available() {
         return;
     }
     let run = |args: &[&str], timeout| {
-        let mut argv = throttle_argv(cfg);
-        argv.push("codegraph".into());
-        argv.extend(args.iter().map(|s| s.to_string()));
         run_logged(
-            Command::new(&argv[0]).args(&argv[1..]).current_dir(dir),
+            Command::new("codegraph").args(args).current_dir(dir),
             timeout,
             log,
         )
@@ -599,23 +596,6 @@ fn codegraph(cfg: &Config, dir: &Path, log: &File) {
     if let Err(err) = run(&["init", "--yes"], CODEGRAPH_INIT_TIMEOUT) {
         warn!("codegraph init failed ({err:#}); running the turn unindexed");
     }
-}
-
-/// The nice/ionice prefix that throttles a process tree; every descendant
-/// inherits both priorities across fork and exec.
-pub fn throttle_argv(cfg: &Config) -> Vec<String> {
-    let mut argv = Vec::new();
-    if let Some(nice) = cfg.nice {
-        argv.extend(["nice".into(), "-n".into(), nice.to_string()]);
-    }
-    match cfg.ionice {
-        Some(IoClass::BestEffort) => {
-            argv.extend(["ionice", "-c", "2", "-n", "7"].map(String::from));
-        }
-        Some(IoClass::Idle) => argv.extend(["ionice", "-c", "3"].map(String::from)),
-        None => {}
-    }
-    argv
 }
 
 /// SIGTERM the child's whole process group with a grace period, then SIGKILL;

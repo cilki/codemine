@@ -166,11 +166,21 @@ memory lives in `skips.json` in the workspace and survives restarts.
 
 #### Prioritization
 
-On low-resource machines, the CPU priority and I/O class settings throttle the
-agent by spawning it through `nice`/`ionice`; the whole process tree (cargo,
-rustc, test runs, codegraph's indexing) inherits the reduced priorities. Both
-default to spawning the agent unthrottled (`high` CPU priority, full I/O
-priority); `normal` is `nice -n 10`, `low` is `nice -n 19`, and the two I/O
-classes are `ionice -c 2 -n 7` (best-effort) and `ionice -c 3` (idle). I/O
-priorities only take effect on schedulers that honor them (e.g. bfq); CPU
-niceness works everywhere.
+**codemine** doesn't throttle itself. On low-resource machines, lower its
+priority where it is started instead; every process it spawns (opencode, cargo,
+rustc, test runs, codegraph's indexing) inherits it. Under systemd, add a
+drop-in with `systemctl edit codemine`:
+
+```ini
+[Service]
+Nice=19
+IOSchedulingClass=idle
+# Or, gentler: best-effort at its lowest level.
+#IOSchedulingClass=best-effort
+#IOSchedulingPriority=7
+```
+
+The web UI runs at the same priority, which it barely notices. I/O priorities
+only take effect on schedulers that honor them (e.g. bfq); `Nice=` works
+everywhere. In a container, `docker run --cpu-shares` and `--blkio-weight` do
+the same job.

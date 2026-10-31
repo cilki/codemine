@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Cli, Config, Forge, ForgeKind, IoClass};
+use crate::config::{Cli, Config, Forge, ForgeKind};
 use crate::schedule::Schedule;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -34,10 +34,6 @@ pub struct Settings {
     pub hourly_limit: Option<f64>,
     /// Seconds before a turn is cut off.
     pub turn_timeout_secs: u64,
-    /// CPU niceness for the agent process tree, 1-19.
-    pub nice: Option<u8>,
-    /// I/O scheduling class for the agent process tree.
-    pub ionice: Option<IoClass>,
     /// The daily window turns may start in; off by default.
     pub schedule: Schedule,
 }
@@ -53,8 +49,6 @@ impl Default for Settings {
             tasks: crate::prompts::default_tasks(),
             hourly_limit: None,
             turn_timeout_secs: 21600,
-            nice: None,
-            ionice: None,
             schedule: Schedule::default(),
         }
     }
@@ -308,8 +302,6 @@ impl Settings {
             // email comes from each forge's account via identity::resolve.
             author_name: model_author_name(&self.model),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
-            nice: self.nice,
-            ionice: self.ionice,
             schedule: self.schedule,
             workspace: cli.workspace.clone(),
         })
@@ -354,11 +346,6 @@ impl Settings {
     }
 
     fn validate(&self) -> Result<()> {
-        if let Some(nice) = self.nice
-            && !(1..=19).contains(&nice)
-        {
-            bail!("nice must be between 1 and 19");
-        }
         if let Some(limit) = self.hourly_limit
             && !(limit.is_finite() && limit > 0.0)
         {
@@ -709,9 +696,6 @@ mod tests {
     fn validation_rejects_bad_values() {
         let mut settings = configured();
         let mut bad = configured();
-        bad.nice = Some(40);
-        assert!(settings.apply_update(bad).is_err());
-        let mut bad = configured();
         bad.hourly_limit = Some(0.0);
         assert!(settings.apply_update(bad).is_err());
         let mut bad = configured();
@@ -728,7 +712,25 @@ mod tests {
         bad.schedule.end_minute = bad.schedule.start_minute;
         assert!(settings.apply_update(bad).is_err());
         // The failed updates changed nothing.
-        assert_eq!(settings.nice, None);
+        assert_eq!(settings.turn_timeout_secs, 21600);
+        assert_eq!(settings.hourly_limit, None);
+    }
+
+    /// CPU and I/O priority used to be settings; they belong to the service
+    /// now. A config.json written while they were still settings must keep
+    /// loading, and the next save drops them.
+    #[test]
+    fn a_config_with_the_retired_priority_settings_still_loads() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "model": "anthropic/claude",
+            "nice": 10,
+            "ionice": "idle",
+        }))
+        .unwrap();
+        assert_eq!(settings.model, "anthropic/claude");
+        let value = serde_json::to_value(&settings).unwrap();
+        assert!(value.get("nice").is_none());
+        assert!(value.get("ionice").is_none());
     }
 
     #[test]

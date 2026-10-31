@@ -11,9 +11,46 @@
 //! discarded both streams, and two of the forge calls appended an empty
 //! stderr as a dangling colon.
 
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+
+/// Whether `command`'s program names an executable somewhere on the PATH
+/// it will be run with.
+///
+/// Spawning would say the same thing on its own, except where it can't:
+/// under QEMU user-mode emulation (an arm64 image on an x86 host, or the
+/// aarch64 build) glibc's `posix_spawn` never learns that the exec failed,
+/// so a missing program "starts" and exits 127 without a word. Looking
+/// first keeps a tool that isn't installed reading as one that couldn't be
+/// run, wherever the runner happens to be.
+///
+/// A program given by path is left to the spawn, and a PATH set on the
+/// command itself is the one searched, as it is the one the spawn uses.
+fn on_path(command: &Command) -> bool {
+    let program = command.get_program();
+    if program.as_encoded_bytes().contains(&b'/') {
+        return true;
+    }
+    let set = command.get_envs().find(|(key, _)| *key == "PATH");
+    let path = match set {
+        Some((_, value)) => value.map(OsStr::to_os_string),
+        None => std::env::var_os("PATH"),
+    };
+    let Some(path) = path else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| executable(&dir.join(program)))
+}
+
+fn executable(candidate: &Path) -> bool {
+    candidate
+        .metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
 
 /// Run `command` to completion and hand back its standard output, failing
 /// with whatever it complained about.
@@ -30,6 +67,9 @@ use anyhow::{Context, Result, bail};
 /// turn, or the whole main loop, depending on who asked.
 pub fn output(command: &mut Command) -> Result<Vec<u8>> {
     let program = command.get_program().to_string_lossy().into_owned();
+    if !on_path(command) {
+        bail!("failed to run {program}: not found in PATH");
+    }
     let output = command
         .stdin(Stdio::null())
         .output()
@@ -89,6 +129,26 @@ mod tests {
             said.contains("failed to run codemine-no-such-program"),
             "{said}"
         );
+    }
+
+    /// The PATH searched is the one the child would run with, so a command
+    /// that sets its own is judged by it rather than by the runner's.
+    #[test]
+    fn a_path_set_on_the_command_is_the_one_searched() {
+        let err = output(Command::new("sh").env("PATH", "/codemine-nonexistent")).unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("failed to run sh"), "{said}");
+    }
+
+    /// A program named by path is not looked up anywhere; it runs as given.
+    #[test]
+    fn a_program_given_by_path_is_not_looked_up() {
+        let sh = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("sh"))
+            .find(|candidate| executable(candidate))
+            .unwrap();
+        let out = output(Command::new(sh).env("PATH", "").args(["-c", "echo ok"])).unwrap();
+        assert_eq!(out, b"ok\n");
     }
 
     /// Nothing here is attended, so a child that reads stdin has to see it

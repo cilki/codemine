@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ForgeKind {
@@ -144,16 +143,6 @@ fn parse_models(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// I/O scheduling class for the agent process tree, passed to ionice.
-#[derive(Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum IoClass {
-    /// Best-effort class at the lowest level (ionice -c 2 -n 7).
-    BestEffort,
-    /// Idle class: only gets disk time nobody else wants (ionice -c 3).
-    Idle,
-}
-
 /// One code forge the bot sweeps.
 pub struct Forge {
     pub kind: ForgeKind,
@@ -224,10 +213,6 @@ pub struct Config {
     pub hourly_limit: Option<f64>,
     pub author_name: String,
     pub turn_timeout: Duration,
-    /// CPU niceness applied to the agent process tree (1-19).
-    pub nice: Option<u8>,
-    /// I/O scheduling class applied to the agent process tree.
-    pub ionice: Option<IoClass>,
     /// The daily window turns may start in.
     pub schedule: crate::schedule::Schedule,
     /// Root of the persistent workspace where repositories stay cloned across

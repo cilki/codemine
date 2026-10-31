@@ -894,14 +894,14 @@ mod tests {
     #[test]
     fn settings_validation_fails_with_422() {
         let (addr, _dir) = serve_in_tempdir();
-        let update = json!({ "nice": 40 });
+        let update = json!({ "turn_timeout_secs": 0 });
         let response = request(addr, "PUT", "/api/settings", &update.to_string());
         assert!(response.starts_with("HTTP/1.1 422"), "{response}");
         assert!(
             body_json(&response)["error"]
                 .as_str()
                 .unwrap()
-                .contains("nice")
+                .contains("timeout")
         );
     }
 
