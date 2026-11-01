@@ -1098,9 +1098,11 @@
       };
       label.append(check, name);
       row.insertCell().append(label);
-      for (const [slug, description] of columns) {
+      // The instructions tooltip lives on the column header only; repeating
+      // it on every cell would just get in the way of the pointer.
+      for (const [slug] of columns) {
         const state = repo?.tasks.has(slug) ? "on" : "off";
-        row.insertCell().append(taskToggle(slug, description, state, () => {
+        row.insertCell().append(taskToggle(slug, null, state, () => {
           const tasks = repoState(name).tasks;
           tasks.has(slug) ? tasks.delete(slug) : tasks.add(slug);
           toggled();
