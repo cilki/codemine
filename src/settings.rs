@@ -31,7 +31,8 @@ pub struct Settings {
     pub rate_limit: Option<RateLimit>,
     /// Seconds before a turn is cut off.
     pub turn_timeout_secs: u64,
-    /// The daily window turns may start in; off by default.
+    /// The daily window automatic turns may start in; off by default. Turns
+    /// the forge asks for start outside it too.
     pub schedule: Schedule,
 }
 

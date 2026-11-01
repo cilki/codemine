@@ -57,6 +57,25 @@ impl TokenUsage {
     }
 }
 
+/// What rtk trimmed off the command output the agent read, as rtk recorded
+/// it: `input` is the raw output and `output` what the agent got instead,
+/// both in rtk's bytes/4 estimate, so the ratio between them is reliable
+/// and the absolute figures approximate.
+#[derive(Serialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct Savings {
+    pub commands: u64,
+    pub input: u64,
+    pub output: u64,
+}
+
+impl Savings {
+    pub fn add(&mut self, other: &Savings) {
+        self.commands += other.commands;
+        self.input += other.input;
+        self.output += other.output;
+    }
+}
+
 /// How a finished turn went, for display only; whether a turn counts toward
 /// the rate limit is decided separately in the turn runner.
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
@@ -82,6 +101,9 @@ pub struct TurnRecord {
     pub outcome: Outcome,
     /// None when opencode's session storage couldn't be read.
     pub tokens: Option<TokenUsage>,
+    /// None when rtk's history couldn't be read, which includes rtk not
+    /// being installed at all.
+    pub rtk: Option<Savings>,
     /// The turn's full log on disk, kept until the record ages out.
     #[serde(skip)]
     pub log_path: PathBuf,
@@ -132,6 +154,9 @@ pub enum Activity {
         /// What the turn has spent so far, resampled while it runs; None
         /// until opencode has recorded its first message.
         tokens: Option<TokenUsage>,
+        /// What rtk has trimmed for the turn so far; None while its
+        /// history can't be read.
+        rtk: Option<Savings>,
     },
     Sleeping {
         until: u64,
@@ -152,8 +177,8 @@ pub enum Activity {
     RateLimited {
         until: u64,
     },
-    /// The clock is outside the configured daily window; the next turn may
-    /// start at this epoch.
+    /// The clock is outside the configured daily window; the next automatic
+    /// turn may start at this epoch, though forge activity starts one sooner.
     OffHours {
         until: u64,
     },
@@ -278,6 +303,7 @@ pub struct Totals {
     pub timeout: u64,
     pub canceled: u64,
     pub tokens: TokenUsage,
+    pub rtk: Savings,
 }
 
 #[derive(Serialize)]
@@ -368,6 +394,9 @@ impl Status {
         if let Some(tokens) = &record.tokens {
             self.totals.tokens.add(tokens);
         }
+        if let Some(rtk) = &record.rtk {
+            self.totals.rtk.add(rtk);
+        }
         self.turns.push_front(record);
         self.turns_revision += 1;
         // A record is the only way to reach a turn's log — the web UI asks
@@ -410,6 +439,11 @@ mod tests {
                 input: 10,
                 output: 5,
                 ..Default::default()
+            }),
+            rtk: Some(Savings {
+                commands: 1,
+                input: 100,
+                output: 20,
             }),
             log_path: PathBuf::new(),
         }

@@ -1,5 +1,7 @@
-//! The optional daily window turns may start in. Off by default; when on,
-//! the main loop holds turns until the local clock is back inside it. The
+//! The optional daily window automatic turns may start in. Off by default;
+//! when on, the main loop holds the turns it would pick for itself until the
+//! local clock is back inside it, while turns the forge asks for — a review
+//! request, a comment on the bot's PR — start whenever they arrive. The
 //! window is read against the process's timezone, so a deployment picks its
 //! quiet hours with `TZ` (or the container's `/etc/localtime`) and thinks in
 //! wall-clock time.
@@ -15,7 +17,8 @@ const SECONDS_PER_DAY: u32 = MINUTES_PER_DAY * 60;
 #[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(default)]
 pub struct Schedule {
-    /// Off by default: turns run around the clock until this is turned on.
+    /// Off by default: automatic turns run around the clock until this is
+    /// turned on.
     pub enabled: bool,
     /// Minutes past local midnight the window opens and closes. A start
     /// after the end wraps midnight, which is the usual shape of it — 22:00

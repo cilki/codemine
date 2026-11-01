@@ -15,7 +15,9 @@ use crate::cache;
 use crate::config::{Config, Forge, ForgeKind};
 use crate::precheck;
 use crate::scan::{Verdict, last_lines};
-use crate::status::{Activity, Outcome, Shared, Status, TokenUsage, TurnRecord, epoch_now};
+use crate::status::{
+    Activity, Outcome, Savings, Shared, Status, TokenUsage, TurnRecord, epoch_now,
+};
 use crate::workspace;
 
 #[derive(Default)]
@@ -24,6 +26,20 @@ pub enum Backoff {
     UsageLimit(u64),
     #[default]
     Normal,
+}
+
+/// What a pass may draw from. The schedule's window gates automatic turns —
+/// the ones the runner picks for itself off the random draw — and not the
+/// ones the forge asked for, so a pass inside the window draws from anything
+/// and a pass outside it draws from the activity queue alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Draw {
+    /// The activity queue first, then the random draw over the whole pool.
+    Any,
+    /// The activity queue alone: a review request or a comment on the bot's
+    /// PR starts a turn whenever it arrives, where an automatic turn waits
+    /// for the window to open.
+    QueuedOnly,
 }
 
 /// Why a pass took no turn at all. The two cases differ in kind, and so has
@@ -111,6 +127,7 @@ impl Turn<'_> {
             pgid: 0,
             started: self.started,
             tokens: None,
+            rtk: None,
         }
     }
 
@@ -118,14 +135,7 @@ impl Turn<'_> {
     /// an idle page shows, and the turn joins the list and the totals. The
     /// one place a turn is recorded, whether it ran to the end or never got
     /// past preparing its clone.
-    fn finish(
-        &self,
-        status: &Shared,
-        tail: &str,
-        outcome: Outcome,
-        elapsed: u64,
-        tokens: Option<TokenUsage>,
-    ) {
+    fn finish(&self, status: &Shared, tail: &str, outcome: Outcome, elapsed: u64, spent: Spent) {
         let record = TurnRecord {
             task: self.task.to_owned(),
             repo: self.repo.to_owned(),
@@ -133,7 +143,8 @@ impl Turn<'_> {
             started: self.started,
             duration_secs: elapsed,
             outcome,
-            tokens,
+            tokens: spent.tokens,
+            rtk: spent.rtk,
             log_path: self.log_path.clone(),
         };
         Status::update(status, |s| {
@@ -147,13 +158,16 @@ impl Turn<'_> {
 /// Run one opencode turn against the repository's workspace clone and report
 /// how it went. The clone survives across turns, and so does the turn's log
 /// under `<workspace>/logs`, for as long as the process runs. `opencode` is
-/// the version the agent is started with, which settles its flags.
+/// the version the agent is started with, which settles its flags, and
+/// `draw` is whether the random draw is on the table or only what the forge
+/// queued — see `Draw`.
 pub fn run(
     cfg: &Config,
     opencode: &crate::opencode::Version,
     status: &Shared,
     pending: &crate::events::Pending,
     cache: &cache::Cache,
+    draw: Draw,
 ) -> Result<Report> {
     let forge = &cfg.forge;
     let pool = pool(forge)?;
@@ -170,7 +184,9 @@ pub fn run(
     // The precondition probes plus the skip cache, sharing one set of forge
     // lookups across everything this draw asks about.
     let probe = cache::Probe::new(cache);
-    let Some((task, repo)) = pick(forge, &pool, pending, &probe) else {
+    let Some((task, repo)) = pick(forge, &pool, pending, draw, |task, repo| {
+        probe.actionable(task, forge, repo)
+    }) else {
         return Ok(Report {
             idle: Some(Idle::NothingToDo),
             ..Default::default()
@@ -210,7 +226,7 @@ pub fn run(
             "failed to prepare {repo} in {elapsed}s: {err:#}\n{}",
             last_lines(&tail, 20)
         );
-        turn.finish(status, &tail, Outcome::Failed, elapsed, None);
+        turn.finish(status, &tail, Outcome::Failed, elapsed, Spent::default());
         return Ok(Report::default());
     }
 
@@ -222,7 +238,7 @@ pub fn run(
             *pgid = child.id() as i32;
         }
     });
-    let (exit, canceled, sampled) = supervise(cfg, status, &turn, &mut child)?;
+    let (exit, canceled, spent) = supervise(cfg, status, &turn, &mut child)?;
     let elapsed = turn.elapsed();
 
     let tail = read_tail(&mut log, 64 * 1024)?;
@@ -242,7 +258,7 @@ pub fn run(
         }
     }
 
-    turn.finish(status, &tail, outcome, elapsed, sampled);
+    turn.finish(status, &tail, outcome, elapsed, spent);
 
     Ok(Report {
         backoff: match verdict.usage_limit {
@@ -278,12 +294,18 @@ fn pool(forge: &Forge) -> Result<Vec<String>> {
 /// ahead of the random draw. Entries that no longer check out (repository
 /// disabled or gone, the forge since switched, the activity already handled,
 /// the tasks since turned off for the repository) are dropped rather than
-/// requeued — the ordinary draw probes both tasks anyway.
+/// requeued — the ordinary draw probes both tasks anyway. Under
+/// `Draw::QueuedOnly` the queue is all there is: a pass outside the
+/// schedule's window takes the turns the forge asked for and none the
+/// runner would pick on its own. `check` is whether a (task, repository)
+/// pair has work, which the caller answers from the prechecks and the skip
+/// cache.
 fn pick<'a>(
     forge: &'a Forge,
     pool: &'a [String],
     pending: &crate::events::Pending,
-    probe: &cache::Probe,
+    draw: Draw,
+    check: impl Fn(&str, &str) -> bool,
 ) -> Option<(&'a str, &'a str)> {
     while let Some((kind, repo)) = pending.pop() {
         if kind != forge.kind {
@@ -293,15 +315,16 @@ fn pick<'a>(
             continue;
         };
         for task in crate::events::QUEUED_TASKS {
-            if forge.runs(task, repo) && probe.actionable(task, forge, repo) {
+            if forge.runs(task, repo) && check(task, repo) {
                 info!("fresh activity on {repo}; drawing {task} on it first");
                 return Some((task, repo));
             }
         }
     }
-    precheck::draw(forge, pool, |task, repo| {
-        probe.actionable(task, forge, repo)
-    })
+    match draw {
+        Draw::Any => precheck::draw(forge, pool, check),
+        Draw::QueuedOnly => None,
+    }
 }
 
 /// Create the turn's log and the directory it lives in. Opened for reading as
@@ -413,6 +436,14 @@ fn spawn_agent(
         .with_context(|| format!("failed to spawn {}", argv[0]))
 }
 
+/// What a turn cost and what rtk saved it, each None when its source
+/// couldn't be read.
+#[derive(Default)]
+struct Spent {
+    tokens: Option<TokenUsage>,
+    rtk: Option<Savings>,
+}
+
 /// Wait for the agent, killing its process group if the timeout runs out or
 /// the web UI asks for the turn to be cut short. How it ended comes back as
 /// the exit status (None when it was killed), whether the kill was the cancel
@@ -423,16 +454,18 @@ fn spawn_agent(
 /// page can watch the cost climb instead of learning it at the end. The
 /// samples come off one [`usage::Sampler`](crate::usage::Sampler), which
 /// carries the sum from hop to hop and so reads only what the agent recorded
-/// since the previous one.
+/// since the previous one. rtk's savings are resampled on the same hops.
 fn supervise(
     cfg: &Config,
     status: &Shared,
     turn: &Turn,
     child: &mut Child,
-) -> Result<(Option<ExitStatus>, bool, Option<TokenUsage>)> {
+) -> Result<(Option<ExitStatus>, bool, Spent)> {
     let run_start = Instant::now();
     let mut usage = crate::usage::Sampler::new(turn.wall);
+    let savings = crate::savings::Sampler::new(turn.wall, &turn.dir);
     let mut sampled = None;
+    let mut saved = None;
     let mut canceled = false;
     let exit = loop {
         // Checked first so a cancel clicked during preparation lands too.
@@ -450,11 +483,29 @@ fn supervise(
         // A failed read (opencode mid-write, say) leaves the last good
         // sample up rather than blinking the figure away.
         let tokens = usage.sample();
-        if tokens.is_some() && tokens != sampled {
+        let rtk = savings.sample();
+        let tokens_moved = tokens.is_some() && tokens != sampled;
+        let rtk_moved = rtk.is_some() && rtk != saved;
+        if tokens_moved {
             sampled = tokens.clone();
+        }
+        if rtk_moved {
+            saved = rtk.clone();
+        }
+        if tokens_moved || rtk_moved {
             Status::update(status, |s| {
-                if let Activity::Running { tokens: live, .. } = &mut s.activity {
-                    *live = tokens;
+                if let Activity::Running {
+                    tokens: live,
+                    rtk: live_rtk,
+                    ..
+                } = &mut s.activity
+                {
+                    if tokens_moved {
+                        *live = tokens;
+                    }
+                    if rtk_moved {
+                        *live_rtk = rtk;
+                    }
                 }
             });
         }
@@ -469,8 +520,13 @@ fn supervise(
     // One last sample, after the tree is down and so after opencode has
     // written whatever it had left: the answer the turn is recorded with.
     // Nothing is lost if this one fails — the sampler still holds what the
-    // hops above counted.
-    Ok((exit, canceled, usage.sample().or(sampled)))
+    // hops above counted. Likewise for rtk, whose last command may have
+    // finished recording only as the tree went down.
+    let spent = Spent {
+        tokens: usage.sample().or(sampled),
+        rtk: savings.sample().or(saved),
+    };
+    Ok((exit, canceled, spent))
 }
 
 /// What the finished turn amounts to, and the one line the runner says about
@@ -654,9 +710,99 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ExitStatus, Outcome, PAGE_SIZE, Verdict, listed_repo, open_log, outcome_of, paginate,
-        safe_repo_path,
+        Draw, ExitStatus, Outcome, PAGE_SIZE, Verdict, listed_repo, open_log, outcome_of, paginate,
+        pick, safe_repo_path,
     };
+    use crate::config::{Forge, ForgeKind};
+    use crate::events::Pending;
+
+    /// A GitHub forge with the same tasks on every one of `repos`, and the
+    /// pool listing all of them.
+    fn sweep(repos: &[&str], tasks: &[&str]) -> (Forge, Vec<String>) {
+        let tasks: std::collections::BTreeSet<String> =
+            tasks.iter().map(|task| (*task).to_owned()).collect();
+        let forge = Forge {
+            kind: ForgeKind::Github,
+            token: "tok".into(),
+            user: String::new(),
+            login: String::new(),
+            email: String::new(),
+            url: "https://github.com".into(),
+            repos: repos
+                .iter()
+                .map(|repo| ((*repo).to_owned(), tasks.clone()))
+                .collect(),
+        };
+        let pool = repos.iter().map(|repo| (*repo).to_owned()).collect();
+        (forge, pool)
+    }
+
+    /// Fresh activity is drawn whether or not the window is open, and
+    /// `review` asks before `feedback`.
+    #[test]
+    fn a_queued_repository_is_drawn_inside_and_outside_the_window() {
+        for draw in [Draw::Any, Draw::QueuedOnly] {
+            let (forge, pool) = sweep(&["me/one", "me/two"], &["review", "feedback", "rebase"]);
+            let pending = Pending::new();
+            pending.push(ForgeKind::Github, "me/two".into());
+            let picked = pick(&forge, &pool, &pending, draw, |_, _| true);
+            assert_eq!(picked, Some(("review", "me/two")), "{draw:?}");
+            assert!(pending.is_empty());
+        }
+    }
+
+    /// Outside the window only the forge's own asks get a turn: with nothing
+    /// queued the pass draws nothing, and probes nothing either.
+    #[test]
+    fn off_hours_takes_no_automatic_turn() {
+        let (forge, pool) = sweep(&["me/repo"], &["review", "feedback", "rebase"]);
+        let pending = Pending::new();
+        let probed = std::cell::Cell::new(0);
+        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| {
+            probed.set(probed.get() + 1);
+            true
+        });
+        assert_eq!(picked, None);
+        assert_eq!(probed.get(), 0);
+    }
+
+    /// A queued repository whose activity turns out to be handled already is
+    /// dropped, and off hours that is the end of the pass — the random draw
+    /// is not consulted. Inside the window it is.
+    #[test]
+    fn a_handled_queue_entry_falls_through_to_the_draw_only_inside_the_window() {
+        let (forge, pool) = sweep(&["me/repo"], &["review", "feedback", "rebase"]);
+        let queued_only = |task: &str, _: &str| crate::events::QUEUED_TASKS.contains(&task);
+
+        let pending = Pending::new();
+        pending.push(ForgeKind::Github, "me/repo".into());
+        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| false);
+        assert_eq!(picked, None);
+        assert!(pending.is_empty());
+
+        let pending = Pending::new();
+        pending.push(ForgeKind::Github, "me/repo".into());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let picked = pick(&forge, &pool, &pending, Draw::Any, |task, repo| {
+            seen.borrow_mut().push(task.to_owned());
+            !queued_only(task, repo)
+        });
+        assert_eq!(picked, Some(("rebase", "me/repo")));
+        assert!(seen.borrow().iter().any(|task| task == "rebase"));
+    }
+
+    /// Entries that no longer check out are dropped rather than drawn: the
+    /// forge since switched, or the repository left the pool.
+    #[test]
+    fn stale_queue_entries_are_dropped() {
+        let (forge, pool) = sweep(&["me/repo"], &["review", "feedback"]);
+        let pending = Pending::new();
+        pending.push(ForgeKind::Gitea, "me/repo".into());
+        pending.push(ForgeKind::Github, "me/gone".into());
+        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| true);
+        assert_eq!(picked, None);
+        assert!(pending.is_empty());
+    }
 
     fn verdict(completed: bool, died: bool) -> Verdict {
         Verdict {

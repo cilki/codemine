@@ -84,6 +84,7 @@
   #stat-skipped { color: #9aa0a6; }
   #stat-failed { color: #e74c3c; }
   #stat-tokens { color: #61afef; }
+  #stat-tokens[title] { cursor: help; }
   .columns {
     /* The log is the wide column: turn rows are short, log lines aren't. The
        turns column is exactly as wide as the runner and past-hour tiles plus
@@ -316,7 +317,7 @@
       <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
       <div class="field">
         <label class="check" for="s-schedule-enabled"><input type="checkbox" id="s-schedule-enabled">
-          Only start turns between</label>
+          Only start automatic turns between</label>
         <div class="times">
           <input id="s-schedule-start" type="time" aria-label="window opens">
           <span class="muted">to</span>
@@ -392,6 +393,28 @@
     if (a.state !== "running") return null;
     if (a.tokens) lastTokens = { started: a.started, tokens: a.tokens };
     return lastTokens && lastTokens.started === a.started ? lastTokens.tokens : null;
+  }
+
+  // The same for rtk's savings, which come off a different database on the
+  // same hops and can come up empty independently of the tokens.
+  let lastRtk = null;
+
+  function liveRtk(a) {
+    if (a.state !== "running") return null;
+    if (a.rtk) lastRtk = { started: a.started, rtk: a.rtk };
+    return lastRtk && lastRtk.started === a.started ? lastRtk.rtk : null;
+  }
+
+  // rtk's figures are its own bytes/4 estimates of the command output it
+  // filtered, so the share is the reliable part and the counts approximate.
+  function rtkNote(r) {
+    if (!r.commands) return "no rtk savings recorded";
+    const saved = r.input - r.output;
+    const pct = r.input ? Math.round(saved / r.input * 100) : 0;
+    return "rtk saved ~" + fmtTokens(Math.max(saved, 0)) + " tokens (" + pct
+      + "% of " + fmtTokens(r.input) + " in command output) over "
+      + r.commands + (r.commands === 1 ? " command" : " commands")
+      + "\nestimated by rtk at 4 bytes per token";
   }
 
   const tokenBreakdown = t =>
@@ -478,7 +501,7 @@
   const STATE_NOTES = {
     idle: "every enabled task has nothing to do on any enabled repository",
     sleeping: "pausing between turns",
-    off_hours: "outside the schedule's daily window",
+    off_hours: "outside the schedule's daily window; automatic turns wait, forge activity still starts one",
     rate_limited: "the rate limit's window is full; waiting for its oldest completed task to age out",
     usage_limit: "the model's usage window is exhausted",
     unconfigured: "something in the settings has to be fixed first",
@@ -577,6 +600,14 @@
     const spent = (state.totals.tokens ? tokenTotal(state.totals.tokens) : 0)
       + (running ? tokenTotal(running) : 0);
     $("stat-tokens").textContent = spent ? fmtTokens(spent) : "–";
+    const rtk = { commands: 0, input: 0, output: 0 };
+    for (const r of [state.totals.rtk, liveRtk(a)]) {
+      if (!r) continue;
+      rtk.commands += r.commands;
+      rtk.input += r.input;
+      rtk.output += r.output;
+    }
+    $("stat-tokens").title = rtkNote(rtk);
 
     const rows = turnHistory.map(turn => {
       const row = turnRow(turn.task, turn.repo, turn.forge, turn.outcome,

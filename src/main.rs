@@ -18,6 +18,7 @@ mod precheck;
 mod prompts;
 mod proxy;
 mod sandbox;
+mod savings;
 mod scan;
 mod schedule;
 mod settings;
@@ -42,7 +43,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::{Cli, Config, ForgeKind, USAGE};
 use crate::settings::{Problem, Settings, SettingsStore};
 use crate::status::{Activity, Shared, Status};
-use crate::turn::Backoff;
+use crate::turn::{Backoff, Draw};
 
 fn main() -> Result<()> {
     // The hidden sandbox wrapper mode the turn runner spawns opencode
@@ -101,8 +102,9 @@ fn main() -> Result<()> {
         .spawn(move || drop(config::models(&warm_against)))?;
 
     // Watch the forge for activity: a comment on a PR or issue queues that
-    // repository for a feedback turn ahead of the draw, and ends the
-    // between-turn sleep early.
+    // repository for a feedback turn ahead of the draw, ends the between-turn
+    // sleep early, and starts a turn outside the schedule's window, which
+    // holds only the automatic turns.
     let pending = events::Pending::new();
     events::spawn(store.clone(), pending.clone())?;
 
@@ -175,20 +177,33 @@ fn main() -> Result<()> {
             }
         };
 
+        // The schedule's window gates automatic turns only: a turn the forge
+        // asked for — a review request, a comment on the bot's PR — starts
+        // whenever it arrives, and a closed window narrows the pass to those.
         // Off-hours holds come before the rate limit, whose completions age
         // out across the closed stretch the same as any idle time; a turn
         // already under way is left to finish, since the window gates when
         // turns start, not how long they may run.
-        if let Some(closed) = cfg.schedule.hold(schedule::local_second_of_day()) {
-            let until = status::epoch_now() + closed;
-            Status::update(&status, |s| s.activity = Activity::OffHours { until });
-            once_only(&cli, "the schedule's window is closed")?;
-            // Sliced like the rate-limit wait, and cut short by an edit, so
-            // a widened window applies at once instead of at the end of the
-            // hold.
-            wait(closed.min(60), 1, || store.generation() != generation);
-            continue;
-        }
+        let draw = match cfg.schedule.hold(schedule::local_second_of_day()) {
+            None => Draw::Any,
+            Some(_) if !pending.is_empty() => {
+                info!("forge activity off hours; drawing from the queue alone");
+                Draw::QueuedOnly
+            }
+            Some(closed) => {
+                let until = status::epoch_now() + closed;
+                Status::update(&status, |s| s.activity = Activity::OffHours { until });
+                once_only(&cli, "the schedule's window is closed")?;
+                // Sliced like the rate-limit wait, and cut short by an edit,
+                // so a widened window applies at once instead of at the end
+                // of the hold — and by forge activity, which may run off
+                // hours.
+                wait(closed.min(60), 1, || {
+                    store.generation() != generation || !pending.is_empty()
+                });
+                continue;
+            }
+        };
 
         // Ask the rate limit whether its window has room for another
         // completed task. The window is the one in the shared status, which
@@ -211,7 +226,18 @@ fn main() -> Result<()> {
             continue;
         }
 
-        match turn::run(&cfg, &opencode, &status, &pending, &cache) {
+        match turn::run(&cfg, &opencode, &status, &pending, &cache, draw) {
+            // An off-hours pass whose queued activity turned out to be
+            // handled already (or on a repository since disabled) says
+            // nothing about the pool: it never drew from it. Straight back
+            // around into the hold, with no idle gap and no "nothing to do"
+            // — the queue was drained, and the watcher only refills it on a
+            // newer feed stamp, so there is nothing to spin on.
+            Ok(report)
+                if report.idle == Some(turn::Idle::NothingToDo) && draw == Draw::QueuedOnly =>
+            {
+                info!("the queued activity needed no turn; back to the hold");
+            }
             // The draw took no turn. Which of its two reasons it is decides
             // how that is shown: a pool the forge doesn't list is a blocker
             // like any settings problem, where a caught-up pool is simply

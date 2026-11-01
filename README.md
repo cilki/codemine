@@ -118,12 +118,17 @@ large projects.
 #### RTK
 
 With [rtk](https://github.com/rtk-ai/rtk) installed, the agent's shell commands
-are compressed to save tokens.
+are compressed to save tokens. Hover over the Tokens stat in the web UI to see
+how much rtk has saved since startup. rtk estimates these numbers at 4 bytes
+per token, so the percentage is reliable but the token counts are approximate.
 
 #### Scheduling and rate limiting
 
-With a schedule enabled, turns can only _start_ inside a daily window. You can
-also set a rate limit: at most _N_ completed tasks in any rolling _W_ hours
+With a schedule enabled, automatic turns — the ones the runner picks for
+itself — can only _start_ inside a daily window. Turns the forge asks for (a
+review request, or a comment on one of the bot's PRs) start whenever they
+arrive, window or not. You can also set a rate limit, which applies to both:
+at most _N_ completed tasks in any rolling _W_ hours
 (up to 24). Once _N_ tasks have completed inside the window, the next turn
 waits until the oldest of them is _W_ hours old. Only turns that make real
 changes count; skipped, failed, timed-out and cancelled turns don't. For a

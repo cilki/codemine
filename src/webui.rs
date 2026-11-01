@@ -855,6 +855,7 @@ mod tests {
                 pgid: child.id() as i32,
                 started: 0,
                 tokens: None,
+                rtk: None,
             }
         });
 
@@ -906,6 +907,7 @@ mod tests {
                 pgid: 1,
                 started: 0,
                 tokens: None,
+                rtk: None,
             }
         });
         let response = request(addr, "POST", "/api/cancel", "");
@@ -977,6 +979,7 @@ mod tests {
                 cache_read: 9_876_543,
                 cache_write: 123_456,
             }),
+            rtk: None,
             log_path: std::path::PathBuf::from("/nonexistent"),
         }
     }
@@ -1008,6 +1011,7 @@ mod tests {
                 pgid: 0,
                 started: 1_760_000_000,
                 tokens: sample(1),
+                rtk: None,
             };
             // A full history, which is what the stream used to re-send.
             for n in 0..200 {
@@ -1097,6 +1101,7 @@ mod tests {
                 duration_secs: 1,
                 outcome: crate::status::Outcome::Completed,
                 tokens: None,
+                rtk: None,
                 log_path: path.clone(),
             })
         });
@@ -1141,6 +1146,7 @@ mod tests {
                 pgid: 0,
                 started: 0,
                 tokens: None,
+                rtk: None,
             }
         });
         assert_eq!(log_tail(&status), "first\n");
@@ -1277,6 +1283,7 @@ mod tests {
             pgid: 0,
             started: 0,
             tokens: None,
+            rtk: None,
         };
         let append = |path: &std::path::Path, text: &str| {
             let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();

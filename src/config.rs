@@ -249,7 +249,7 @@ pub struct Config {
     pub rate_limit: Option<crate::settings::RateLimit>,
     pub author_name: String,
     pub turn_timeout: Duration,
-    /// The daily window turns may start in.
+    /// The daily window automatic turns may start in.
     pub schedule: crate::schedule::Schedule,
     /// Root of the persistent workspace where repositories stay cloned across
     /// turns.
