@@ -438,7 +438,7 @@ fn spawn_agent(
 
 /// What a turn cost and what rtk saved it, each None when its source
 /// couldn't be read.
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq)]
 struct Spent {
     tokens: Option<TokenUsage>,
     rtk: Option<Savings>,
@@ -464,8 +464,14 @@ fn supervise(
     let run_start = Instant::now();
     let mut usage = crate::usage::Sampler::new(turn.wall);
     let savings = crate::savings::Sampler::new(turn.wall, &turn.dir);
-    let mut sampled = None;
-    let mut saved = None;
+    // Each figure resampled over the last good one, so a failed read
+    // (opencode mid-write, say) leaves that up rather than blinking the
+    // figure away — on the page as much as in the record.
+    let mut resample = |last: &Spent| Spent {
+        tokens: usage.sample().or_else(|| last.tokens.clone()),
+        rtk: savings.sample().or_else(|| last.rtk.clone()),
+    };
+    let mut spent = Spent::default();
     let mut canceled = false;
     let exit = loop {
         // Checked first so a cancel clicked during preparation lands too.
@@ -480,34 +486,15 @@ fn supervise(
         if let Some(exit) = child.wait_timeout(SAMPLE_INTERVAL.min(left))? {
             break Some(exit);
         }
-        // A failed read (opencode mid-write, say) leaves the last good
-        // sample up rather than blinking the figure away.
-        let tokens = usage.sample();
-        let rtk = savings.sample();
-        let tokens_moved = tokens.is_some() && tokens != sampled;
-        let rtk_moved = rtk.is_some() && rtk != saved;
-        if tokens_moved {
-            sampled = tokens.clone();
-        }
-        if rtk_moved {
-            saved = rtk.clone();
-        }
-        if tokens_moved || rtk_moved {
+        let next = resample(&spent);
+        if next != spent {
             Status::update(status, |s| {
-                if let Activity::Running {
-                    tokens: live,
-                    rtk: live_rtk,
-                    ..
-                } = &mut s.activity
-                {
-                    if tokens_moved {
-                        *live = tokens;
-                    }
-                    if rtk_moved {
-                        *live_rtk = rtk;
-                    }
+                if let Activity::Running { tokens, rtk, .. } = &mut s.activity {
+                    *tokens = next.tokens.clone();
+                    *rtk = next.rtk.clone();
                 }
             });
+            spent = next;
         }
     };
     match exit {
@@ -522,11 +509,7 @@ fn supervise(
     // Nothing is lost if this one fails — the sampler still holds what the
     // hops above counted. Likewise for rtk, whose last command may have
     // finished recording only as the tree went down.
-    let spent = Spent {
-        tokens: usage.sample().or(sampled),
-        rtk: savings.sample().or(saved),
-    };
-    Ok((exit, canceled, spent))
+    Ok((exit, canceled, resample(&spent)))
 }
 
 /// What the finished turn amounts to, and the one line the runner says about

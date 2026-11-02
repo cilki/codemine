@@ -382,29 +382,6 @@
 
   const tokenTotal = t => t.input + t.output + t.reasoning + t.cache_read + t.cache_write;
 
-  // The running turn's newest token sample, by the turn it belongs to.
-  // Sampling can come up empty — opencode's session store is mid-write, say —
-  // and a figure that blinks out and back reads as a glitch, so the last
-  // value seen stands in until a fresher one lands. A new turn starts over
-  // rather than inheriting its predecessor's total.
-  let lastTokens = null;
-
-  function liveTokens(a) {
-    if (a.state !== "running") return null;
-    if (a.tokens) lastTokens = { started: a.started, tokens: a.tokens };
-    return lastTokens && lastTokens.started === a.started ? lastTokens.tokens : null;
-  }
-
-  // The same for rtk's savings, which come off a different database on the
-  // same hops and can come up empty independently of the tokens.
-  let lastRtk = null;
-
-  function liveRtk(a) {
-    if (a.state !== "running") return null;
-    if (a.rtk) lastRtk = { started: a.started, rtk: a.rtk };
-    return lastRtk && lastRtk.started === a.started ? lastRtk.rtk : null;
-  }
-
   // rtk's figures are its own bytes/4 estimates of the command output it
   // filtered, so the share is the reliable part and the counts approximate.
   function rtkNote(r) {
@@ -570,10 +547,11 @@
     const elapsed = $("running-elapsed");
     if (elapsed && a.state === "running") {
       // Tokens sit beside the clock because the row's other slot is the
-      // turn's identity; they only move when a new sample lands.
-      const tokens = liveTokens(a);
+      // turn's identity; they only move when a new sample lands. The runner
+      // keeps the last good sample up through a failed read, so a figure
+      // that is there never blinks out.
       elapsed.textContent = fmtDuration(serverNow() - a.started)
-        + (tokens ? " · " + fmtTokens(tokenTotal(tokens)) + " tokens" : "");
+        + (a.tokens ? " · " + fmtTokens(tokenTotal(a.tokens)) + " tokens" : "");
     }
   }
 
@@ -596,12 +574,13 @@
     $("stat-failed").textContent = state.totals.failed + state.totals.timeout;
     // The in-flight turn's tally is not in the totals yet, so it is added
     // here; the stat then climbs during a turn instead of jumping at its end.
-    const running = liveTokens(a);
+    // Only a running activity carries these, so any other reads as none.
+    const running = a.tokens;
     const spent = (state.totals.tokens ? tokenTotal(state.totals.tokens) : 0)
       + (running ? tokenTotal(running) : 0);
     $("stat-tokens").textContent = spent ? fmtTokens(spent) : "–";
     const rtk = { commands: 0, input: 0, output: 0 };
-    for (const r of [state.totals.rtk, liveRtk(a)]) {
+    for (const r of [state.totals.rtk, a.rtk]) {
       if (!r) continue;
       rtk.commands += r.commands;
       rtk.input += r.input;
