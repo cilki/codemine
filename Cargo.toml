@@ -25,7 +25,7 @@ reqwest = { version = "0.13.5", default-features = false, features = [
   "blocking",
   "rustls-no-provider",
 ] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 # The patch floor is the fix for RUSTSEC-2026-0349, which is a client-side
 # issue and so one the runner is exposed to: an attacker who answers one
 # connection attempt and drops it makes the client remember a classical key
@@ -41,7 +41,7 @@ rustls = { version = "0.23.46", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-sysinfo = { version = "0.39.6", default-features = false, features = [
+sysinfo = { version = "0.40.1", default-features = false, features = [
   "component",
   "disk",
   "system",

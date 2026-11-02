@@ -53,7 +53,7 @@ pub fn snapshot(workspace: &Path) -> Host {
         temp_c: cpu_temp(),
         disk_total,
         disk_available,
-        uptime_secs: System::uptime(),
+        uptime_secs: System::uptime().unwrap_or_default(),
     }
 }
 
@@ -79,9 +79,10 @@ fn memory() -> (u64, u64) {
             system.refresh_memory_specifics(ram);
             system
         }
-        none => none.insert(System::new_with_specifics(
-            RefreshKind::nothing().with_memory(ram),
-        )),
+        none => match System::new_with_specifics(RefreshKind::nothing().with_memory(ram)) {
+            Ok(system) => none.insert(system),
+            Err(_) => return (0, 0),
+        },
     };
     (system.total_memory(), system.available_memory())
 }
@@ -124,23 +125,30 @@ fn cpu_usage() -> f32 {
     // replaces it with a windowed one. Measuring a window here instead,
     // which is what sleeping through one amounted to, cost the web UI's
     // runtime half a second of the first page load.
-    let sample = cached.get_or_insert_with(|| {
-        let sys = System::new_with_specifics(
-            RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing().with_cpu_usage()),
-        );
-        CpuSample {
-            usage: sys.global_cpu_usage(),
-            at: Instant::now(),
-            sys,
+    let sample = match &mut *cached {
+        Some(sample) => {
+            // Asked again within the window, the answer hasn't had time to
+            // change, and re-diffing would only add noise.
+            if sample.at.elapsed() >= CPU_WINDOW {
+                sample.sys.refresh_cpu_usage();
+                sample.at = Instant::now();
+                sample.usage = sample.sys.global_cpu_usage();
+            }
+            sample
         }
-    });
-    // Asked again within the window, the answer hasn't had time to change,
-    // and re-diffing would only add noise.
-    if sample.at.elapsed() >= CPU_WINDOW {
-        sample.sys.refresh_cpu_usage();
-        sample.at = Instant::now();
-        sample.usage = sample.sys.global_cpu_usage();
-    }
+        none => {
+            let Ok(sys) = System::new_with_specifics(
+                RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing().with_usage()),
+            ) else {
+                return 0.0;
+            };
+            none.insert(CpuSample {
+                usage: sys.global_cpu_usage(),
+                at: Instant::now(),
+                sys,
+            })
+        }
+    };
     sample.usage
 }
 
@@ -178,12 +186,14 @@ fn disk_info(path: &Path) -> (u64, u64) {
             // A freshly built list carries its first reading already; a
             // standing one needs the chosen mount measured again.
             if let Some(index) = volumes.chosen {
-                volumes.disks.list_mut()[index].refresh_specifics(storage);
+                volumes.disks[index].refresh_specifics(storage);
             }
             volumes
         }
         _ => {
-            let disks = Disks::new_with_refreshed_list_specifics(storage);
+            let Ok(disks) = Disks::new_with_refreshed_list_specifics(storage) else {
+                return (0, 0);
+            };
             let chosen = choose_mount(&disks, path);
             cached.insert(Volumes {
                 disks,
@@ -196,7 +206,7 @@ fn disk_info(path: &Path) -> (u64, u64) {
     let Some(index) = volumes.chosen else {
         return (0, 0);
     };
-    let disk = &volumes.disks.list()[index];
+    let disk = &volumes.disks[index];
     (disk.total_space(), disk.available_space())
 }
 
@@ -204,7 +214,6 @@ fn disk_info(path: &Path) -> (u64, u64) {
 /// every ancestor's filesystem also "holds" it.
 fn choose_mount(disks: &Disks, path: &Path) -> Option<usize> {
     disks
-        .list()
         .iter()
         .enumerate()
         .filter(|(_, disk)| path.starts_with(disk.mount_point()))
@@ -243,13 +252,13 @@ fn cpu_temp() -> Option<f32> {
             // A freshly built list carries its first reading already; a
             // standing one needs the chosen sensor read out again.
             if let Some(index) = sensors.chosen {
-                sensors.components.list_mut()[index].refresh();
+                sensors.components[index].refresh();
             }
             sensors
         }
         _ => {
-            let components = Components::new_with_refreshed_list();
-            let chosen = choose_sensor(components.list());
+            let components = Components::new_with_refreshed_list().ok()?;
+            let chosen = choose_sensor(&components);
             cached.insert(Sensors {
                 components,
                 chosen,
@@ -258,7 +267,7 @@ fn cpu_temp() -> Option<f32> {
         }
     };
     let index = sensors.chosen?;
-    sensors.components.list()[index].temperature()
+    sensors.components[index].temperature()
 }
 
 /// Label fragments that mark a sensor as the CPU's, best first: a
@@ -304,8 +313,8 @@ mod tests {
     /// `/sys/class/hwmon` — agrees trivially, on None.
     #[test]
     fn the_remembered_sensor_answers_like_a_full_scan() {
-        let all = Components::new_with_refreshed_list();
-        let scanned = choose_sensor(all.list()).map(|at| &all.list()[at]);
+        let all = Components::new_with_refreshed_list().expect("sysinfo supports Linux");
+        let scanned = choose_sensor(&all).map(|at| &all[at]);
 
         // Twice, so the second reading goes through the remembered list
         // rather than building one.
@@ -319,7 +328,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let remembered = cached
             .as_ref()
-            .and_then(|sensors| sensors.chosen.map(|at| &sensors.components.list()[at]));
+            .and_then(|sensors| sensors.chosen.map(|at| &sensors.components[at]));
         assert_eq!(
             scanned.map(Component::label),
             remembered.map(Component::label),
@@ -335,11 +344,12 @@ mod tests {
     #[test]
     fn the_remembered_mount_answers_like_a_full_scan() {
         let all =
-            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage())
+                .expect("sysinfo supports Linux");
         let scan = |path: &Path| {
             choose_mount(&all, path)
                 .map(|at| {
-                    let disk = &all.list()[at];
+                    let disk = &all[at];
                     (disk.total_space(), disk.available_space())
                 })
                 .unwrap_or((0, 0))
