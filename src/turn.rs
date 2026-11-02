@@ -497,12 +497,12 @@ fn supervise(
             spent = next;
         }
     };
-    match exit {
-        None => workspace::kill_group(child)?,
-        // The leader exiting says nothing about what it started in the
-        // background; left alone, that outlives the turn and keeps writing
-        // into the clone.
-        Some(_) => workspace::kill_leftovers(child.id() as i32),
+    // A killed turn takes its tree down with it, and so does one that exited:
+    // the leader exiting says nothing about what it started in the
+    // background, which left alone outlives the turn and keeps writing into
+    // the clone.
+    if workspace::kill_group(child.id() as i32) && exit.is_some() {
+        warn!("the agent left processes running; stopped them");
     }
     // One last sample, after the tree is down and so after opencode has
     // written whatever it had left: the answer the turn is recorded with.

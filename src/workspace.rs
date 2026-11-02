@@ -598,58 +598,52 @@ fn codegraph(dir: &Path, log: &File) {
     }
 }
 
-/// SIGTERM the child's whole process group with a grace period, then SIGKILL;
-/// signalling only the child would orphan its grandchildren. The SIGCONT
-/// alongside the SIGTERM lets a paused (stopped) tree wake up and die
-/// gracefully instead of eating the SIGKILL.
-pub fn kill_group(child: &mut Child) -> Result<()> {
-    let pgid = -(child.id() as i32);
-    unsafe {
-        libc::kill(pgid, libc::SIGTERM);
-        libc::kill(pgid, libc::SIGCONT);
-    }
-    if child.wait_timeout(Duration::from_secs(10))?.is_none() {
-        unsafe { libc::kill(pgid, libc::SIGKILL) };
-        child.wait().ok();
-    }
-    Ok(())
-}
-
-/// Take down whatever an agent that exited on its own left running in its
-/// process group: a dev server, a watcher, a test daemon. The leader is gone
-/// and already waited on, so this goes by the group id alone. A clean group
-/// (the usual case) costs one probe.
+/// Take down a whole process group — a timed-out or cancelled child with
+/// everything it started, or what an agent that exited on its own left
+/// running: a dev server, a watcher, a test daemon. Signalling only the
+/// leader would orphan its grandchildren, and a leader that dies on the
+/// SIGTERM says nothing about the rest, so this goes by the group id alone
+/// until the whole group is gone: SIGTERM with a grace period, then SIGKILL.
+/// The SIGCONT alongside the SIGTERM lets a paused (stopped) tree wake up and
+/// die gracefully instead of eating the SIGKILL. A clean group (the usual
+/// case after an exit) costs one probe. Returns whether anything was left to
+/// stop.
 ///
-/// Where the runner is PID 1 (the container image `exec`s it), the orphans
-/// are reparented to it, and a zombie still answers a signal probe; reaping
-/// by group lets the probe see them gone, without touching the exit status
-/// of any other child the runner is waiting on.
-pub fn kill_leftovers(pgid: i32) {
+/// The probe reaps the group's zombies first, since a zombie still answers
+/// it: the leader, if it hasn't been waited on yet, and where the runner is
+/// PID 1 (the container image `exec`s it) the orphans reparented to it too.
+/// Reaping by group leaves the exit status of any other child the runner is
+/// waiting on alone.
+pub fn kill_group(pgid: i32) -> bool {
     if pgid <= 0 {
-        return;
+        return false;
     }
     let alive = || {
         while unsafe { libc::waitpid(-pgid, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
         unsafe { libc::kill(-pgid, 0) == 0 }
     };
     if !alive() {
-        return;
+        return false;
     }
-    warn!("the agent left processes running in group {pgid}; stopping them");
+    let gone_within = |grace: Duration| {
+        let deadline = Instant::now() + grace;
+        while alive() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        true
+    };
     unsafe {
         libc::kill(-pgid, libc::SIGTERM);
         libc::kill(-pgid, libc::SIGCONT);
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-        if !alive() {
-            return;
-        }
+    if !gone_within(Duration::from_secs(10)) {
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        gone_within(Duration::from_secs(1));
     }
-    unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    std::thread::sleep(Duration::from_millis(100));
-    alive();
+    true
 }
 
 /// Stop or continue a whole process group, for the web UI's pause button.
@@ -679,7 +673,7 @@ fn run_logged(command: &mut Command, timeout: Duration, log: &File) -> Result<()
         Some(status) if status.success() => Ok(()),
         Some(status) => bail!("{program} exited with {status}"),
         None => {
-            kill_group(&mut child)?;
+            kill_group(child.id() as i32);
             bail!("{program} timed out after {}s", timeout.as_secs());
         }
     }
@@ -1084,8 +1078,26 @@ mod tests {
             "nothing was left behind"
         );
 
-        kill_leftovers(pgid);
+        assert!(kill_group(pgid), "nothing was stopped");
         assert_ne!(unsafe { libc::kill(-pgid, 0) }, 0, "the group survived");
+    }
+
+    /// A child still running goes down with its whole group, and is reaped
+    /// along the way rather than left a zombie for its `Child` to wait on.
+    #[test]
+    fn a_running_group_is_killed_and_reaped() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 1000 & sleep 1000"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        assert!(kill_group(pgid), "nothing was stopped");
+        assert_ne!(unsafe { libc::kill(-pgid, 0) }, 0, "the group survived");
+        assert!(!kill_group(pgid), "a dead group read as alive");
     }
 
     /// Which of `fired` the plants managed to touch.
