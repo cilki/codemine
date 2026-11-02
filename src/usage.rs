@@ -101,45 +101,19 @@ impl Sampler {
         // Descending rowid is a reverse walk of the table's own b-tree, not
         // a sort: rowid *is* the key, so nothing is materialized and the
         // walk can be abandoned as soon as it reads past the window.
-        let Ok(mut query) =
-            db.prepare("SELECT rowid, time_created, data FROM message ORDER BY rowid DESC")
-        else {
+        let Some((Some(sum), reached)) = tally(
+            &db,
+            "SELECT rowid, time_created, data FROM message ORDER BY rowid DESC",
+            [],
+            since_ms,
+            Some(stop_ms),
+            0,
+        ) else {
             return false;
         };
-        let Ok(mut rows) = query.query([]) else {
-            return false;
-        };
-        let mut sum = TokenUsage::default();
-        let mut found = false;
-        // The newest row the walk saw, which is where the next sample picks
-        // up. Taken whether or not the row counted: a row that didn't is
-        // still one no later sample needs to look at again.
-        let mut reached = 0;
-        while let Ok(Some(row)) = rows.next() {
-            let (Ok(rowid), Ok(created)) = (row.get::<_, i64>(0), row.get::<_, i64>(1)) else {
-                continue;
-            };
-            reached = reached.max(rowid);
-            if created < stop_ms {
-                break;
-            }
-            // Inside the slack but still before the turn: not this turn's
-            // cost, and not far enough back to end the walk either.
-            if created < since_ms {
-                continue;
-            }
-            if let Ok(rusqlite::types::ValueRef::Text(data)) = row.get_ref(2)
-                && let Some(tokens) = tokens_in(data)
-            {
-                sum.add(&tokens);
-                found = true;
-            }
-        }
-        if found {
-            self.sum = Some(sum);
-            self.cursor = Some((path.to_owned(), reached));
-        }
-        found
+        self.sum = Some(sum);
+        self.cursor = Some((path.to_owned(), reached));
+        true
     }
 
     /// Add the rows appended past `from`. `rowid > ?` is a seek into the
@@ -158,29 +132,19 @@ impl Sampler {
             self.cursor = None;
             return;
         };
-        let Ok(mut query) = db.prepare(
+        let Some((added, reached)) = tally(
+            &db,
             "SELECT rowid, time_created, data FROM message WHERE rowid > ?1 ORDER BY rowid",
+            [from],
+            since_ms,
+            None,
+            from,
         ) else {
             return;
         };
-        let Ok(mut rows) = query.query([from]) else {
-            return;
-        };
         let mut sum = self.sum.clone().unwrap_or_default();
-        let mut reached = from;
-        while let Ok(Some(row)) = rows.next() {
-            let (Ok(rowid), Ok(created)) = (row.get::<_, i64>(0), row.get::<_, i64>(1)) else {
-                continue;
-            };
-            reached = reached.max(rowid);
-            if created < since_ms {
-                continue;
-            }
-            if let Ok(rusqlite::types::ValueRef::Text(data)) = row.get_ref(2)
-                && let Some(tokens) = tokens_in(data)
-            {
-                sum.add(&tokens);
-            }
+        if let Some(added) = added {
+            sum.add(&added);
         }
         self.sum = Some(sum);
         self.cursor = Some((path.to_owned(), reached));
@@ -196,6 +160,48 @@ impl Sampler {
                 .ok()?;
         Some((db, since_ms))
     }
+}
+
+/// Sum the token counts of the turn's messages among the rows `sql` selects
+/// (`rowid, time_created, data`), and say the newest rowid read, starting
+/// from `reached`. The sum is None when no row carried a `tokens` object.
+/// A row stamped before `since_ms` doesn't count; one before `stop_ms` ends
+/// the walk, which only a backwards walk can ask for. None when the query
+/// can't run at all.
+///
+/// The rowid is taken whether or not the row counted: a row that didn't is
+/// still one no later sample needs to look at again.
+fn tally(
+    db: &rusqlite::Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    since_ms: i64,
+    stop_ms: Option<i64>,
+    mut reached: i64,
+) -> Option<(Option<TokenUsage>, i64)> {
+    let mut query = db.prepare(sql).ok()?;
+    let mut rows = query.query(params).ok()?;
+    let mut sum: Option<TokenUsage> = None;
+    while let Ok(Some(row)) = rows.next() {
+        let (Ok(rowid), Ok(created)) = (row.get::<_, i64>(0), row.get::<_, i64>(1)) else {
+            continue;
+        };
+        reached = reached.max(rowid);
+        if stop_ms.is_some_and(|stop| created < stop) {
+            break;
+        }
+        // Before the turn, but not necessarily far enough back to end the
+        // walk: not this turn's cost either way.
+        if created < since_ms {
+            continue;
+        }
+        if let Ok(rusqlite::types::ValueRef::Text(data)) = row.get_ref(2)
+            && let Some(tokens) = tokens_in(data)
+        {
+            sum.get_or_insert_default().add(&tokens);
+        }
+    }
+    Some((sum, reached))
 }
 
 /// The database files opencode may be writing: `opencode.db` historically,

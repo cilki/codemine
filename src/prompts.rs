@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
@@ -194,23 +194,11 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
 /// install disables itself when it can't find the binary. Nothing here is
 /// allowed to fail startup, which is why it reports instead of returning.
 pub fn install_rtk() {
-    let output = match Command::new("rtk")
-        .args(["init", "-g", "--opencode"])
-        .stdin(Stdio::null())
-        .output()
+    // `child::output` says "not found in PATH" for a missing rtk, and does
+    // so under QEMU too, where the spawn alone can't tell.
+    if let Err(err) = crate::child::output(Command::new("rtk").args(["init", "-g", "--opencode"]))
     {
-        Ok(output) => output,
-        Err(_) => {
-            tracing::info!("rtk is not installed; the agent's commands run unrewritten");
-            return;
-        }
-    };
-    if !output.status.success() {
-        tracing::warn!(
-            "rtk init exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        tracing::warn!("{err:#}; the agent's commands run unrewritten");
         return;
     }
     if let Err(err) = install_rtk_config(&rtk_config_path()) {
