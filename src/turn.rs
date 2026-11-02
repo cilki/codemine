@@ -183,9 +183,9 @@ pub fn run(
     }
     // The precondition probes plus the skip cache, sharing one set of forge
     // lookups across everything this draw asks about.
-    let probe = cache::Probe::new(cache);
+    let probe = cache::Probe::new(cache, forge);
     let Some((task, repo)) = pick(forge, &pool, pending, draw, |task, repo| {
-        probe.actionable(task, forge, repo)
+        probe.actionable(task, repo)
     }) else {
         return Ok(Report {
             idle: Some(Idle::NothingToDo),
@@ -374,7 +374,7 @@ fn answered_state(cfg: &Config, turn: &Turn, probe: &cache::Probe) -> Option<Str
             }
         },
         cache::Basis::Feed | cache::Basis::Prs | cache::Basis::Reviews => {
-            probe.state(turn.task, turn.forge, turn.repo)
+            probe.state(turn.task, turn.repo)
         }
     }
 }

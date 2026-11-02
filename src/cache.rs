@@ -16,7 +16,7 @@
 //! outlives the process; it is keyed by commit and forge state, not by the
 //! clone, so the fresh clones a restart brings leave it valid.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -195,29 +195,32 @@ type OpenPrs = Vec<serde_json::Value>;
 
 /// The draw's precondition check with the skip memory folded in, plus the
 /// forge state read along the way: default-branch commits per repository,
-/// notification feeds per forge, and the open-PR listing per repository with
+/// the forge's notification feed, and the open-PR listing per repository with
 /// the conflicting PRs and pending review requests read off it. Each is
 /// fetched at most once and answers for every candidate the rest of the draw
-/// asks about.
+/// asks about. A probe lives for one draw, and a draw is over one forge.
 pub struct Probe<'a> {
     cache: &'a Cache,
-    heads: RefCell<BTreeMap<(ForgeKind, String), Option<String>>>,
-    feeds: RefCell<BTreeMap<ForgeKind, Option<BTreeMap<String, String>>>>,
+    forge: &'a Forge,
+    heads: RefCell<BTreeMap<String, Option<String>>>,
+    /// The feed is account-wide, so one read answers for every repository.
+    unread: OnceCell<Option<BTreeMap<String, String>>>,
     /// The page both PR answers below are read from.
-    listings: RefCell<BTreeMap<(ForgeKind, String), Option<OpenPrs>>>,
-    conflicts: RefCell<BTreeMap<(ForgeKind, String), Option<PrKeys>>>,
-    reviews: RefCell<BTreeMap<(ForgeKind, String), Option<PrKeys>>>,
+    listings: RefCell<BTreeMap<String, Option<OpenPrs>>>,
+    conflicts: RefCell<BTreeMap<String, Option<PrKeys>>>,
+    reviews: RefCell<BTreeMap<String, Option<PrKeys>>>,
 }
 
 impl<'a> Probe<'a> {
-    pub fn new(cache: &'a Cache) -> Probe<'a> {
+    pub fn new(cache: &'a Cache, forge: &'a Forge) -> Probe<'a> {
         Probe {
             cache,
-            heads: RefCell::new(BTreeMap::new()),
-            feeds: RefCell::new(BTreeMap::new()),
-            listings: RefCell::new(BTreeMap::new()),
-            conflicts: RefCell::new(BTreeMap::new()),
-            reviews: RefCell::new(BTreeMap::new()),
+            forge,
+            heads: RefCell::default(),
+            unread: OnceCell::new(),
+            listings: RefCell::default(),
+            conflicts: RefCell::default(),
+            reviews: RefCell::default(),
         }
     }
 
@@ -225,8 +228,8 @@ impl<'a> Probe<'a> {
     /// something to act on, and must not already have come up empty at
     /// exactly this state. The memory is checked first, so a task held back
     /// by it never reaches the precondition probe.
-    pub fn actionable(&self, task: &str, forge: &Forge, repo: &str) -> bool {
-        if self.remembered(task, forge, repo) {
+    pub fn actionable(&self, task: &str, repo: &str) -> bool {
+        if self.remembered(task, repo) {
             return false;
         }
         match basis(task) {
@@ -237,21 +240,17 @@ impl<'a> Probe<'a> {
             // the one request it already made rather than one per repository.
             // Fail-open: an unreadable feed draws the task and at worst
             // skips again.
-            Some(Basis::Feed) => self.feed(forge).is_none_or(|feed| feed.contains_key(repo)),
+            Some(Basis::Feed) => self.feed().is_none_or(|feed| feed.contains_key(repo)),
             // `rebase` has work only when the bot has an open conflicting PR
             // here. Fail-closed, unlike the feed: an unreadable listing
             // leaves nothing to remember a skip against, so drawing on it
             // doesn't risk one wasted turn but one per draw until the probe
             // heals — the task is held back instead, logged by the getter.
-            Some(Basis::Prs) => self
-                .conflicting(forge, repo)
-                .is_some_and(|prs| !prs.is_empty()),
+            Some(Basis::Prs) => self.conflicting(repo).is_some_and(|prs| !prs.is_empty()),
             // `review` likewise: work only when someone has asked the bot
             // for a review it hasn't given yet, and held back on an
             // unreadable listing.
-            Some(Basis::Reviews) => self
-                .requested(forge, repo)
-                .is_some_and(|prs| !prs.is_empty()),
+            Some(Basis::Reviews) => self.requested(repo).is_some_and(|prs| !prs.is_empty()),
             // Every other task is always worth a turn; only the memory above
             // holds one back.
             _ => true,
@@ -261,21 +260,21 @@ impl<'a> Probe<'a> {
     /// The state the task's answer currently depends on, for remembering a
     /// skip against. `None` when the task keeps no memory, or when the state
     /// couldn't be read.
-    pub fn state(&self, task: &str, forge: &Forge, repo: &str) -> Option<String> {
+    pub fn state(&self, task: &str, repo: &str) -> Option<String> {
         match basis(task)? {
-            Basis::Head => self.head(forge, repo),
-            Basis::Feed => self.stamp(forge, repo),
-            Basis::Prs => self.conflicting(forge, repo).map(|prs| prs.join(" ")),
-            Basis::Reviews => self.requested(forge, repo).map(|prs| prs.join(" ")),
+            Basis::Head => self.head(repo),
+            Basis::Feed => self.feed()?.get(repo).cloned(),
+            Basis::Prs => self.conflicting(repo).map(|prs| prs.join(" ")),
+            Basis::Reviews => self.requested(repo).map(|prs| prs.join(" ")),
         }
     }
 
     /// Whether a remembered skip still describes the repository.
-    fn remembered(&self, task: &str, forge: &Forge, repo: &str) -> bool {
+    fn remembered(&self, task: &str, repo: &str) -> bool {
         let Some(basis) = basis(task) else {
             return false;
         };
-        let Some(mark) = self.cache.marked(&key(task, forge.kind, repo)) else {
+        let Some(mark) = self.cache.marked(&key(task, self.forge.kind, repo)) else {
             return false;
         };
         // Checked before the state is read, so a reworded task costs no
@@ -287,7 +286,7 @@ impl<'a> Probe<'a> {
         // said to still stand, so it doesn't hold the task back. (`rebase`
         // and `review` are held back regardless — their preconditions fail
         // closed on the same unreadable listing.)
-        let Some(state) = self.state(task, forge, repo) else {
+        let Some(state) = self.state(task, repo) else {
             return false;
         };
         match basis {
@@ -307,26 +306,20 @@ impl<'a> Probe<'a> {
 
     /// The repository's default-branch commit, read from the forge once per
     /// repository and remembered for the rest of the draw.
-    fn head(&self, forge: &Forge, repo: &str) -> Option<String> {
-        once(&self.heads, (forge.kind, repo.to_owned()), || {
-            crate::precheck::head_sha(forge, repo)
+    fn head(&self, repo: &str) -> Option<String> {
+        once(&self.heads, repo, || {
+            crate::precheck::head_sha(self.forge, repo)
                 .with_context(|| format!("failed to read {repo}'s head commit"))
         })
-    }
-
-    /// The newest unread notification on the repository's feed. `None` for a
-    /// repository with nothing unread on it, or a feed that couldn't be read.
-    fn stamp(&self, forge: &Forge, repo: &str) -> Option<String> {
-        self.feed(forge)?.get(repo).cloned()
     }
 
     /// The bot's open conflicting PRs on the repository, answered once per
     /// repository and remembered for the rest of the draw. `None` when the
     /// listing couldn't be read.
-    fn conflicting(&self, forge: &Forge, repo: &str) -> Option<PrKeys> {
-        once(&self.conflicts, (forge.kind, repo.to_owned()), || {
-            let open = self.open_prs(forge, repo)?;
-            crate::precheck::conflicting_prs(forge, repo, &open)
+    fn conflicting(&self, repo: &str) -> Option<PrKeys> {
+        once(&self.conflicts, repo, || {
+            let open = self.open_prs(repo)?;
+            crate::precheck::conflicting_prs(self.forge, repo, &open)
                 .with_context(|| format!("failed to read {repo}'s conflicting PRs"))
         })
     }
@@ -334,10 +327,10 @@ impl<'a> Probe<'a> {
     /// The open PRs the bot is asked to review on the repository, answered
     /// once per repository and remembered for the rest of the draw. `None`
     /// when the listing couldn't be read.
-    fn requested(&self, forge: &Forge, repo: &str) -> Option<PrKeys> {
-        once(&self.reviews, (forge.kind, repo.to_owned()), || {
-            let open = self.open_prs(forge, repo)?;
-            crate::precheck::review_requests(forge, repo, &open)
+    fn requested(&self, repo: &str) -> Option<PrKeys> {
+        once(&self.reviews, repo, || {
+            let open = self.open_prs(repo)?;
+            crate::precheck::review_requests(self.forge, repo, &open)
                 .with_context(|| format!("failed to read {repo}'s review requests"))
         })
     }
@@ -348,42 +341,48 @@ impl<'a> Probe<'a> {
     /// been asked about, and the gated pass probes both. Each used to fetch
     /// the page for itself, which on Gitea and GitHub is the identical
     /// request made twice per repository per draw.
-    fn open_prs(&self, forge: &Forge, repo: &str) -> Result<OpenPrs> {
-        once(&self.listings, (forge.kind, repo.to_owned()), || {
-            crate::precheck::open_prs(forge, repo)
+    fn open_prs(&self, repo: &str) -> Result<OpenPrs> {
+        once(&self.listings, repo, || {
+            crate::precheck::open_prs(self.forge, repo)
                 .with_context(|| format!("failed to list {repo}'s open PRs"))
         })
         .context("the open PR listing is unreadable")
     }
 
-    /// The forge's unread notifications as repository → newest stamp. The
-    /// feed is account-wide, so one request per forge answers for every
-    /// repository in the draw. `None` when it couldn't be read.
-    fn feed(&self, forge: &Forge) -> Option<BTreeMap<String, String>> {
-        once(&self.feeds, forge.kind, || {
-            crate::events::unread(forge)
-                .with_context(|| format!("failed to read {}'s activity feed", forge.kind.name()))
-        })
+    /// The forge's unread notifications as repository → newest stamp, read
+    /// once per draw. `None` when it couldn't be read.
+    fn feed(&self) -> Option<&BTreeMap<String, String>> {
+        self.unread
+            .get_or_init(|| {
+                logged(crate::events::unread(self.forge).with_context(|| {
+                    format!("failed to read {}'s activity feed", self.forge.kind.name())
+                }))
+            })
+            .as_ref()
     }
 }
 
-/// Ask the forge for one key's worth of state at most once per draw, handing
-/// every later caller the same answer — a failure included, since a listing
-/// the forge just refused is not worth re-asking for the next candidate. One
-/// draw asks the same question of the same repository for several tasks, and
-/// `feedback` asks the same account-wide feed for every repository in the
-/// pool.
-fn once<K: Ord, V: Clone>(
-    memo: &RefCell<BTreeMap<K, Option<V>>>,
-    key: K,
+/// Ask the forge for one repository's worth of state at most once per draw,
+/// handing every later caller the same answer — a failure included, since a
+/// listing the forge just refused is not worth re-asking for the next
+/// candidate. One draw asks the same question of the same repository for
+/// several tasks.
+fn once<V: Clone>(
+    memo: &RefCell<BTreeMap<String, Option<V>>>,
+    repo: &str,
     read: impl FnOnce() -> Result<V>,
 ) -> Option<V> {
-    if let Some(answer) = memo.borrow().get(&key) {
+    if let Some(answer) = memo.borrow().get(repo) {
         return answer.clone();
     }
-    let answer = read().inspect_err(|err| warn!("{err:#}")).ok();
-    memo.borrow_mut().insert(key, answer.clone());
+    let answer = logged(read());
+    memo.borrow_mut().insert(repo.to_owned(), answer.clone());
     answer
+}
+
+/// A forge read's answer, with a failure logged and dropped.
+fn logged<V>(answer: Result<V>) -> Option<V> {
+    answer.inspect_err(|err| warn!("{err:#}")).ok()
 }
 
 #[cfg(test)]
@@ -408,38 +407,39 @@ mod tests {
         }
     }
 
+    /// The forge every probe below draws on.
+    static GITHUB: std::sync::LazyLock<Forge> =
+        std::sync::LazyLock::new(|| forge(ForgeKind::Github));
+
     /// A probe with `me/repo`'s head already answered, so the tests never
     /// reach for a forge.
     fn probe<'a>(cache: &'a Cache, head: &str) -> Probe<'a> {
-        let probe = Probe::new(cache);
+        let probe = Probe::new(cache, &GITHUB);
         probe
             .heads
             .borrow_mut()
-            .insert((ForgeKind::Github, "me/repo".into()), Some(head.into()));
+            .insert("me/repo".into(), Some(head.into()));
         probe
     }
 
     /// The same for the notification feed, which the probe reads once per
     /// forge rather than per repository.
     fn feed_probe<'a>(cache: &'a Cache, feed: &[(&str, &str)]) -> Probe<'a> {
-        let probe = Probe::new(cache);
-        probe.feeds.borrow_mut().insert(
-            ForgeKind::Github,
-            Some(
-                feed.iter()
-                    .map(|(repo, stamp)| ((*repo).to_owned(), (*stamp).to_owned()))
-                    .collect(),
-            ),
-        );
+        let probe = Probe::new(cache, &GITHUB);
+        let feed = feed
+            .iter()
+            .map(|(repo, stamp)| ((*repo).to_owned(), (*stamp).to_owned()))
+            .collect();
+        probe.unread.set(Some(feed)).unwrap();
         probe
     }
 
     /// And for the conflicting-PR listing `rebase` is probed out of; `None`
     /// is a listing that couldn't be read.
     fn conflict_probe<'a>(cache: &'a Cache, prs: Option<&[&str]>) -> Probe<'a> {
-        let probe = Probe::new(cache);
+        let probe = Probe::new(cache, &GITHUB);
         probe.conflicts.borrow_mut().insert(
-            (ForgeKind::Github, "me/repo".into()),
+            "me/repo".into(),
             prs.map(|prs| prs.iter().map(|pr| (*pr).to_owned()).collect()),
         );
         probe
@@ -447,9 +447,9 @@ mod tests {
 
     /// And for the review-request listing `review` is probed out of.
     fn review_probe<'a>(cache: &'a Cache, prs: Option<&[&str]>) -> Probe<'a> {
-        let probe = Probe::new(cache);
+        let probe = Probe::new(cache, &GITHUB);
         probe.reviews.borrow_mut().insert(
-            (ForgeKind::Github, "me/repo".into()),
+            "me/repo".into(),
             prs.map(|prs| prs.iter().map(|pr| (*pr).to_owned()).collect()),
         );
         probe
@@ -516,7 +516,6 @@ mod tests {
     fn a_feedback_skip_stands_until_a_newer_thread_arrives() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        let github = forge(ForgeKind::Github);
         cache.remember(
             "feedback",
             ForgeKind::Github,
@@ -525,9 +524,9 @@ mod tests {
         );
 
         let unchanged = [("me/repo", "2026-10-01T02:00:00Z")];
-        assert!(feed_probe(&cache, &unchanged).remembered("feedback", &github, "me/repo"));
+        assert!(feed_probe(&cache, &unchanged).remembered("feedback", "me/repo"));
         let newer = [("me/repo", "2026-10-01T03:00:00Z")];
-        assert!(!feed_probe(&cache, &newer).remembered("feedback", &github, "me/repo"));
+        assert!(!feed_probe(&cache, &newer).remembered("feedback", "me/repo"));
     }
 
     /// A stamp moving backward is a thread being read or cleared rather than
@@ -543,11 +542,7 @@ mod tests {
             "2026-10-01T02:00:00Z",
         );
         let older = [("me/repo", "2026-10-01T01:00:00Z")];
-        assert!(feed_probe(&cache, &older).remembered(
-            "feedback",
-            &forge(ForgeKind::Github),
-            "me/repo"
-        ));
+        assert!(feed_probe(&cache, &older).remembered("feedback", "me/repo"));
     }
 
     /// A feed with nothing on the repository fails open like an unreadable
@@ -564,16 +559,8 @@ mod tests {
             "2026-10-01T02:00:00Z",
         );
         let elsewhere = [("me/other", "2026-10-01T03:00:00Z")];
-        assert!(!feed_probe(&cache, &elsewhere).remembered(
-            "feedback",
-            &forge(ForgeKind::Github),
-            "me/repo"
-        ));
-        assert!(!feed_probe(&cache, &[]).remembered(
-            "feedback",
-            &forge(ForgeKind::Github),
-            "me/repo"
-        ));
+        assert!(!feed_probe(&cache, &elsewhere).remembered("feedback", "me/repo"));
+        assert!(!feed_probe(&cache, &[]).remembered("feedback", "me/repo"));
     }
 
     /// `feedback`'s precondition is answered out of the same feed its memory
@@ -584,18 +571,14 @@ mod tests {
     fn feedback_is_drawn_only_for_a_repository_with_unread_activity() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        let github = forge(ForgeKind::Github);
         let feed = [("me/repo", "2026-10-01T02:00:00Z")];
-        assert!(feed_probe(&cache, &feed).actionable("feedback", &github, "me/repo"));
-        assert!(!feed_probe(&cache, &feed).actionable("feedback", &github, "me/other"));
-        assert!(!feed_probe(&cache, &[]).actionable("feedback", &github, "me/repo"));
+        assert!(feed_probe(&cache, &feed).actionable("feedback", "me/repo"));
+        assert!(!feed_probe(&cache, &feed).actionable("feedback", "me/other"));
+        assert!(!feed_probe(&cache, &[]).actionable("feedback", "me/repo"));
 
-        let unreadable = Probe::new(&cache);
-        unreadable
-            .feeds
-            .borrow_mut()
-            .insert(ForgeKind::Github, None);
-        assert!(unreadable.actionable("feedback", &github, "me/repo"));
+        let unreadable = Probe::new(&cache, &GITHUB);
+        unreadable.unread.set(None).unwrap();
+        assert!(unreadable.actionable("feedback", "me/repo"));
     }
 
     /// The memory outranks the precondition: a thread `feedback` has already
@@ -608,7 +591,7 @@ mod tests {
         let stamp = "2026-10-01T02:00:00Z";
         cache.remember("feedback", ForgeKind::Github, "me/repo", stamp);
         let probe = feed_probe(&cache, &[("me/repo", stamp)]);
-        assert!(!probe.actionable("feedback", &forge(ForgeKind::Github), "me/repo"));
+        assert!(!probe.actionable("feedback", "me/repo"));
     }
 
     /// `rebase` is drawn only when the bot has an open conflicting PR, and —
@@ -619,10 +602,9 @@ mod tests {
     fn rebase_is_drawn_only_when_an_owned_pr_conflicts() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        let github = forge(ForgeKind::Github);
-        assert!(conflict_probe(&cache, Some(&["12@abc"])).actionable("rebase", &github, "me/repo"));
-        assert!(!conflict_probe(&cache, Some(&[])).actionable("rebase", &github, "me/repo"));
-        assert!(!conflict_probe(&cache, None).actionable("rebase", &github, "me/repo"));
+        assert!(conflict_probe(&cache, Some(&["12@abc"])).actionable("rebase", "me/repo"));
+        assert!(!conflict_probe(&cache, Some(&[])).actionable("rebase", "me/repo"));
+        assert!(!conflict_probe(&cache, None).actionable("rebase", "me/repo"));
     }
 
     /// A `rebase` skip is keyed on the conflict set: it stands while the set
@@ -635,22 +617,18 @@ mod tests {
     fn a_rebase_skip_stands_until_the_conflict_set_moves() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        let github = forge(ForgeKind::Github);
         cache.remember("rebase", ForgeKind::Github, "me/repo", "12@abc");
 
-        assert!(conflict_probe(&cache, Some(&["12@abc"])).remembered("rebase", &github, "me/repo"));
+        assert!(conflict_probe(&cache, Some(&["12@abc"])).remembered("rebase", "me/repo"));
         // A force-push moves the head.
-        assert!(
-            !conflict_probe(&cache, Some(&["12@def"])).remembered("rebase", &github, "me/repo")
-        );
+        assert!(!conflict_probe(&cache, Some(&["12@def"])).remembered("rebase", "me/repo"));
         // A second conflict appears.
         assert!(
-            !conflict_probe(&cache, Some(&["12@abc", "15@eee"]))
-                .remembered("rebase", &github, "me/repo")
+            !conflict_probe(&cache, Some(&["12@abc", "15@eee"])).remembered("rebase", "me/repo")
         );
         // The set empties: the mark no longer stands, and the precondition
         // holds the task back anyway.
-        assert!(!conflict_probe(&cache, Some(&[])).remembered("rebase", &github, "me/repo"));
+        assert!(!conflict_probe(&cache, Some(&[])).remembered("rebase", "me/repo"));
     }
 
     /// The memory outranks the precondition here too: a conflict `rebase`
@@ -662,7 +640,7 @@ mod tests {
         let cache = cache(&root);
         cache.remember("rebase", ForgeKind::Github, "me/repo", "12@abc");
         let probe = conflict_probe(&cache, Some(&["12@abc"]));
-        assert!(!probe.actionable("rebase", &forge(ForgeKind::Github), "me/repo"));
+        assert!(!probe.actionable("rebase", "me/repo"));
     }
 
     /// An unreadable listing neither stands a mark up nor draws the task:
@@ -674,8 +652,8 @@ mod tests {
         let cache = cache(&root);
         cache.remember("rebase", ForgeKind::Github, "me/repo", "12@abc");
         let probe = conflict_probe(&cache, None);
-        assert!(!probe.remembered("rebase", &forge(ForgeKind::Github), "me/repo"));
-        assert!(!probe.actionable("rebase", &forge(ForgeKind::Github), "me/repo"));
+        assert!(!probe.remembered("rebase", "me/repo"));
+        assert!(!probe.actionable("rebase", "me/repo"));
     }
 
     /// `review` is drawn only when someone has asked the bot for a review it
@@ -684,10 +662,9 @@ mod tests {
     fn review_is_drawn_only_when_a_review_is_requested() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        let github = forge(ForgeKind::Github);
-        assert!(review_probe(&cache, Some(&["12@abc"])).actionable("review", &github, "me/repo"));
-        assert!(!review_probe(&cache, Some(&[])).actionable("review", &github, "me/repo"));
-        assert!(!review_probe(&cache, None).actionable("review", &github, "me/repo"));
+        assert!(review_probe(&cache, Some(&["12@abc"])).actionable("review", "me/repo"));
+        assert!(!review_probe(&cache, Some(&[])).actionable("review", "me/repo"));
+        assert!(!review_probe(&cache, None).actionable("review", "me/repo"));
     }
 
     /// A `review` skip is keyed on the request set: it stands while the set
@@ -699,22 +676,18 @@ mod tests {
     fn a_review_skip_stands_until_the_request_set_moves() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        let github = forge(ForgeKind::Github);
         cache.remember("review", ForgeKind::Github, "me/repo", "12@abc");
 
         let same = review_probe(&cache, Some(&["12@abc"]));
-        assert!(same.remembered("review", &github, "me/repo"));
-        assert!(!same.actionable("review", &github, "me/repo"));
-        assert!(!review_probe(&cache, Some(&["12@def"])).remembered("review", &github, "me/repo"));
-        assert!(
-            !review_probe(&cache, Some(&["12@abc", "15@eee"]))
-                .remembered("review", &github, "me/repo")
-        );
-        assert!(!review_probe(&cache, Some(&[])).remembered("review", &github, "me/repo"));
+        assert!(same.remembered("review", "me/repo"));
+        assert!(!same.actionable("review", "me/repo"));
+        assert!(!review_probe(&cache, Some(&["12@def"])).remembered("review", "me/repo"));
+        assert!(!review_probe(&cache, Some(&["12@abc", "15@eee"])).remembered("review", "me/repo"));
+        assert!(!review_probe(&cache, Some(&[])).remembered("review", "me/repo"));
 
         let unreadable = review_probe(&cache, None);
-        assert!(!unreadable.remembered("review", &github, "me/repo"));
-        assert!(!unreadable.actionable("review", &github, "me/repo"));
+        assert!(!unreadable.remembered("review", "me/repo"));
+        assert!(!unreadable.actionable("review", "me/repo"));
     }
 
     /// A task with no precondition of its own is drawn without any forge
@@ -723,10 +696,10 @@ mod tests {
     fn an_unprobed_task_needs_no_forge_lookup() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        let probe = Probe::new(&cache);
-        assert!(probe.actionable("docs", &forge(ForgeKind::Github), "me/repo"));
+        let probe = Probe::new(&cache, &GITHUB);
+        assert!(probe.actionable("docs", "me/repo"));
         assert!(probe.heads.borrow().is_empty());
-        assert!(probe.feeds.borrow().is_empty());
+        assert!(probe.unread.get().is_none());
         assert!(probe.conflicts.borrow().is_empty());
         assert!(probe.reviews.borrow().is_empty());
     }
@@ -736,9 +709,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
         cache.remember("docs", ForgeKind::Github, "me/repo", "abc");
-        let github = forge(ForgeKind::Github);
-        assert!(probe(&cache, "abc").remembered("docs", &github, "me/repo"));
-        assert!(!probe(&cache, "def").remembered("docs", &github, "me/repo"));
+        assert!(probe(&cache, "abc").remembered("docs", "me/repo"));
+        assert!(!probe(&cache, "def").remembered("docs", "me/repo"));
     }
 
     /// Nothing is remembered for another task, another repository, or a forge
@@ -750,9 +722,16 @@ mod tests {
         cache.remember("docs", ForgeKind::Github, "me/repo", "abc");
 
         let probe = probe(&cache, "abc");
-        assert!(!probe.remembered("coverage", &forge(ForgeKind::Github), "me/repo"));
-        assert!(!probe.remembered("docs", &forge(ForgeKind::Github), "me/other"));
-        assert!(!probe.remembered("docs", &forge(ForgeKind::Gitea), "me/repo"));
+        assert!(!probe.remembered("coverage", "me/repo"));
+        assert!(!probe.remembered("docs", "me/other"));
+
+        let gitea = forge(ForgeKind::Gitea);
+        let probe = Probe::new(&cache, &gitea);
+        probe
+            .heads
+            .borrow_mut()
+            .insert("me/repo".into(), Some("abc".into()));
+        assert!(!probe.remembered("docs", "me/repo"));
     }
 
     #[test]
@@ -761,7 +740,7 @@ mod tests {
         let cache = cache(&root);
         cache.remember("simplify", ForgeKind::Github, "me/repo", "abc");
         cache.forget("simplify", ForgeKind::Github, "me/repo");
-        assert!(!probe(&cache, "abc").remembered("simplify", &forge(ForgeKind::Github), "me/repo"));
+        assert!(!probe(&cache, "abc").remembered("simplify", "me/repo"));
     }
 
     /// A task with no basis is never held back, whatever the file happens to
@@ -771,10 +750,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
         cache.remember("bump", ForgeKind::Github, "me/repo", "abc");
-        let probe = Probe::new(&cache);
-        assert!(!probe.remembered("bump", &forge(ForgeKind::Github), "me/repo"));
+        let probe = Probe::new(&cache, &GITHUB);
+        assert!(!probe.remembered("bump", "me/repo"));
         assert!(probe.heads.borrow().is_empty());
-        assert!(probe.feeds.borrow().is_empty());
+        assert!(probe.unread.get().is_none());
         assert!(probe.conflicts.borrow().is_empty());
         assert!(probe.reviews.borrow().is_empty());
     }
@@ -787,7 +766,7 @@ mod tests {
         cache.remember("docs", ForgeKind::Github, "me/repo", "abc");
         let key = key("docs", ForgeKind::Github, "me/repo");
         cache.lock().get_mut(&key).unwrap().prompt = "stale".into();
-        assert!(!probe(&cache, "abc").remembered("docs", &forge(ForgeKind::Github), "me/repo"));
+        assert!(!probe(&cache, "abc").remembered("docs", "me/repo"));
     }
 
     /// An unreadable head fails open: better a redundant turn than a task
@@ -797,12 +776,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
         cache.remember("docs", ForgeKind::Github, "me/repo", "abc");
-        let probe = Probe::new(&cache);
-        probe
-            .heads
-            .borrow_mut()
-            .insert((ForgeKind::Github, "me/repo".into()), None);
-        assert!(!probe.remembered("docs", &forge(ForgeKind::Github), "me/repo"));
+        let probe = Probe::new(&cache, &GITHUB);
+        probe.heads.borrow_mut().insert("me/repo".into(), None);
+        assert!(!probe.remembered("docs", "me/repo"));
     }
 
     #[test]
