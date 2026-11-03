@@ -175,11 +175,7 @@ fn key(task: &str, forge: ForgeKind, repo: &str) -> String {
 /// A short digest of the task's instructions as this build spells them, so
 /// the skips remembered under one wording don't gate the next one.
 fn digest(task: &str) -> String {
-    let instructions = crate::prompts::tasks()
-        .into_iter()
-        .find(|candidate| candidate.slug == task)
-        .map(|candidate| candidate.description)
-        .unwrap_or_default();
+    let instructions = crate::prompts::task(task).map_or("", |task| &task.description);
     Sha256::digest(instructions.as_bytes())[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -485,12 +481,15 @@ mod tests {
             .chain(unremembered)
             .chain(["feedback", "rebase", "review"])
             .collect();
-        let slugs: BTreeSet<String> = crate::prompts::default_tasks().into_iter().collect();
         for task in &declared {
-            assert!(slugs.contains(*task), "{task} is gone");
+            assert!(crate::prompts::defines(task), "{task} is gone");
         }
-        for slug in &slugs {
-            assert!(declared.contains(slug.as_str()), "{slug} declares nothing");
+        for task in crate::prompts::tasks() {
+            assert!(
+                declared.contains(task.slug.as_str()),
+                "{} declares nothing",
+                task.slug
+            );
         }
     }
 

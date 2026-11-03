@@ -1168,7 +1168,7 @@ mod tests {
                 .all(|m| { m.as_str().is_some_and(|id| id.contains('/')) })
         );
         let tasks = value["tasks"].as_array().unwrap();
-        assert_eq!(tasks.len(), crate::prompts::default_tasks().len());
+        assert_eq!(tasks.len(), crate::prompts::tasks().len());
         // Each task carries the instructions it selects, for the UI tooltip.
         assert!(tasks.iter().all(|task| {
             task["slug"].as_str().is_some_and(|slug| !slug.is_empty())

@@ -2,7 +2,6 @@
 //! forge skills installed into opencode's config directory at startup, so
 //! the binary works without the image copying them.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -331,8 +330,15 @@ pub struct Task {
     pub description: String,
 }
 
-/// The task pool, parsed from the sweep command's `## "slug"` sections.
-pub fn tasks() -> Vec<Task> {
+/// The task pool, parsed from the sweep command's `## "slug"` sections once
+/// per process: the command is baked into the binary, and the draw asks
+/// after a task's instructions for every candidate it weighs.
+pub fn tasks() -> &'static [Task] {
+    static TASKS: OnceLock<Vec<Task>> = OnceLock::new();
+    TASKS.get_or_init(parse_tasks)
+}
+
+fn parse_tasks() -> Vec<Task> {
     let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
     let mut inside = false;
     for line in str::from_utf8(SWEEP).expect("sweep.md is UTF-8").lines() {
@@ -385,22 +391,17 @@ fn describe(lines: &[&str]) -> String {
     bullets.join("\n")
 }
 
-/// Every task slug the sweep command defines, in command order — what a
-/// freshly enabled repository is swept for.
-pub fn default_tasks() -> Vec<String> {
-    tasks().into_iter().map(|task| task.slug).collect()
+/// The task the sweep command defines under this slug, if any.
+pub fn task(slug: &str) -> Option<&'static Task> {
+    tasks().iter().find(|task| task.slug == slug)
 }
 
 /// Whether the sweep command defines this task. A stored slug it doesn't
 /// define — a task that has since been removed, or a typo in a hand-edited
 /// config.json — carries no instructions, so drawing it would spend a whole
-/// agent session on a bare word. Parsed once: this is asked on the status
-/// poll, not just at the turn boundary.
+/// agent session on a bare word.
 pub fn defines(slug: &str) -> bool {
-    static SLUGS: OnceLock<BTreeSet<String>> = OnceLock::new();
-    SLUGS
-        .get_or_init(|| default_tasks().into_iter().collect())
-        .contains(slug)
+    task(slug).is_some()
 }
 
 #[cfg(test)]
@@ -409,14 +410,11 @@ mod tests {
 
     #[test]
     fn tasks_carry_their_sweep_instructions() {
-        let tasks = tasks();
         let by_slug = |slug: &str| {
-            tasks
-                .iter()
-                .find(|task| task.slug == slug)
+            task(slug)
                 .unwrap_or_else(|| panic!("no {slug} task"))
                 .description
-                .clone()
+                .as_str()
         };
 
         // Wrapped lines are joined back into one bullet per instruction.
@@ -434,7 +432,7 @@ mod tests {
         );
         // The `# General information` section is not a task and its prose
         // never lands on the task above it.
-        assert!(!tasks.iter().any(|task| task.slug.starts_with('#')));
+        assert!(!tasks().iter().any(|task| task.slug.starts_with('#')));
         assert!(
             !by_slug("roleplay").contains("nix"),
             "{}",
@@ -446,8 +444,8 @@ mod tests {
     /// exactly the sections the command has.
     #[test]
     fn defines_answers_for_the_sweep_sections_only() {
-        for slug in default_tasks() {
-            assert!(defines(&slug), "{slug}");
+        for task in tasks() {
+            assert!(defines(&task.slug), "{}", task.slug);
         }
         assert!(!defines("no-such-task"));
         assert!(!defines(""));
