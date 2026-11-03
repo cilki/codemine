@@ -379,15 +379,19 @@ fn answered_state(cfg: &Config, turn: &Turn, probe: &cache::Probe) -> Option<Str
     }
 }
 
-/// Start the agent on the turn, inside the Landlock write sandbox so it
-/// cannot work from any checkout other than the assigned clone.
+/// Start the agent on the turn. With `--sandbox` it runs inside the Landlock
+/// write sandbox so it cannot work from any checkout other than the assigned
+/// clone; otherwise whatever runs codemine (a container) is the boundary.
 fn spawn_agent(
     cfg: &Config,
     opencode: &crate::opencode::Version,
     turn: &Turn,
     log: &File,
 ) -> Result<Child> {
-    let mut argv = crate::sandbox::wrap(&turn.dir, &turn.log_path);
+    let mut argv = match cfg.sandbox {
+        true => crate::sandbox::wrap(&turn.dir, &turn.log_path),
+        false => Vec::new(),
+    };
     argv.extend(["opencode", "run"].map(String::from));
     // Which flags keep the session inside the sandbox and pre-approved
     // depends on the opencode: see `Version::run_flags`.
@@ -415,7 +419,8 @@ fn spawn_agent(
         .env("RTK_TELEMETRY_DISABLED", "1")
         // Headless runs auto-reject permission prompts, so every tool the
         // agent needs has to be pre-approved (on 2.x `--auto` is the
-        // fallback). The Landlock sandbox is the real boundary, and
+        // fallback). The sandbox (Landlock with `--sandbox`, else the
+        // container) is the real boundary, and
         // legitimate work (cargo's registry, tool caches) lives outside the
         // clone, so opencode's own external-directory gate stays open too.
         .env(
