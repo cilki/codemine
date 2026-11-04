@@ -90,17 +90,14 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/emblem.svg", get(emblem))
         .route("/favicon.svg", get(favicon))
         .route("/api/status", get(api_status))
-        .route("/api/log", get(api_log))
         .route("/api/turns/{started}/log", get(api_turn_log))
         .route("/api/events", get(api_events))
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/paused", axum::routing::put(api_put_paused))
         .route("/api/cancel", axum::routing::post(api_post_cancel))
         .route("/api/options", get(api_options))
-        .route("/api/repos", get(api_repos));
-    #[cfg(feature = "hostinfo")]
-    let app = app.route("/api/host", get(api_host));
-    let app = app.with_state(state);
+        .route("/api/repos", get(api_repos))
+        .with_state(state);
     let listener = tokio::net::TcpListener::from_std(listener)?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -135,17 +132,6 @@ async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         with_member(&status, "turns", &turns_json(&state.status)),
     )
-}
-
-/// A fresh host-details snapshot; the event stream pushes the same shape.
-#[cfg(feature = "hostinfo")]
-async fn api_host(State(state): State<AppState>) -> Json<crate::host::Host> {
-    Json(crate::host::snapshot(&state.workspace))
-}
-
-/// The live log tail while a turn is running, else the last finished turn's.
-async fn api_log(State(state): State<AppState>) -> String {
-    log_tail(&state.status)
 }
 
 /// One finished turn's full log, identified by its start epoch. Served raw,
@@ -247,7 +233,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                 }
                 *sent = Some(key.clone());
             }
-            if let Some((name, text)) = log.event() {
+            if let Some((name, text)) = log {
                 let data = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
                 if send(&tx, name, &data).await.is_err() {
                     return;
@@ -327,29 +313,6 @@ fn with_member(object: &str, name: &str, value: &str) -> String {
     format!("{{\"{name}\":{value}{separator}{fields}")
 }
 
-/// The running turn's log tail, else the last finished turn's.
-fn log_tail(status: &Shared) -> String {
-    let (log_path, fallback) = live_log(status);
-    log_path
-        .and_then(|path| {
-            let mut file = std::fs::File::open(path).ok()?;
-            crate::turn::read_tail(&mut file, LOG_WINDOW).ok()
-        })
-        .unwrap_or(fallback)
-}
-
-/// Where the live log is being read from right now: the running turn's log
-/// file if there is one, and the last finished turn's stored tail to fall
-/// back on when there isn't (or when the file can't be opened).
-fn live_log(status: &Shared) -> (Option<PathBuf>, String) {
-    let status = status.lock();
-    let path = match &status.activity {
-        Activity::Running { log_path, .. } => Some(log_path.clone()),
-        _ => None,
-    };
-    (path, status.log_tail.clone())
-}
-
 /// How far the page has been told the log goes, so the next tick can send
 /// what was added instead of the whole window again.
 enum LogCursor {
@@ -360,7 +323,10 @@ enum LogCursor {
     Idle(String),
 }
 
-/// What to tell the page about the log on this tick.
+/// What to tell the page about the log on this tick, as the SSE event name
+/// and payload, or None when there is nothing to say: `log` is the whole
+/// window, which the page shows instead of what it had, and `log-append` is
+/// what was appended since the last tick, which it adds to the end.
 ///
 /// A log only ever grows while the turn that owns it runs, so resending the
 /// whole window every two seconds sent the same sixteen kilobytes over and
@@ -368,27 +334,18 @@ enum LogCursor {
 /// new bytes go now, and the window is restated solely when the page cannot
 /// append to what it has: the first tick of a stream, a turn starting or
 /// ending, a log replaced by the next turn's, or one that shrank.
-enum LogUpdate {
-    /// The whole window; the page shows this instead of what it had.
-    Replace(String),
-    /// What was appended since the last tick; the page adds it to the end.
-    Append(String),
-    Unchanged,
-}
-
-impl LogUpdate {
-    /// The SSE event name and payload, or None when there is nothing to say.
-    fn event(self) -> Option<(&'static str, String)> {
-        match self {
-            LogUpdate::Replace(text) => Some(("log", text)),
-            LogUpdate::Append(text) => Some(("log-append", text)),
-            LogUpdate::Unchanged => None,
-        }
-    }
-}
-
-fn log_update(status: &Shared, cursor: &mut Option<LogCursor>) -> LogUpdate {
-    let (log_path, fallback) = live_log(status);
+fn log_update(status: &Shared, cursor: &mut Option<LogCursor>) -> Option<(&'static str, String)> {
+    // The running turn's log file if there is one, and the last finished
+    // turn's stored tail to fall back on when there isn't (or when the file
+    // can't be opened).
+    let (log_path, fallback) = {
+        let status = status.lock();
+        let path = match &status.activity {
+            Activity::Running { log_path, .. } => Some(log_path.clone()),
+            _ => None,
+        };
+        (path, status.log_tail.clone())
+    };
     let open = log_path.and_then(|path| {
         let file = std::fs::File::open(&path).ok()?;
         let len = file.metadata().ok()?.len();
@@ -398,10 +355,10 @@ fn log_update(status: &Shared, cursor: &mut Option<LogCursor>) -> LogUpdate {
         // Nothing running: the idle page shows the last turn's stored tail,
         // restated only when it changes.
         if matches!(cursor, Some(LogCursor::Idle(sent)) if *sent == fallback) {
-            return LogUpdate::Unchanged;
+            return None;
         }
         *cursor = Some(LogCursor::Idle(fallback.clone()));
-        return LogUpdate::Replace(fallback);
+        return Some(("log", fallback));
     };
     // Appending is only possible against this very file, read no further
     // than it now reaches, and only while what was added still fits in the
@@ -416,26 +373,26 @@ fn log_update(status: &Shared, cursor: &mut Option<LogCursor>) -> LogUpdate {
         _ => None,
     };
     match appendable {
-        Some(offset) if offset == len => LogUpdate::Unchanged,
+        Some(offset) if offset == len => None,
         Some(offset) => match appended(&mut file, offset) {
             // A read that produced nothing usable (a lone continuation byte
             // mid-write) leaves the cursor where it was for the next tick.
-            Ok((text, _)) if text.is_empty() => LogUpdate::Unchanged,
+            Ok((text, _)) if text.is_empty() => None,
             Ok((text, reached)) => {
                 *cursor = Some(LogCursor::Live {
                     path,
                     offset: reached,
                 });
-                LogUpdate::Append(text)
+                Some(("log-append", text))
             }
-            Err(_) => LogUpdate::Unchanged,
+            Err(_) => None,
         },
         None => match crate::turn::read_tail(&mut file, LOG_WINDOW) {
             Ok(tail) => {
                 *cursor = Some(LogCursor::Live { path, offset: len });
-                LogUpdate::Replace(tail)
+                Some(("log", tail))
             }
-            Err(_) => LogUpdate::Unchanged,
+            Err(_) => None,
         },
     }
 }
@@ -716,13 +673,6 @@ mod tests {
         assert!(response.contains("image/svg+xml"), "{response}");
         assert!(response.contains("<svg"), "{response}");
         assert!(!response.contains("<?xml"), "{response}");
-
-        // The host endpoint rides the hostinfo feature.
-        let response = request(addr, "GET", "/api/host", "");
-        #[cfg(feature = "hostinfo")]
-        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        #[cfg(not(feature = "hostinfo"))]
-        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
     }
 
     #[test]
@@ -850,7 +800,6 @@ mod tests {
                 task: "simplify".into(),
                 repo: "o/r".into(),
                 forge: "github".into(),
-                workspace: "/w".into(),
                 log_path: dir.path().join("log"),
                 pgid: child.id() as i32,
                 started: 0,
@@ -902,7 +851,6 @@ mod tests {
                 task: "simplify".into(),
                 repo: "o/r".into(),
                 forge: "github".into(),
-                workspace: "/w".into(),
                 log_path: dir.path().join("log"),
                 pgid: 1,
                 started: 0,
@@ -1006,7 +954,6 @@ mod tests {
                 task: "benchmark".into(),
                 repo: "cilki/codemine".into(),
                 forge: "gitea".into(),
-                workspace: "/w".into(),
                 log_path: dir.path().join("turn.log"),
                 pgid: 0,
                 started: 1_760_000_000,
@@ -1122,36 +1069,6 @@ mod tests {
         assert!(request(addr, "GET", "/api/turns/999/log", "").starts_with("HTTP/1.1 404"));
         std::fs::remove_file(&path).unwrap();
         assert!(request(addr, "GET", "/api/turns/100/log", "").starts_with("HTTP/1.1 404"));
-    }
-
-    #[test]
-    fn log_tail_follows_the_running_turn() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("turn.log");
-        std::fs::write(&path, "first\n").unwrap();
-        let status = Shared::new();
-
-        // Idle: the last finished turn's stored tail.
-        Status::update(&status, |s| s.log_tail = "from the last turn".into());
-        assert_eq!(log_tail(&status), "from the last turn");
-
-        // Running: the live file, re-read each time.
-        Status::update(&status, |s| {
-            s.activity = Activity::Running {
-                task: "simplify".into(),
-                repo: "o/r".into(),
-                forge: "github".into(),
-                workspace: "/w".into(),
-                log_path: path.clone(),
-                pgid: 0,
-                started: 0,
-                tokens: None,
-                rtk: None,
-            }
-        });
-        assert_eq!(log_tail(&status), "first\n");
-        std::fs::write(&path, "first\nsecond\n").unwrap();
-        assert_eq!(log_tail(&status), "first\nsecond\n");
     }
 
     #[test]
@@ -1278,7 +1195,6 @@ mod tests {
             task: "benchmark".into(),
             repo: "o/r".into(),
             forge: "gitea".into(),
-            workspace: "/w".into(),
             log_path: path.to_path_buf(),
             pgid: 0,
             started: 0,
@@ -1290,7 +1206,7 @@ mod tests {
             file.write_all(text.as_bytes()).unwrap();
         };
         let mut cursor = None;
-        let update = |cursor: &mut Option<LogCursor>| log_update(&status, cursor).event();
+        let update = |cursor: &mut Option<LogCursor>| log_update(&status, cursor);
 
         // Idle: the last finished turn's stored tail, stated once.
         Status::update(&status, |s| s.log_tail = "from the last turn".into());

@@ -143,7 +143,6 @@ pub enum Activity {
         task: String,
         repo: String,
         forge: String,
-        workspace: String,
         #[serde(skip)]
         log_path: PathBuf,
         /// The agent's process group, for the web UI's pause and resume
@@ -342,7 +341,10 @@ pub struct Status {
     /// compare — which is the whole cost the separate event exists to avoid.
     #[serde(skip)]
     pub turns_revision: u64,
-    /// Tail of the last finished turn's log.
+    /// Tail of the last finished turn's log. Skipped by the serialization:
+    /// the page is sent it as a `log` event, and carrying up to 100 lines of
+    /// it on every status event as well sent it again with each token sample.
+    #[serde(skip)]
     pub log_tail: String,
     /// When set, turns are held after one died on proxy auth: the epoch at
     /// which the main loop will try again even without a fresh login.

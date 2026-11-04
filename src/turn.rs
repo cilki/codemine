@@ -105,7 +105,6 @@ impl Turn<'_> {
             task: self.task.to_owned(),
             repo: self.repo.to_owned(),
             forge: self.forge_name().into(),
-            workspace: self.dir.display().to_string(),
             log_path: self.log_path.clone(),
             // 0 until the agent's process group exists; `run` fills it in the
             // moment it does, which is what arms the pause button.

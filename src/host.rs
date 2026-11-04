@@ -100,9 +100,8 @@ fn local_ip() -> String {
 }
 
 /// The System the usage is diffed through and the figure it last produced.
-/// Kept process wide so every caller — each open event stream, plus
-/// `/api/host` — shares one measurement window instead of racing each other
-/// for ever shorter, ever noisier deltas.
+/// Kept process wide so every open event stream shares one measurement
+/// window instead of racing the others for ever shorter, ever noisier deltas.
 static CPU: Mutex<Option<CpuSample>> = Mutex::new(None);
 
 struct CpuSample {
