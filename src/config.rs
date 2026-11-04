@@ -171,14 +171,9 @@ fn parse_models(stdout: &str) -> Vec<String> {
 pub struct Forge {
     pub kind: ForgeKind,
     pub token: String,
-    /// Username for the git credential line; GitHub and GitLab accept any
-    /// token-bearing pseudo-user over HTTPS, Gitea's is the account login
-    /// that `identity::resolve` reads off the forge.
-    pub user: String,
     /// The account's login on the forge, as PRs name their author; empty
     /// until `identity::resolve` fills it from the forge's whoami endpoint,
-    /// which the main loop does before any turn runs. Distinct from `user`,
-    /// which on GitHub and GitLab is a fixed credential pseudo-user.
+    /// which the main loop does before any turn runs.
     pub login: String,
     /// The email commits on this forge are authored (and committed) as;
     /// empty until `identity::resolve` fills it from the forge's whoami
@@ -195,6 +190,17 @@ pub struct Forge {
 }
 
 impl Forge {
+    /// Username for the git credential line: GitHub and GitLab accept a
+    /// fixed token-bearing pseudo-user over HTTPS, Gitea wants the account
+    /// login.
+    pub fn credential_user(&self) -> &str {
+        match self.kind {
+            ForgeKind::Gitea => &self.login,
+            ForgeKind::Github => "x-access-token",
+            ForgeKind::Gitlab => "oauth2",
+        }
+    }
+
     /// Whether `task` is on for `repo`; a repository that isn't enabled has
     /// nothing on.
     pub fn runs(&self, task: &str, repo: &str) -> bool {
@@ -453,7 +459,6 @@ mod tests {
         let forge = |kind, url: &str| Forge {
             kind,
             token: "tok".into(),
-            user: String::new(),
             login: String::new(),
             email: String::new(),
             url: url.into(),

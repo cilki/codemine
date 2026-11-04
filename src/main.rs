@@ -669,9 +669,11 @@ fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
     let forge = &cfg.forge;
     let credentials = format!(
         "{}\n",
-        forge
-            .url
-            .replacen("://", &format!("://{}:{}@", forge.user, forge.token), 1)
+        forge.url.replacen(
+            "://",
+            &format!("://{}:{}@", forge.credential_user(), forge.token),
+            1
+        )
     );
     let path = workspace::git_credentials(&cli.workspace);
     OpenOptions::new()

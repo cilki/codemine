@@ -103,9 +103,6 @@ pub fn resolve(forge: &mut Forge) -> Result<()> {
     };
     forge.email = identity.email.clone();
     forge.login = identity.login.clone();
-    if forge.kind == ForgeKind::Gitea {
-        forge.user = identity.login.clone();
-    }
     Ok(())
 }
 
@@ -316,11 +313,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn forge(kind: ForgeKind, user: &str, token: &str) -> Forge {
+    fn forge(kind: ForgeKind, token: &str) -> Forge {
         Forge {
             kind,
             token: token.into(),
-            user: user.into(),
             login: String::new(),
             email: String::new(),
             url: "https://forge.example.com".into(),
@@ -388,8 +384,8 @@ mod tests {
     fn resolve_fills_from_the_cache() {
         // Tokens are unique per test: the cache is one static shared across
         // the test binary's threads.
-        let mut gitea = forge(ForgeKind::Gitea, "", "cache-test-gitea");
-        let mut github = forge(ForgeKind::Github, "x-access-token", "cache-test-github");
+        let mut gitea = forge(ForgeKind::Gitea, "cache-test-gitea");
+        let mut github = forge(ForgeKind::Github, "cache-test-github");
         for f in [&gitea, &github] {
             lock().insert(
                 (f.kind, f.url.clone(), f.token.clone()),
@@ -404,10 +400,10 @@ mod tests {
         // Gitea's credential-line user is the resolved login; the other
         // forges keep their fixed pseudo-users. The login lands on every
         // forge either way.
-        assert_eq!(gitea.user, "gitea-bot");
+        assert_eq!(gitea.credential_user(), "gitea-bot");
         assert_eq!(gitea.login, "gitea-bot");
         assert_eq!(gitea.email, "bot@gitea.example.com");
-        assert_eq!(github.user, "x-access-token");
+        assert_eq!(github.credential_user(), "x-access-token");
         assert_eq!(github.login, "github-bot");
         assert_eq!(github.email, "bot@github.example.com");
     }
@@ -420,7 +416,7 @@ mod tests {
     /// without asking again.
     #[test]
     fn a_fresh_lookup_records_its_answer() {
-        let mut gitea = forge(ForgeKind::Gitea, "", "fresh-lookup-test");
+        let mut gitea = forge(ForgeKind::Gitea, "fresh-lookup-test");
         // Nothing listens on port 1, so whoami fails as fast as the request
         // can be refused.
         gitea.url = "http://127.0.0.1:1".into();
@@ -494,7 +490,7 @@ mod tests {
 
     #[test]
     fn a_recent_failure_is_held_without_asking_again() {
-        let mut github = forge(ForgeKind::Github, "x-access-token", "failed-test");
+        let mut github = forge(ForgeKind::Github, "failed-test");
         lock().insert(
             (ForgeKind::Github, github.url.clone(), "failed-test".into()),
             Cached::Failed(Instant::now(), "the token is bad".into()),

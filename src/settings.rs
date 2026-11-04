@@ -256,13 +256,6 @@ impl Settings {
         Some(Forge {
             kind: forge.kind,
             token: forge.token.clone(),
-            user: match forge.kind {
-                // Filled with the account login by `identity::resolve`
-                // before the credential line is written.
-                ForgeKind::Gitea => String::new(),
-                ForgeKind::Github => "x-access-token".into(),
-                ForgeKind::Gitlab => "oauth2".into(),
-            },
             login: String::new(),
             email: String::new(),
             url: forge.url(),
@@ -552,7 +545,7 @@ mod tests {
         let config = settings.to_config(&cli()).unwrap();
         assert_eq!(config.forge.kind, ForgeKind::Github);
         assert_eq!(config.forge.url, "https://github.com");
-        assert_eq!(config.forge.user, "x-access-token");
+        assert_eq!(config.forge.credential_user(), "x-access-token");
         // The author email is resolved from the forge account before any
         // turn runs, never from the settings.
         assert_eq!(config.forge.email, "");
@@ -687,7 +680,7 @@ mod tests {
         let config = settings.to_config(&cli()).unwrap();
         assert_eq!(config.forge.url, "https://git.example.com");
         // Gitea's credential user is the login, read off the forge later.
-        assert_eq!(config.forge.user, "");
+        assert_eq!(config.forge.credential_user(), "");
     }
 
     #[test]

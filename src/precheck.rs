@@ -467,7 +467,6 @@ mod tests {
         Forge {
             kind: ForgeKind::Github,
             token: "tok".into(),
-            user: String::new(),
             login: String::new(),
             email: String::new(),
             url: "https://github.com".into(),
