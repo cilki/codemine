@@ -13,7 +13,9 @@
 //! two of the whole tail, to say four things about one piece of text.
 
 /// What the turn's log says about how it went: the five things the log is the
-/// only witness to, read together because they are read from one text.
+/// only witness to, read together because they are read from one text. The
+/// default is a log that said nothing.
+#[derive(Default)]
 pub struct Verdict {
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
     /// only these turns count toward the rate limit.

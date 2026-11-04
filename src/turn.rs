@@ -20,14 +20,6 @@ use crate::status::{
 };
 use crate::workspace;
 
-#[derive(Default)]
-pub enum Backoff {
-    /// The usage window is exhausted until this epoch.
-    UsageLimit(u64),
-    #[default]
-    Normal,
-}
-
 /// What a pass may draw from. The schedule's window gates automatic turns —
 /// the ones the runner picks for itself off the random draw — and not the
 /// ones the forge asked for, so a pass inside the window draws from anything
@@ -55,28 +47,21 @@ pub enum Idle {
     NoListedRepos,
 }
 
-/// A turn that never started reports exactly this: nothing to back off from,
-/// nothing spent, nothing to gate on, nothing cancelled.
-#[derive(Default)]
-pub struct Report {
-    pub backoff: Backoff,
-    /// Why the draw came up empty, when it did. `None` means a turn ran —
-    /// whatever became of it.
-    pub idle: Option<Idle>,
-    /// The agent reported real forge changes with a `TASK COMPLETED` marker;
-    /// only these turns count toward the rate limit.
-    pub completed: bool,
-    /// The turn died on proxy authentication (a rejected client key or a
-    /// proxy with no usable login); the main loop briefly gates further
-    /// turns so a broken setup can't burn them back to back.
-    pub auth_error: bool,
-    /// opencode refused the configured model, with what it said about it.
-    /// Nothing but an edit fixes that, so the main loop raises it against the
-    /// model field and stops drawing rather than retrying.
-    pub rejected_model: Option<String>,
-    /// The web UI cancelled the turn; the main loop skips the between-turn
-    /// sleep so the next one starts right away.
-    pub canceled: bool,
+/// How a pass went: the draw took no turn, and why, or a turn ran —
+/// whatever became of it.
+pub enum Report {
+    Idle(Idle),
+    Ran {
+        /// What the turn's log said about it, which the main loop acts on: a
+        /// completion counts toward the rate limit, a usage notice holds the
+        /// next turn, a proxy auth failure briefly gates turns, and a refused
+        /// model blocks them until another is picked. A turn that died
+        /// preparing its clone never wrote a log to read, and says nothing.
+        verdict: Verdict,
+        /// The web UI cancelled the turn; the main loop skips the
+        /// between-turn sleep so the next one starts right away.
+        canceled: bool,
+    },
 }
 
 /// One turn's identity, as everything that reports on it spells it: the pair
@@ -176,10 +161,7 @@ pub fn run(
         // what does is an enabled repository the forge no longer lists —
         // renamed, deleted, or out of the token's reach. The caller reports
         // it, since it is the one that knows how to show a blocker.
-        return Ok(Report {
-            idle: Some(Idle::NoListedRepos),
-            ..Default::default()
-        });
+        return Ok(Report::Idle(Idle::NoListedRepos));
     }
     // The precondition probes plus the skip cache, sharing one set of forge
     // lookups across everything this draw asks about.
@@ -187,10 +169,7 @@ pub fn run(
     let Some((task, repo)) = pick(forge, &pool, pending, draw, |task, repo| {
         probe.actionable(task, repo)
     }) else {
-        return Ok(Report {
-            idle: Some(Idle::NothingToDo),
-            ..Default::default()
-        });
+        return Ok(Report::Idle(Idle::NothingToDo));
     };
 
     let started = epoch_now();
@@ -227,7 +206,10 @@ pub fn run(
             last_lines(&tail, 20)
         );
         turn.finish(status, &tail, Outcome::Failed, elapsed, Spent::default());
-        return Ok(Report::default());
+        return Ok(Report::Ran {
+            verdict: Verdict::default(),
+            canceled: false,
+        });
     }
 
     let state = answered_state(cfg, &turn, &probe);
@@ -260,18 +242,7 @@ pub fn run(
 
     turn.finish(status, &tail, outcome, elapsed, spent);
 
-    Ok(Report {
-        backoff: match verdict.usage_limit {
-            Some(epoch) => Backoff::UsageLimit(epoch),
-            None => Backoff::Normal,
-        },
-        // This pass took its turn, whatever came of it.
-        idle: None,
-        completed: verdict.completed,
-        auth_error: verdict.auth_error,
-        rejected_model: verdict.rejected_model,
-        canceled,
-    })
+    Ok(Report::Ran { verdict, canceled })
 }
 
 /// Everything the draw may choose from: every enabled repository the forge

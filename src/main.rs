@@ -43,7 +43,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::{Cli, Config, ForgeKind, USAGE};
 use crate::settings::{Problem, Settings, SettingsStore};
 use crate::status::{Activity, Shared, Status};
-use crate::turn::{Backoff, Draw};
+use crate::turn::{Draw, Idle, Report};
 
 fn main() -> Result<()> {
     // The hidden sandbox wrapper mode the turn runner spawns opencode
@@ -109,16 +109,11 @@ fn main() -> Result<()> {
     events::spawn(store.clone(), pending.clone())?;
 
     let mut applied_generation = None;
-    // The epoch until which turns are held after one died on proxy auth: a
-    // short flat pause, since refreshing is CLIProxyAPI's continuous job and
-    // anything it can't fix on its own needs a human either way — which the
-    // health problem below surfaces independently.
-    let mut auth_gated: Option<u64> = None;
     // The model a turn found opencode refusing, and what it said about it.
-    // Unlike the auth gate this has no expiry: a model ID the provider has
-    // renamed or retired is wrong until somebody picks another one, so it
-    // stands as a blocker against the model field until that model stops
-    // being the configured one.
+    // Unlike the proxy auth gate (`Status::oauth_gated_until`) this has no
+    // expiry: a model ID the provider has renamed or retired is wrong until
+    // somebody picks another one, so it stands as a blocker against the model
+    // field until that model stops being the configured one.
     let mut rejected_model: Option<(String, String)> = None;
     // What was last logged as blocking turns, so a blocker that needs a
     // human says so once instead of once per pass.
@@ -140,10 +135,14 @@ fn main() -> Result<()> {
         };
         let (settings, generation) = store.snapshot();
         let mut problems = settings.problems();
+        // Set after a turn died on proxy auth: a short flat pause, since
+        // refreshing is CLIProxyAPI's continuous job and anything it can't fix
+        // on its own needs a human either way — which the health problem
+        // surfaces independently.
+        let auth_gated = status.lock().oauth_gated_until;
         if let Some(retry_at) = auth_gated {
             if status::epoch_now() >= retry_at {
                 info!("retrying after the proxy auth gate expired");
-                auth_gated = None;
                 Status::update(&status, |s| s.oauth_gated_until = None);
             } else {
                 problems.push(Problem::new(
@@ -233,16 +232,14 @@ fn main() -> Result<()> {
             // around into the hold, with no idle gap and no "nothing to do"
             // — the queue was drained, and the watcher only refills it on a
             // newer feed stamp, so there is nothing to spin on.
-            Ok(report)
-                if report.idle == Some(turn::Idle::NothingToDo) && draw == Draw::QueuedOnly =>
-            {
+            Ok(Report::Idle(Idle::NothingToDo)) if draw == Draw::QueuedOnly => {
                 info!("the queued activity needed no turn; back to the hold");
             }
             // The draw took no turn. Which of its two reasons it is decides
             // how that is shown: a pool the forge doesn't list is a blocker
             // like any settings problem, where a caught-up pool is simply
             // what a runner with nothing to do looks like.
-            Ok(report) if report.idle.is_some() => match idle_problem(report.idle) {
+            Ok(Report::Idle(idle)) => match idle_problem(idle) {
                 Some(problem) => {
                     // The pool is broken rather than caught up, so the next
                     // draw after it is fixed is a first draw again.
@@ -262,35 +259,29 @@ fn main() -> Result<()> {
                         info!("{NOTHING_TO_DO}");
                     }
                     idle_draws = idle_draws.saturating_add(1);
-                    sleep(
-                        &cli,
-                        Backoff::Normal,
-                        &status,
-                        &pending,
-                        Some(idle_draws),
-                        || store.generation() != generation,
-                    );
+                    sleep(&cli, None, &status, &pending, Some(idle_draws), || {
+                        store.generation() != generation
+                    });
                 }
             },
-            Ok(report) => {
+            Ok(Report::Ran { verdict, canceled }) => {
                 idle_draws = 0;
                 if blocked.cleared() {
                     info!("taking turns again");
                 }
-                if report.auth_error {
+                if verdict.auth_error {
                     let until = status::epoch_now() + AUTH_RETRY;
                     error!(
                         "the turn died on proxy auth; holding turns for {} minutes",
                         AUTH_RETRY / 60
                     );
-                    auth_gated = Some(until);
                     Status::update(&status, |s| s.oauth_gated_until = Some(until));
                 }
-                if let Some(complaint) = report.rejected_model {
+                if let Some(complaint) = verdict.rejected_model {
                     error!("opencode refused the configured model: {complaint}");
                     rejected_model = Some((cfg.model.clone(), complaint));
                 }
-                if report.completed {
+                if verdict.completed {
                     // Recorded with or without a limit, so one set later
                     // counts what actually ran; only logged under one.
                     let now = status::epoch_now();
@@ -305,15 +296,14 @@ fn main() -> Result<()> {
                         );
                     }
                 }
-                match report.backoff {
-                    // A cancelled turn heads straight into the next one —
-                    // that is the button's promise — but a usage-limit
-                    // backoff still holds, since retrying early just burns
-                    // the next turn on the same limit.
-                    Backoff::Normal if report.canceled => {}
-                    backoff => sleep(&cli, backoff, &status, &pending, None, || {
+                // A cancelled turn heads straight into the next one — that is
+                // the button's promise — but a usage-limit backoff still
+                // holds, since retrying early just burns the next turn on the
+                // same limit.
+                if !canceled || verdict.usage_limit.is_some() {
+                    sleep(&cli, verdict.usage_limit, &status, &pending, None, || {
                         store.generation() != generation
-                    }),
+                    });
                 }
             }
             // A failing turn (bad token, unreachable forge, ...) must not
@@ -322,7 +312,7 @@ fn main() -> Result<()> {
                 idle_draws = 0;
                 error!("turn failed: {err:#}");
                 Status::update(&status, |s| s.log_tail = format!("turn failed: {err:#}"));
-                sleep(&cli, Backoff::Normal, &status, &pending, None, || {
+                sleep(&cli, None, &status, &pending, None, || {
                     store.generation() != generation
                 });
             }
@@ -356,10 +346,10 @@ const NOTHING_TO_DO: &str = "every enabled task has nothing to do on any enabled
 /// fixes it.
 /// A pool that is merely caught up is no problem at all, and mustn't flag the
 /// settings as if it were.
-fn idle_problem(idle: Option<turn::Idle>) -> Option<Problem> {
-    match idle? {
-        turn::Idle::NothingToDo => None,
-        turn::Idle::NoListedRepos => Some(Problem::new(
+fn idle_problem(idle: Idle) -> Option<Problem> {
+    match idle {
+        Idle::NothingToDo => None,
+        Idle::NoListedRepos => Some(Problem::new(
             "repos",
             "none of the enabled repositories are listed by the forge, or all are archived",
         )),
@@ -762,13 +752,14 @@ fn idle_gap(streak: u32) -> u64 {
 
 /// How long to hold before the next turn, and whether the hold is a usage
 /// window — which, unlike an ordinary pause, fresh forge activity may not cut
-/// short, since nothing can run before the window reopens. `idle` carries the
-/// number of consecutive draws that have found nothing, and is None when the
-/// pass took a turn.
-fn hold(backoff: Backoff, idle: Option<u32>, now: u64) -> (u64, bool) {
-    match backoff {
+/// short, since nothing can run before the window reopens. `usage_limit` is
+/// the epoch an exhausted usage window reopens at, when the turn's log named
+/// one. `idle` carries the number of consecutive draws that have found
+/// nothing, and is None when the pass took a turn.
+fn hold(usage_limit: Option<u64>, idle: Option<u32>, now: u64) -> (u64, bool) {
+    match usage_limit {
         // A minute past the reopening, so the next turn isn't racing it.
-        Backoff::UsageLimit(epoch) if epoch > now => {
+        Some(epoch) if epoch > now => {
             let asked = (epoch - now).saturating_add(60);
             if asked > MAX_USAGE_HOLD {
                 warn!(
@@ -787,7 +778,7 @@ fn hold(backoff: Backoff, idle: Option<u32>, now: u64) -> (u64, bool) {
 /// just long enough to keep a failing run from spinning the loop.
 fn sleep(
     cli: &Cli,
-    backoff: Backoff,
+    usage_limit: Option<u64>,
     status: &status::Shared,
     pending: &events::Pending,
     idle: Option<u32>,
@@ -797,7 +788,7 @@ fn sleep(
         return;
     }
     let now = status::epoch_now();
-    let (seconds, limited) = hold(backoff, idle, now);
+    let (seconds, limited) = hold(usage_limit, idle, now);
     let until = now + seconds;
     if limited {
         info!(
@@ -938,41 +929,26 @@ mod tests {
         let now = 1_760_000_000;
         // No limit reported: the short pause that keeps a failing run from
         // spinning the loop.
-        assert_eq!(hold(Backoff::Normal, None, now), (TURN_GAP, false));
+        assert_eq!(hold(None, None, now), (TURN_GAP, false));
         // A window reopening in an hour is obeyed as given, plus the minute
         // of slack that keeps the next turn from racing it.
-        assert_eq!(
-            hold(Backoff::UsageLimit(now + 3600), None, now),
-            (3660, true)
-        );
+        assert_eq!(hold(Some(now + 3600), None, now), (3660, true));
         // One that already reopened is no hold at all.
-        assert_eq!(
-            hold(Backoff::UsageLimit(now - 1), None, now),
-            (TURN_GAP, false)
-        );
+        assert_eq!(hold(Some(now - 1), None, now), (TURN_GAP, false));
         // A weekly window is the widest Anthropic reports, and lands right at
         // the cap rather than being clipped by it.
         assert_eq!(
-            hold(Backoff::UsageLimit(now + MAX_USAGE_HOLD - 60), None, now),
+            hold(Some(now + MAX_USAGE_HOLD - 60), None, now),
             (MAX_USAGE_HOLD, true)
         );
         // Anything beyond is capped: the largest epoch the scanner will hand
         // over is a 261-year hold taken at face value.
-        assert_eq!(
-            hold(Backoff::UsageLimit(9_999_999_999), None, now),
-            (MAX_USAGE_HOLD, true)
-        );
-        assert_eq!(
-            hold(Backoff::UsageLimit(u64::MAX), None, now),
-            (MAX_USAGE_HOLD, true)
-        );
+        assert_eq!(hold(Some(9_999_999_999), None, now), (MAX_USAGE_HOLD, true));
+        assert_eq!(hold(Some(u64::MAX), None, now), (MAX_USAGE_HOLD, true));
         // An idle streak lengthens the ordinary gap and nothing else: a usage
         // window outranks it, since the hold is the window's either way.
-        assert_eq!(hold(Backoff::Normal, Some(3), now), (240, false));
-        assert_eq!(
-            hold(Backoff::UsageLimit(now + 3600), Some(9), now),
-            (3660, true)
-        );
+        assert_eq!(hold(None, Some(3), now), (240, false));
+        assert_eq!(hold(Some(now + 3600), Some(9), now), (3660, true));
     }
 
     /// A draw that finds nothing costs a forge round trip per repository, and
@@ -1034,7 +1010,7 @@ mod tests {
     /// button on a perfectly healthy runner.
     #[test]
     fn only_an_unlisted_repository_set_is_a_problem() {
-        let problem = idle_problem(Some(turn::Idle::NoListedRepos)).expect("a blocker");
+        let problem = idle_problem(Idle::NoListedRepos).expect("a blocker");
         // The field is what the page outlines, so it has to name the
         // repository picker rather than the forge's token or URL.
         assert_eq!(problem.field, "repos");
@@ -1043,8 +1019,7 @@ mod tests {
             "{}",
             problem.message
         );
-        assert!(idle_problem(Some(turn::Idle::NothingToDo)).is_none());
-        assert!(idle_problem(None).is_none());
+        assert!(idle_problem(Idle::NothingToDo).is_none());
     }
 
     /// "Nothing to do" and "pausing between turns" used to be the same state
