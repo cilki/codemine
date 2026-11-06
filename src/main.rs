@@ -654,8 +654,17 @@ fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
         "[include]\n\tpath = {}\n",
         home.join(".gitconfig").display()
     );
+    // The empty `helper =` first: it clears every helper the included config
+    // brought along, the URL-specific ones included. Without it, an image or
+    // user config that names its own helper for the forge is asked before
+    // the store, and git takes the first answer that has both a username and
+    // a password, an empty username counting. That is how the emb-build
+    // image's `!glab auth git-credential` entry, answering `username=` with
+    // the token from its environment, had every push on GitLab refused with
+    // `HTTP Basic: Access denied` while the store, which held the credential
+    // git was meant to send, was never consulted at all.
     config.push_str(&format!(
-        "[credential]\n\thelper = store --file={}\n",
+        "[credential]\n\thelper =\n\thelper = store --file={}\n",
         workspace::git_credentials(&cli.workspace).display()
     ));
     std::fs::write(&path, config).with_context(|| format!("failed to write {}", path.display()))?;
@@ -897,6 +906,7 @@ fn iso8601(epoch: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// The config the runner hands every git it spawns, `opencode`'s
     /// included, via `GIT_CONFIG_GLOBAL`: it has to carry the credential
@@ -931,6 +941,81 @@ mod tests {
             )),
             "{written}"
         );
+    }
+
+    /// The included config is the user's, or the image's, and it may name a
+    /// credential helper of its own for the forge: the emb-build image does,
+    /// with `!glab auth git-credential` for its GitLab. Git asks helpers in
+    /// config order and stops at the first that answers with both a username
+    /// and a password, an empty username included, so a helper the include
+    /// brought in was answering for the store, and every push the store was
+    /// written for failed with `HTTP Basic: Access denied`. The store has to
+    /// be the only helper git consults.
+    #[test]
+    fn the_git_config_lets_nothing_included_answer_for_the_store() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        // A helper that answers like glab does with a token from its
+        // environment and no config: a password under an empty username.
+        let impostor = home.path().join("impostor.sh");
+        std::fs::write(
+            &impostor,
+            "#!/bin/sh\n[ \"$1\" = get ] && { echo username=; echo password=IMPOSTOR; }\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            format!(
+                "[credential \"https://forge.example.com\"]\n\thelper =\n\thelper = {}\n",
+                impostor.display()
+            ),
+        )
+        .unwrap();
+
+        let cli = Cli::parse(
+            [
+                "codemine",
+                "--workspace",
+                &workspace.path().display().to_string(),
+            ]
+            .map(String::from)
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        let config = install_git_config(&cli, home.path()).unwrap();
+        std::fs::write(
+            workspace::git_credentials(&cli.workspace),
+            credential_line(&forge("bot", "s3cret")),
+        )
+        .unwrap();
+
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=forge.example.com\n\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let answer = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(answer.contains("username=bot\n"), "{answer}");
+        assert!(answer.contains("password=s3cret\n"), "{answer}");
     }
 
     /// A Gitea forge, whose credential user is the account login, so `user`
