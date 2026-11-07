@@ -239,20 +239,39 @@ fn update(workspace: &Path, url: &str, dir: &Path, log: &File) -> Result<()> {
         "--prune",
         "+refs/heads/*:refs/remotes/origin/*",
     ])?;
-    // Track upstream default-branch changes.
-    git(&["remote", "set-head", "origin", "--auto"])?;
-    let head = git_stdout(
-        workspace,
-        dir,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    )?;
-    let branch = head
-        .trim()
-        .strip_prefix("origin/")
-        .with_context(|| format!("unexpected origin HEAD: {}", head.trim()))?;
+    // Track upstream default-branch changes. The branch is asked of the
+    // remote and written with `symbolic-ref` rather than with
+    // `remote set-head --auto`: that command runs the clone's
+    // `reference-transaction` hook whatever `core.hooksPath` says (git
+    // 2.47), and a hook the agent left in the clone is exactly what the
+    // override is there to keep out of the runner's own git. `ls-remote`
+    // writes nothing locally, and `symbolic-ref` honors the override.
+    let symref = git_stdout(workspace, dir, &["ls-remote", "--symref", "origin", "HEAD"])?;
+    let branch = symref
+        .lines()
+        .find_map(|line| line.strip_prefix("ref: refs/heads/"))
+        .and_then(|rest| rest.split('\t').next())
+        .filter(|branch| !branch.is_empty())
+        .with_context(|| format!("origin reports no symbolic HEAD: {}", symref.trim()))?;
+    git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        &format!("refs/remotes/origin/{branch}"),
+    ])?;
     git(&["checkout", "--force", branch])?;
     git(&["reset", "--hard", &format!("origin/{branch}")])?;
     git(&["clean", "-fd", "-e", ".codegraph"])?;
+    // Submodules, for the repositories that have them. The clone is made
+    // without them, so until this ran a submodule was an empty directory the
+    // agent found out about one failed build later and filled in by hand.
+    // Not worth a reclone either: the turn's own branch is already correct,
+    // and a submodule the forge can't serve is a warning in the log rather
+    // than a dead turn. `.gitmodules` is the repository's, but git takes
+    // only a URL and a path from it — an `update = !command` is honored from
+    // the local config alone, which `reset_local_config` has just rebuilt.
+    if let Err(err) = git(&["submodule", "update", "--init", "--recursive"]) {
+        warn!("failed to update submodules in {}: {err:#}", dir.display());
+    }
     // The branch the turn starts on is current now; the rest are brought
     // forward separately. A failure there is not worth a reclone — the
     // turn's own branch is already correct.
@@ -832,6 +851,47 @@ mod tests {
             ],
         );
         (origin, clone)
+    }
+
+    /// A repository's submodules are part of the tree the agent is handed.
+    /// The clone is made without them, so `update` is what fills them in:
+    /// `protocols/score` used to be an empty directory that a turn found out
+    /// about one failed build later.
+    #[test]
+    fn update_fills_in_submodules() {
+        // Submodule clones over the file protocol are refused by default
+        // (protocol.file.allow); the test's repositories are all local, and
+        // this is the one switch that reaches git's own submodule clone,
+        // which `update` cannot be handed a `-c` for.
+        unsafe { std::env::set_var("GIT_ALLOW_PROTOCOL", "file") };
+        let root = tempfile::tempdir().unwrap();
+        let lib = root.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        git(&lib, &["init", "-b", "main"]);
+        commit(&lib, "lib-first");
+        let (origin, clone) = origin_and_clone(root.path());
+        git(
+            &origin,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &lib.display().to_string(),
+                "vendor/lib",
+            ],
+        );
+        git(&origin, &["commit", "-m", "add submodule"]);
+
+        let log = File::create(root.path().join("log")).unwrap();
+        update(root.path(), &url_of(&origin), &clone, &log).unwrap();
+
+        let populated = clone.join("vendor/lib/.git");
+        assert!(populated.exists(), "submodule was not initialised");
+        assert_eq!(
+            head_of(&clone.join("vendor/lib"), "HEAD"),
+            head_of(&lib, "main")
+        );
     }
 
     /// Every branch the turn might touch starts at what origin has now, not

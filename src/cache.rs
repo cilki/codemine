@@ -1,7 +1,10 @@
 //! Skip memory for the tasks whose answer is a function of something the
 //! runner can observe for itself. `docs`, `simplify`, `benchmark`,
-//! `coverage`, and `mutation` all read the code and nothing else, so a turn
-//! that found nothing to do will find nothing again until the code moves.
+//! `coverage`, `mutation`, and `audit` all read the code and nothing else, so
+//! a turn that found nothing to do will find nothing again until the code
+//! moves. (`audit` also asks the ecosystem's advisory database, which moves
+//! on its own; but it moves over days, and the alternative was the same
+//! repository audited twice at the same commit twelve minutes apart.)
 //! `feedback` reads the forge's notification feed, so its answer holds until
 //! a thread newer than the ones it already read arrives. `rebase` reads the
 //! forge's view of the bot's own open PRs, so its answer holds until one of
@@ -62,7 +65,7 @@ pub enum Basis {
 /// would outlast the reason for it.
 pub fn basis(task: &str) -> Option<Basis> {
     match task {
-        "docs" | "simplify" | "benchmark" | "coverage" | "mutation" => Some(Basis::Head),
+        "docs" | "simplify" | "benchmark" | "coverage" | "mutation" | "audit" => Some(Basis::Head),
         "feedback" => Some(Basis::Feed),
         "rebase" => Some(Basis::Prs),
         "review" => Some(Basis::Reviews),
@@ -463,8 +466,8 @@ mod tests {
     /// it.
     #[test]
     fn basis_matches_what_each_task_reads() {
-        let head = ["docs", "simplify", "benchmark", "coverage", "mutation"];
-        let unremembered = ["bump", "todo", "roleplay", "audit", "feature"];
+        let head = ["docs", "simplify", "benchmark", "coverage", "mutation", "audit"];
+        let unremembered = ["bump", "todo", "roleplay", "feature"];
         for task in head {
             assert_eq!(basis(task), Some(Basis::Head), "{task}");
         }

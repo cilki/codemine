@@ -22,10 +22,24 @@ are fine to reuse. The clone is thrown away whenever the runner restarts, so
 anything that was never pushed — local branches included — may be gone by the
 next run.
 
+Until that restart, though, the clone keeps the local branches earlier turns
+left in it. Before you start anything, list the ones that were never pushed:
+
+```sh
+git branch --no-color -vv | grep -v '\[origin/'
+```
+
+Each is work on this repository that an earlier turn finished but could not
+deliver — a push the forge refused, say. Resume it rather than redo it: if the
+change still applies, check it out, rebase it onto the current base, and carry
+on from the delivery step; if the base has absorbed it, delete the branch.
+
+<!-- codegraph -->
 Prefer the `codegraph_explore` tool over grep/find/broad file reads when
 exploring the codebase — it answers structural questions in a single call and is
 much cheaper. Fall back to normal exploration only if the tool is unavailable or
 fails.
+<!-- /codegraph -->
 
 Execute only the assigned task, described below. If there is nothing to do for
 it on the assigned repository, skip the turn — do not switch to a different task
@@ -199,10 +213,20 @@ the user decide what to do.
 
 # General information
 
-Some of what you need to build and test is already on the PATH: Rust toolchain,
-`cc`, `make`, `python3`, and `hyperfine` for benchmarking. If a project has a
-`shell.nix`, it's usually worthwhile to run `nix develop` or `nix-shell` and use
-the project-specific tools/versions.
+What is on the PATH depends on the image this runner was started in. Check
+with `command -v <tool>` before building a plan on a tool, and when one you
+needed is missing (a test runner, a benchmark harness, a docs builder), say so
+in your report so it can be added — don't go looking for it again next turn.
+Two things are known not to be here: a Docker daemon and cloud credentials, so
+a test plan that needs either can only be run with stubs. If a project has a
+`shell.nix` or `flake.nix`, it's usually worthwhile to run `nix develop` or
+`nix-shell` and use the project-specific tools/versions.
+
+Your commands are rewritten through `rtk`, which compresses their output to
+save tokens. When you need a command's exact output — a patch you will apply
+later, a file another program will read — run it as `rtk proxy <command>` so
+nothing is summarized away: a summarized diff written to a file is not a
+patch.
 
 Prefer `cargo check` over `cargo build` when you only need to know whether
 something compiles; always check the compilation succeeds except for trivial
@@ -214,3 +238,8 @@ give it a scratch home —
 — rather than the real one. The real home holds the configuration of the tools
 running this session, and a program that writes its own defaults there on
 startup breaks the sessions that come after yours.
+
+`/tmp` may be mounted `noexec` (`mount | grep ' /tmp '` says), in which case
+nothing placed there can run: not a script, not a virtualenv's interpreter, not
+a stub binary. Put anything executable under `/var/tmp/opencode` instead, and
+don't spend a turn rediscovering this.

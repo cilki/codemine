@@ -269,7 +269,7 @@ pub const USAGE: &str = "usage: codemine [--listen ADDR] [--workspace DIR] [--on
   --listen ADDR     bind address for the web UI (default 0.0.0.0:8080)
   --workspace DIR   persistent workspace root (default ~/.codemine)
   --once            run a single turn and exit
-  --sandbox         confine the agent's writes with Landlock
+  --sandbox         confine the agent's writes with Landlock (which also forbids every mount)
   --help            show this help";
 
 /// Command-line options; everything else is configured through the web UI

@@ -373,6 +373,7 @@ fn spawn_agent(
         turn.repo,
         turn.forge_name(),
         &turn.dir,
+        crate::workspace::codegraph_available(),
     ));
     Command::new(&argv[0])
         .args(&argv[1..])

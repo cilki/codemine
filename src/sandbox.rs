@@ -6,6 +6,20 @@
 //! work from some other checkout it finds on the machine. Reads stay
 //! unrestricted: the agent needs toolchains and configs from all over, and
 //! the damage vector is writing where it shouldn't.
+//!
+//! Two consequences reach the agent as bare `permission denied`, and are
+//! worth knowing before reading a turn log as a container problem:
+//!
+//! - A Landlocked process cannot mount anything, whatever its capabilities:
+//!   the kernel refuses every mount operation inside a Landlock domain, and
+//!   no rule can allow one. A build that mounts an overlay or a tmpfs (the
+//!   emb-build SDK's `spicymake` does both) cannot run under the sandbox at
+//!   all, even in a `--privileged` container. A deployment sweeping such a
+//!   repository has to run without `--sandbox`.
+//! - Writes land only in the paths [`writable_paths`] names. A tool whose
+//!   cache is configured elsewhere — `uv` with `cache-dir = /workspace/…`,
+//!   say — fails on first use, and so does anything the agent tries to put
+//!   under the home directory itself.
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};

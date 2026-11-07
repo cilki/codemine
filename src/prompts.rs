@@ -75,16 +75,21 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<(
 
 /// The sweep prompt for one turn: `SWEEP` without its front matter, with
 /// `$1`–`$4` replaced by the task, the repository, the forge, and the clone
-/// the agent must work in.
+/// the agent must work in, and the paragraph between the `codegraph` markers
+/// kept only when the tool it recommends is there to use — `install_mcp`
+/// wires `codegraph_explore` in on the same condition, and a prompt that
+/// prefers a tool the session doesn't have is a prompt the agent has to
+/// read past.
 ///
 /// Replaced in a single pass, so a value that itself contains `$2` and the
 /// like is inserted as it is rather than expanded again.
-pub fn sweep_prompt(task: &str, repo: &str, forge: &str, dir: &Path) -> String {
+pub fn sweep_prompt(task: &str, repo: &str, forge: &str, dir: &Path, codegraph: bool) -> String {
     let source = str::from_utf8(SWEEP).expect("sweep.md is UTF-8");
     let dir = dir.display().to_string();
     let args = [task, repo, forge, dir.as_str()];
     let mut prompt = String::with_capacity(source.len());
-    let mut rest = strip_front_matter(source);
+    let source = without_codegraph_markers(strip_front_matter(source), codegraph);
+    let mut rest = source.as_str();
     while let Some(at) = rest.find('$') {
         prompt.push_str(&rest[..at]);
         let after = &rest[at + 1..];
@@ -106,6 +111,33 @@ pub fn sweep_prompt(task: &str, repo: &str, forge: &str, dir: &Path) -> String {
     }
     prompt.push_str(rest);
     prompt
+}
+
+/// The sweep command with its `<!-- codegraph -->` … `<!-- /codegraph -->`
+/// block either kept (without the marker lines) or dropped whole, blank line
+/// after it included. A source with no block, or a half of one, is returned
+/// as it is.
+fn without_codegraph_markers(source: &str, keep: bool) -> String {
+    const OPEN: &str = "<!-- codegraph -->\n";
+    const CLOSE: &str = "<!-- /codegraph -->\n";
+    let Some(start) = source.find(OPEN) else {
+        return source.to_owned();
+    };
+    let Some(end) = source[start..].find(CLOSE).map(|at| start + at) else {
+        return source.to_owned();
+    };
+    let body = &source[start + OPEN.len()..end];
+    let mut after = &source[end + CLOSE.len()..];
+    if !keep {
+        after = after.strip_prefix('\n').unwrap_or(after);
+    }
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..start]);
+    if keep {
+        out.push_str(body);
+    }
+    out.push_str(after);
+    out
 }
 
 /// A markdown file without its leading `---` front-matter block, if it has
@@ -209,12 +241,17 @@ pub fn install_rtk() {
 /// rtk's file, not ours. `gh` and `glab` are kept out of the rewrite because
 /// the forge skills have the agent read review comments and notification
 /// thread ids straight out of those commands' output, and rtk compresses
-/// exactly that away. The savings rtk is here for are in build and test
-/// output, which these don't touch.
+/// exactly that away. `grep`, `diff` and `pytest` are kept out because rtk
+/// does not just compress their output, it changes what they answer: the
+/// turn logs show `grep -v` reporting the lines it was told to leave out, a
+/// `\|` alternation counted as matches across files that have none, and a
+/// `pytest` that isn't installed summarized as "No tests collected" — each
+/// of which the agent acted on. The savings rtk is here for are in build and
+/// test output, which these don't touch.
 const RTK_CONFIG: &str = "\
 # Written by codemine because no rtk config was present; edit freely.
 [hooks]
-exclude_commands = [\"gh\", \"glab\"]
+exclude_commands = [\"gh\", \"glab\", \"grep\", \"diff\", \"pytest\"]
 ";
 
 /// Where rtk reads its config, resolved the way rtk resolves it: its
@@ -522,6 +559,7 @@ mod tests {
             "cilki/$2-repo",
             "gitea",
             Path::new("/work/some dir/repo"),
+            true,
         );
         // No front matter: opencode would take it as part of the message.
         assert!(
@@ -545,7 +583,35 @@ mod tests {
         }
         // Everything after the front matter survives, task sections included.
         assert!(prompt.contains("## \"rebase\""));
-        assert!(prompt.ends_with("come after yours.\n"));
+        assert!(prompt.ends_with("rediscovering this.\n"));
+    }
+
+    /// The codegraph paragraph is in the prompt exactly when the tool is:
+    /// recommending `codegraph_explore` to a session that has no such tool
+    /// is a paragraph the agent has to read past. The markers themselves
+    /// never reach the agent, and dropping the block leaves no double blank
+    /// line behind.
+    #[test]
+    fn sweep_prompt_recommends_codegraph_only_when_it_is_there() {
+        let with = sweep_prompt("docs", "me/repo", "gitea", Path::new("/r"), true);
+        let without = sweep_prompt("docs", "me/repo", "gitea", Path::new("/r"), false);
+        assert!(with.contains("Prefer the `codegraph_explore` tool"), "{with}");
+        assert!(!without.contains("codegraph"), "{without}");
+        for prompt in [&with, &without] {
+            assert!(!prompt.contains("<!--"), "{prompt}");
+            assert!(!prompt.contains("\n\n\n"), "{prompt}");
+        }
+        // Everything else is the same prompt.
+        assert_eq!(
+            with.replace(
+                "Prefer the `codegraph_explore` tool over grep/find/broad file reads when\n\
+                 exploring the codebase — it answers structural questions in a single call and is\n\
+                 much cheaper. Fall back to normal exploration only if the tool is unavailable or\n\
+                 fails.\n\n",
+                ""
+            ),
+            without
+        );
     }
 
     #[test]
@@ -903,7 +969,7 @@ mod tests {
 
         install_rtk_config(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains(r#"exclude_commands = ["gh", "glab"]"#));
+        assert!(written.contains(r#"exclude_commands = ["gh", "glab", "grep", "diff", "pytest"]"#));
 
         let original = "[hooks]\nexclude_commands = [\"curl\"]\n";
         std::fs::write(&path, original).unwrap();

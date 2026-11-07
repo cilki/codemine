@@ -43,7 +43,16 @@ gh api user/repos --paginate --jq '.[].full_name'
 2. Branch before you touch anything: `git checkout -b <short-topic>`.
 3. Commit with a message that explains why the change is being made, not just
    what changed.
-4. Push: `git push -u origin <short-topic>`.
+4. Push, as a command of its own, and look at its result before going on:
+
+   ```sh
+   git push -u origin <short-topic>
+   ```
+
+   Never pipe the push into `tail` or chain it with `&&` into the next step:
+   `git push … 2>&1 | tail -3 && gh pr create …` opens a pull request with no
+   commits when the push fails, because the pipeline's status is `tail`'s, not
+   git's.
 5. Open the pull request; the base defaults to the default branch:
 
    ```sh
@@ -51,7 +60,18 @@ gh api user/repos --paginate --jq '.[].full_name'
    ```
 6. Include how long the session took and how many tokens were consumed in the PR description
 
-If a push is rejected, stop and report it rather than working around it.
+If a push is rejected, do not work around it — not with another credential,
+not by pushing somewhere else; a push the runner's own credentials cannot make
+is a configuration problem for the user to fix, and the report of the turn is
+where they learn of it. But do not let the work vanish with the clone: write
+the branch out as a patch and attach it, with the base branch and commit it
+applies to, to an issue (or a comment on the pull request, if one is already open). `TASK SKIPPED` is still the right marker — nothing
+changed on the forge — but the patch is what makes the next turn a `git am`
+instead of a redo.
+
+```sh
+git format-patch <base>..HEAD --stdout > <patch-file>
+```
 
 ## Responding to review feedback
 
