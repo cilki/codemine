@@ -23,96 +23,97 @@ pub struct Identity {
     pub email: String,
 }
 
-/// One cache slot: the answer, or a recent failure held so the main loop's
-/// five-second unconfigured-retry cadence doesn't poll a forge whose token
-/// is bad at that same cadence.
-#[derive(Clone)]
-enum Cached {
-    Known(Identity),
-    Failed(Instant, String),
-}
-
-/// How long a failed lookup is held before the forge is asked again.
-const RETRY: Duration = Duration::from_secs(60);
+/// How long a reading stands before the forge is asked again, whichever side
+/// took it. A failure held this long keeps the main loop's five-second
+/// unconfigured-retry cadence from polling a forge whose token is bad at that
+/// same cadence; a success expires too, because the web UI's dot is how a
+/// revoked token or a forge gone down shows up while turns are running.
+const TTL: Duration = Duration::from_secs(60);
 
 type Key = (ForgeKind, String, String);
 
-/// Answers for the life of the process, keyed by everything they depend on:
-/// a different token or host is a different account, and the same token
-/// answers the same way until a human edits the account on the forge — which
-/// a restart or a token re-save picks up.
-static CACHE: Mutex<BTreeMap<Key, Cached>> = Mutex::new(BTreeMap::new());
+/// What is known about one forge configuration. `resolve` and `health` ask
+/// the forge the same question, so they share the answer: whichever asks
+/// first spares the other the request.
+#[derive(Default)]
+struct Entry {
+    /// The account, once any lookup has named it. Kept when a later reading
+    /// fails, so a forge that goes down after startup doesn't stop turns
+    /// that already know who they commit as.
+    identity: Option<Identity>,
+    /// The latest reading and when it was taken; None until the first lands.
+    reading: Option<(Instant, ForgeHealth)>,
+    /// Whether `health` has a probe out for this entry.
+    probing: bool,
+}
 
-fn lock() -> MutexGuard<'static, BTreeMap<Key, Cached>> {
-    CACHE
+/// Entries keyed by everything an answer depends on: a different token or
+/// host is a different account, so a just-saved token is asked about at once
+/// instead of waiting out the old one.
+static ENTRIES: Mutex<BTreeMap<Key, Entry>> = Mutex::new(BTreeMap::new());
+
+fn entries() -> MutexGuard<'static, BTreeMap<Key, Entry>> {
+    ENTRIES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The cache's answer for a key, if it still stands: a resolved identity, or
-/// the reason a recent lookup failed. None means the forge has to be asked.
-///
-/// A function of its own so the guard cannot outlive the lookup. `resolve`
-/// records what it learns under the same lock, and a guard borrowed into a
-/// `match` scrutinee lives until the end of the match — long enough to meet
-/// that second lock and park the thread forever on this non-reentrant mutex.
-fn cached(key: &Key) -> Option<Result<Identity, String>> {
-    let answer = lock().get(key).cloned();
-    match answer {
-        Some(Cached::Known(identity)) => Some(Ok(identity)),
-        Some(Cached::Failed(when, why)) if when.elapsed() < RETRY => Some(Err(why)),
-        _ => None,
-    }
+fn key(forge: &Forge) -> Key {
+    (forge.kind, forge.url.clone(), forge.token.clone())
 }
 
-/// Record an answer for a key, holding the lock only for the write.
-fn remember(key: Key, answer: Cached) {
-    lock().insert(key, answer);
+/// Record a reading, and the account it named if it named one. Clears
+/// `probing` whoever took it: the reading is fresh either way, so no probe
+/// is wanted until it goes stale.
+fn record(forge: &Forge, (health, identity): (ForgeHealth, Option<Identity>)) {
+    let mut held = entries();
+    let entry = held.entry(key(forge)).or_default();
+    if let Some(identity) = identity
+        && entry.identity.as_ref() != Some(&identity)
+    {
+        tracing::info!(
+            "{} commits as {} <{}>",
+            forge.kind.name(),
+            identity.login,
+            identity.email
+        );
+        entry.identity = Some(identity);
+    }
+    entry.reading = Some((Instant::now(), health));
+    entry.probing = false;
 }
 
 /// Fill the forge's author email — and Gitea's credential-line user — from
-/// its whoami endpoint, through the cache. Fails when the forge can't
+/// its whoami endpoint, through the shared entry. Fails when the forge can't
 /// answer: a turn there would commit as nobody, so the caller holds turns
-/// like any other unrunnable configuration. The web UI's view of the same
-/// endpoint is [`health`], which keeps asking.
+/// like any other unrunnable configuration.
 pub fn resolve(forge: &mut Forge) -> Result<()> {
-    let key = (forge.kind, forge.url.clone(), forge.token.clone());
-    let identity = match cached(&key) {
-        Some(Ok(identity)) => identity,
-        Some(Err(why)) => return Err(anyhow!("{why}")),
-        None => match whoami(forge) {
-            Ok(identity) => {
-                tracing::info!(
-                    "{} commits as {} <{}>",
-                    forge.kind.name(),
-                    identity.login,
-                    identity.email
-                );
-                remember(key, Cached::Known(identity.clone()));
-                identity
-            }
-            Err(err) => {
-                let err = err.context(format!(
-                    "could not identify the {} account",
-                    forge.kind.name()
-                ));
-                remember(key, Cached::Failed(Instant::now(), format!("{err:#}")));
-                return Err(err);
-            }
-        },
-    };
-    forge.email = identity.email.clone();
-    forge.login = identity.login.clone();
+    // A `let`, not a `match` scrutinee, so the guard is gone before `record`
+    // takes the lock again: this mutex is not reentrant.
+    let known =
+        entries()
+            .get(&key(forge))
+            .and_then(|entry| match (&entry.identity, &entry.reading) {
+                (Some(identity), _) => Some(Ok(identity.clone())),
+                (None, Some((at, health))) if at.elapsed() < TTL => Some(Err(health.error.clone())),
+                _ => None,
+            });
+    let answer = known.unwrap_or_else(|| {
+        let (health, identity) = probe(forge);
+        let answer = identity.clone().ok_or_else(|| health.error.clone());
+        record(forge, (health, identity));
+        answer
+    });
+    let identity = answer.map_err(|why| {
+        anyhow!(
+            "could not identify the {} account: {}",
+            forge.kind.name(),
+            why.unwrap_or_default()
+        )
+    })?;
+    forge.email = identity.email;
+    forge.login = identity.login;
     Ok(())
-}
-
-fn whoami(forge: &Forge) -> Result<Identity> {
-    parse_identity(forge.kind, &ask_whoami(forge)?)
-}
-
-/// The raw whoami answer. Every forge spells its whoami endpoint the same way.
-fn ask_whoami(forge: &Forge) -> Result<serde_json::Value> {
-    forge_json(forge, "user", "user", "user")
 }
 
 /// Whether the web UI's forge card can reach its forge, as the dot beside
@@ -156,29 +157,6 @@ impl ForgeHealth {
     }
 }
 
-/// How long a reading stands before the forge is asked again. Unlike
-/// `resolve`'s cache, a success expires too: the dot is how a revoked token
-/// or a forge gone down shows up while turns are running.
-const HEALTH_TTL: Duration = Duration::from_secs(60);
-
-/// The last reading for one forge configuration, and whether a probe for it
-/// is still out.
-struct Reading {
-    at: Option<Instant>,
-    health: ForgeHealth,
-    probing: bool,
-}
-
-/// Readings keyed like `CACHE`: a new token or URL is a new reading, so a
-/// just-saved token is probed at once instead of waiting out the old one.
-static READINGS: Mutex<BTreeMap<Key, Reading>> = Mutex::new(BTreeMap::new());
-
-fn readings() -> MutexGuard<'static, BTreeMap<Key, Reading>> {
-    READINGS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// The forge's reachability for the web UI. Never blocks: a stale or missing
 /// reading is refreshed on a thread of its own and the last one (or
 /// `Checking`) is handed back meanwhile. The caller is the event stream's
@@ -195,55 +173,58 @@ pub fn health(settings: &Settings) -> ForgeHealth {
 
 /// The standing reading for a forge, sending a probe out when it is stale.
 fn reading(forge: Forge) -> ForgeHealth {
-    let key = (forge.kind, forge.url.clone(), forge.token.clone());
-    let mut held = readings();
-    let entry = held.entry(key.clone()).or_insert_with(|| Reading {
-        at: None,
-        health: ForgeHealth::bare(Reach::Checking),
-        probing: false,
-    });
-    let stale = entry.at.is_none_or(|at| at.elapsed() >= HEALTH_TTL);
+    let mut held = entries();
+    let entry = held.entry(key(&forge)).or_default();
+    let stale = entry
+        .reading
+        .as_ref()
+        .is_none_or(|(at, _)| at.elapsed() >= TTL);
     if stale && !entry.probing {
         let spawned = std::thread::Builder::new()
             .name("forge-health".into())
-            .spawn(move || {
-                let health = probe(&forge);
-                if let Some(entry) = readings().get_mut(&key) {
-                    entry.health = health;
-                    entry.at = Some(Instant::now());
-                    entry.probing = false;
-                }
-            });
+            .spawn(move || record(&forge, probe(&forge)));
         // A thread that couldn't start is retried on the next tick.
         entry.probing = spawned.is_ok();
     }
-    entry.health.clone()
+    match &entry.reading {
+        Some((_, health)) => health.clone(),
+        None => ForgeHealth::bare(Reach::Checking),
+    }
 }
 
-/// Ask the forge who the token is, and read the answer as reachability.
-fn probe(forge: &Forge) -> ForgeHealth {
-    let answer = match ask_whoami(forge) {
+/// Ask the forge who the token is: the reading the answer amounts to, and the
+/// account when it named a usable one.
+fn probe(forge: &Forge) -> (ForgeHealth, Option<Identity>) {
+    // Every forge spells its whoami endpoint the same way.
+    let answer = match forge_json(forge, "user", "user", "user") {
         Ok(answer) => answer,
         Err(err) => {
             let error = format!("{err:#}");
-            return ForgeHealth {
+            let health = ForgeHealth {
                 state: classify(&error),
                 account: None,
                 error: Some(error),
             };
+            return (health, None);
         }
     };
     match parse_identity(forge.kind, &answer) {
-        Ok(identity) => ForgeHealth {
-            state: Reach::Ok,
-            account: Some(format!("{} <{}>", identity.login, identity.email)),
-            error: None,
-        },
-        Err(err) => ForgeHealth {
-            state: Reach::Incomplete,
-            account: None,
-            error: Some(format!("{err:#}")),
-        },
+        Ok(identity) => {
+            let health = ForgeHealth {
+                state: Reach::Ok,
+                account: Some(format!("{} <{}>", identity.login, identity.email)),
+                error: None,
+            };
+            (health, Some(identity))
+        }
+        Err(err) => (
+            ForgeHealth {
+                state: Reach::Incomplete,
+                account: None,
+                error: Some(format!("{err:#}")),
+            },
+            None,
+        ),
     }
 }
 
@@ -387,12 +368,15 @@ mod tests {
         let mut gitea = forge(ForgeKind::Gitea, "cache-test-gitea");
         let mut github = forge(ForgeKind::Github, "cache-test-github");
         for f in [&gitea, &github] {
-            lock().insert(
-                (f.kind, f.url.clone(), f.token.clone()),
-                Cached::Known(Identity {
-                    login: format!("{}-bot", f.kind.name()),
-                    email: format!("bot@{}.example.com", f.kind.name()),
-                }),
+            entries().insert(
+                key(f),
+                Entry {
+                    identity: Some(Identity {
+                        login: format!("{}-bot", f.kind.name()),
+                        email: format!("bot@{}.example.com", f.kind.name()),
+                    }),
+                    ..Entry::default()
+                },
             );
         }
         resolve(&mut gitea).unwrap();
@@ -491,11 +475,37 @@ mod tests {
     #[test]
     fn a_recent_failure_is_held_without_asking_again() {
         let mut github = forge(ForgeKind::Github, "failed-test");
-        lock().insert(
-            (ForgeKind::Github, github.url.clone(), "failed-test".into()),
-            Cached::Failed(Instant::now(), "the token is bad".into()),
+        let mut health = ForgeHealth::bare(Reach::Unauthorized);
+        health.error = Some("the token is bad".into());
+        entries().insert(
+            key(&github),
+            Entry {
+                reading: Some((Instant::now(), health)),
+                ..Entry::default()
+            },
         );
         let err = resolve(&mut github).unwrap_err();
-        assert_eq!(format!("{err:#}"), "the token is bad");
+        assert_eq!(
+            format!("{err:#}"),
+            "could not identify the github account: the token is bad"
+        );
+    }
+
+    /// A reading the web UI's probe took is the one `resolve` answers from,
+    /// and the other way round: the two ask the forge the same question, so
+    /// whichever asked first spares the other the request.
+    #[test]
+    fn resolve_and_health_share_one_reading() {
+        let mut settings = Settings::default();
+        settings.forge.kind = ForgeKind::Gitea;
+        settings.forge.token = "shared-reading-test".into();
+        // Nothing listens on port 1, so the lookup fails fast.
+        settings.forge.url = "http://127.0.0.1:1".into();
+        let mut gitea = settings.runtime_forge().unwrap();
+        let err = format!("{:#}", resolve(&mut gitea).unwrap_err());
+        // Not `Checking`: resolve's failed lookup is already the reading.
+        let health = health(&settings);
+        assert_eq!(health.state, Reach::Unreachable);
+        assert!(err.ends_with(health.error.as_deref().unwrap()), "{err}");
     }
 }
