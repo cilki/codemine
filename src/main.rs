@@ -573,16 +573,10 @@ fn setup(cli: &mut Cli) -> Result<File> {
 
     // Install the embedded prompts where opencode resolves commands and
     // skills by name, so the binary works without the image copying them,
-    // retire whatever the opencode-claude-auth era left behind (plugin
-    // links, npm references, the stale anthropic credential), wire the
-    // codegraph MCP server into opencode's config when the CLI is actually
-    // installed, and let rtk install its own command-rewrite plugin when that
-    // CLI is there.
+    // wire the codegraph MCP server into opencode's config when the CLI is
+    // actually installed, and let rtk install its own command-rewrite plugin
+    // when that CLI is there.
     prompts::install(&prompts::opencode_config_dir())?;
-    prompts::remove_claude_plugin(
-        &prompts::opencode_config_dir(),
-        &prompts::opencode_auth_json(),
-    )?;
     prompts::install_mcp(
         &prompts::opencode_config_dir(),
         workspace::codegraph_available(),

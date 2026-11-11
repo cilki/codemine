@@ -50,11 +50,10 @@ fn read_json(path: &Path) -> Result<serde_json::Value> {
 /// — and only when — the edit changed something.
 ///
 /// Nothing here owns a whole file: opencode's config carries the user's own
-/// settings alongside the provider options and MCP entry codemine maintains,
-/// and its auth.json is entirely theirs but for one dead entry. So an
-/// already-correct file is left as it is, which is what lets it be mounted
-/// read-only — the shape every deployment that configures opencode itself
-/// has, and the reason `install_mcp` gives for not touching the file at all
+/// settings alongside the provider options and MCP entry codemine maintains.
+/// So an already-correct file is left as it is, which is what lets it be
+/// mounted read-only — the shape every deployment that configures opencode
+/// itself has, and the reason `install_mcp` gives for not touching the file at all
 /// when codegraph is missing.
 ///
 /// The write goes through the same writer the settings and the skip cache
@@ -297,55 +296,6 @@ pub fn install_provider(dir: &Path, proxy: &crate::settings::ProxySettings) -> R
                 &proxy.api_key
             },
         });
-    })
-}
-
-/// One-time migration from the opencode-claude-auth era: drop the plugin
-/// links a previous version (or the NixOS module) installed, its npm
-/// references in `opencode.json`, and the stale `anthropic` entry in
-/// opencode's auth.json — any of which would fight the provider config for
-/// the account. The tokens in those files are dead weight now; the login
-/// lives in CLIProxyAPI.
-pub fn remove_claude_plugin(dir: &Path, auth_json: &Path) -> Result<()> {
-    for sub in ["plugin", "plugins"] {
-        let link = dir.join(sub).join("opencode-claude-auth.js");
-        if let Err(err) = std::fs::remove_file(&link)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(err).with_context(|| format!("failed to remove {}", link.display()));
-        }
-    }
-    scrub_plugin_config(dir)?;
-    edit_json(auth_json, |auth| {
-        if let Some(auth) = auth.as_object_mut() {
-            auth.remove("anthropic");
-        }
-    })
-}
-
-/// Where opencode stores provider credentials; only touched to scrub the
-/// legacy anthropic entry.
-pub fn opencode_auth_json() -> PathBuf {
-    crate::config::xdg_dir("XDG_DATA_HOME", ".local/share").join("opencode/auth.json")
-}
-
-/// Drop npm references to the retired plugin (under its current or previous
-/// name) from opencode's config.
-fn scrub_plugin_config(dir: &Path) -> Result<()> {
-    edit_json(&opencode_json(dir), |config| {
-        // get_mut rather than indexing: IndexMut would plant a null `plugin`
-        // key in a config that never had one, and that alone counts as a
-        // change worth writing back.
-        if let Some(plugins) = config
-            .get_mut("plugin")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            plugins.retain(|entry| {
-                !entry.as_str().is_some_and(|entry| {
-                    entry.contains("opencode-claude-auth") || entry.contains("opencode-auth-plugin")
-                })
-            });
-        }
     })
 }
 
@@ -800,51 +750,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_claude_plugin_scrubs_the_legacy_era() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        for sub in ["plugin", "plugins"] {
-            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
-            std::fs::write(dir.path().join(sub).join("opencode-claude-auth.js"), "x").unwrap();
-        }
-        std::fs::write(
-            dir.path().join("opencode.json"),
-            r#"{"theme":"dark","plugin":["opencode-claude-auth@2.2.0","other-plugin"]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            &auth,
-            r#"{"anthropic":{"type":"oauth","access":"a","refresh":"r"},"other":{"key":"k"}}"#,
-        )
-        .unwrap();
-
-        remove_claude_plugin(dir.path(), &auth).unwrap();
-
-        for sub in ["plugin", "plugins"] {
-            assert!(
-                !dir.path()
-                    .join(sub)
-                    .join("opencode-claude-auth.js")
-                    .exists()
-            );
-        }
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join("opencode.json")).unwrap())
-                .unwrap();
-        assert_eq!(config["theme"], "dark");
-        assert_eq!(config["plugin"], serde_json::json!(["other-plugin"]));
-        let auth_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
-        assert!(auth_json.get("anthropic").is_none());
-        assert_eq!(auth_json["other"]["key"], "k");
-
-        // Nothing to scrub: a second run is a clean no-op, and missing files
-        // are fine.
-        remove_claude_plugin(dir.path(), &auth).unwrap();
-        remove_claude_plugin(tempfile::tempdir().unwrap().path(), &dir.path().join("no")).unwrap();
-    }
-
-    #[test]
     fn install_mcp_leaves_config_alone_without_codegraph() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opencode.json");
@@ -882,7 +787,6 @@ mod tests {
     fn an_unchanged_config_is_not_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = opencode_json(dir.path());
-        let auth = dir.path().join("auth.json");
         let proxy = crate::settings::ProxySettings::default();
 
         install_mcp(dir.path(), true).unwrap();
@@ -891,11 +795,7 @@ mod tests {
 
         install_mcp(dir.path(), true).unwrap();
         install_provider(dir.path(), &proxy).unwrap();
-        remove_claude_plugin(dir.path(), &auth).unwrap();
         assert_eq!((std::fs::read(&path).unwrap(), inode(&path)), before);
-        // There was no stale entry to subtract, so auth.json isn't conjured
-        // up to hold the absence of one.
-        assert!(!auth.exists());
 
         // A real change still lands.
         install_provider(
@@ -921,13 +821,11 @@ mod tests {
         install_mcp(dir.path(), true).unwrap();
         assert_eq!(mode(&opencode_json(dir.path())), 0o600);
 
+        // A config someone else created world-readable comes back
+        // owner-only once codemine has a change to write into it.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            opencode_json(dir.path()),
-            r#"{"plugin":["opencode-claude-auth"]}"#,
-        )
-        .unwrap();
-        remove_claude_plugin(dir.path(), &dir.path().join("auth.json")).unwrap();
+        std::fs::write(opencode_json(dir.path()), r#"{"theme":"dark"}"#).unwrap();
+        install_provider(dir.path(), &crate::settings::ProxySettings::default()).unwrap();
         assert_eq!(mode(&opencode_json(dir.path())), 0o600);
     }
 
