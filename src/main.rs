@@ -68,6 +68,8 @@ fn main() -> Result<()> {
     // Held, not dropped: the workspace is this process's for as long as it
     // runs, and letting go of the handle would let a second runner in.
     let _workspace = setup(&mut cli)?;
+    // Before anything reads the task pool, which is fixed once read.
+    prompts::load_custom_tasks(&cli.workspace.join(prompts::CUSTOM_TASKS))?;
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
     // Point opencode at the proxy before anything lists models. The web UI

@@ -59,18 +59,26 @@ pub enum Basis {
     Reviews,
 }
 
-/// The state this task's answer depends on. `None` for the tasks that can
-/// become actionable with nothing observable moving — `bump` watches the
-/// outside world, `feature` invents its own work — where a remembered skip
-/// would outlast the reason for it.
-pub fn basis(task: &str) -> Option<Basis> {
-    match task {
-        "docs" | "simplify" | "benchmark" | "coverage" | "mutation" | "audit" => Some(Basis::Head),
-        "feedback" => Some(Basis::Feed),
-        "rebase" => Some(Basis::Prs),
-        "review" => Some(Basis::Reviews),
-        _ => None,
+impl Basis {
+    /// The basis a task section's `<!-- cache: name -->` line names.
+    pub fn from_name(name: &str) -> Option<Basis> {
+        match name {
+            "head" => Some(Basis::Head),
+            "feed" => Some(Basis::Feed),
+            "prs" => Some(Basis::Prs),
+            "reviews" => Some(Basis::Reviews),
+            _ => None,
+        }
     }
+}
+
+/// The state this task's answer depends on, as its section in the sweep
+/// command (or the user's task file) declares it. `None` for the tasks that
+/// can become actionable with nothing observable moving — `bump` watches the
+/// outside world, `feature` invents its own work — where a remembered skip
+/// would outlast the reason for it, and for a slug no section defines.
+pub fn basis(task: &str) -> Option<Basis> {
+    crate::prompts::task(task)?.basis
 }
 
 /// Whether the task has a precondition probe, which is exactly the tasks

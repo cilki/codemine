@@ -156,9 +156,9 @@ task's own instructions change in a **codemine** upgrade — so a quiet repo
 stops costing a session per task to rediscover that it has nothing to do. What
 counts as the state is whatever the task reads:
 
-- `simplify`, `benchmark`, `docs`, `coverage`, and `mutation` answer out of the
-  code alone, so they remember the default-branch commit they last found
-  nothing at.
+- `simplify`, `benchmark`, `docs`, `coverage`, `mutation`, and `audit` answer
+  out of the code alone, so they remember the default-branch commit they last
+  found nothing at.
 - `feedback` answers out of the forge's notification feed, so it remembers the
   newest unread thread it read. The feed doubles as the task's precondition: a
   repository with nothing unread on it isn't drawn for `feedback` at all.
@@ -172,9 +172,40 @@ counts as the state is whatever the task reads:
 
 Any other outcome retires the memory instead, since the turn either changed
 something (and the state it would be remembered against is stale) or never got
-to answer. `bump`, `todo`, `roleplay`, `audit`, and `feature` can become
-actionable with nothing observable moving, so they are never cached. The
-memory lives in `skips.json` in the workspace and survives restarts.
+to answer. `bump`, `todo`, `roleplay`, and `feature` can become actionable with
+nothing observable moving, so they are never cached. The memory lives in
+`skips.json` in the workspace and survives restarts.
+
+Each task declares its basis with a `<!-- cache: … -->` line right under its
+heading in `commands/sweep.md` — `head`, `feed`, `prs`, or `reviews`, as above
+— and a task without one is never cached. The line is read by **codemine** and
+dropped from the prompt the agent sees.
+
+#### Custom tasks
+
+Put your own tasks in `tasks.md` in the workspace, written the way
+`commands/sweep.md` writes its own: a `## "slug"` heading per task, followed by
+its instructions.
+
+```markdown
+## "changelog"
+<!-- cache: head -->
+
+- Keep CHANGELOG.md in step with the PRs merged since the last release
+
+## "docs"
+
+- Also check the examples under `examples/` still build
+```
+
+A section named after a built-in task appends its lines to that task's
+instructions (and replaces its cache basis, if it declares one); any other slug
+is a new task, offered in the web UI alongside the built-in ones. New slugs may
+only use ASCII letters, digits, `-` and `_`. The same cache lines apply, and
+`$2`, `$3` and `$4` are filled in with the repository, the forge, and the clone
+just as in the built-in sections. Anything outside a task section is ignored.
+The file is read once at startup, so restart **codemine** after editing it; a
+file that can't be parsed stops startup rather than being silently dropped.
 
 #### Prioritization
 

@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::cache::Basis;
+
 /// The prompt every turn runs, rendered by `sweep_prompt`. It is written as
 /// an opencode command (front matter, `$1`–`$4`) but no longer installed as
 /// one: `opencode run` dropped `--command`, so the runner fills it in itself.
@@ -72,7 +74,8 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<(
     crate::workspace::write_json(path, &after)
 }
 
-/// The sweep prompt for one turn: `SWEEP` without its front matter, with
+/// The sweep prompt for one turn: `SWEEP`, with the user's own tasks merged
+/// into its task sections and its cache lines dropped, without its front matter, with
 /// `$1`–`$4` replaced by the task, the repository, the forge, and the clone
 /// the agent must work in, and the paragraph between the `codegraph` markers
 /// kept only when the tool it recommends is there to use — `install_mcp`
@@ -83,7 +86,7 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<(
 /// Replaced in a single pass, so a value that itself contains `$2` and the
 /// like is inserted as it is rather than expanded again.
 pub fn sweep_prompt(task: &str, repo: &str, forge: &str, dir: &Path, codegraph: bool) -> String {
-    let source = str::from_utf8(SWEEP).expect("sweep.md is UTF-8");
+    let source = sweep().rendered.as_str();
     let dir = dir.display().to_string();
     let args = [task, repo, forge, dir.as_str()];
     let mut prompt = String::with_capacity(source.len());
@@ -315,41 +318,199 @@ fn configures_codegraph(path: &Path) -> bool {
 pub struct Task {
     pub slug: String,
     pub description: String,
+    /// What a skip on this task is remembered against, as the section's
+    /// `<!-- cache: … -->` line declares it; `None` when it declares nothing.
+    #[serde(skip)]
+    pub basis: Option<Basis>,
+    /// The section's markdown as the prompt carries it: no heading, no cache
+    /// line, no surrounding blank lines.
+    #[serde(skip)]
+    body: String,
 }
 
-/// The task pool, parsed from the sweep command's `## "slug"` sections once
-/// per process: the command is baked into the binary, and the draw asks
-/// after a task's instructions for every candidate it weighs.
+/// The sweep command taken apart into the prose before its task sections,
+/// the sections themselves, and the prose after them, so the user's own tasks
+/// can be merged in and the whole put back together for the prompt.
+struct Sweep {
+    preamble: String,
+    tasks: Vec<Task>,
+    trailer: String,
+    /// The command as the prompt sends it, the merged task sections included.
+    rendered: String,
+}
+
+/// The file in the workspace the user's own tasks are read from, in the same
+/// `## "slug"` sections the sweep command uses.
+pub const CUSTOM_TASKS: &str = "tasks.md";
+
+static SWEEP_POOL: OnceLock<Sweep> = OnceLock::new();
+
+/// The sweep command with the user's tasks merged in, parsed once per
+/// process: the draw asks after a task's instructions for every candidate it
+/// weighs. Without [`load_custom_tasks`] having run first it is the built-in
+/// command alone.
+fn sweep() -> &'static Sweep {
+    SWEEP_POOL.get_or_init(|| {
+        let builtin = str::from_utf8(SWEEP).expect("sweep.md is UTF-8");
+        merge(parse_sweep(builtin).expect("sweep.md parses"), "")
+            .expect("sweep.md merges with nothing")
+    })
+}
+
+/// Read the user's own tasks from `path`, if the file is there, and merge
+/// them into the pool for the rest of the process. A section whose slug the
+/// sweep command already defines appends its lines to that task's
+/// instructions; any other slug is a new task. Has to run before anything
+/// reads the pool, since the pool is fixed once read.
+///
+/// A file that is there but unreadable or malformed fails startup rather
+/// than being dropped: the user wrote it to have those tasks run, and
+/// sweeping without them is not what they asked for.
+pub fn load_custom_tasks(path: &Path) -> Result<()> {
+    let custom = match std::fs::read_to_string(path) {
+        Ok(custom) => custom,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let builtin = str::from_utf8(SWEEP).expect("sweep.md is UTF-8");
+    let pool = parse_sweep(builtin)
+        .and_then(|sweep| merge(sweep, &custom))
+        .with_context(|| format!("{} is not a valid task file", path.display()))?;
+    SWEEP_POOL
+        .set(pool)
+        .map_err(|_| anyhow::anyhow!("custom tasks loaded after the task pool was read"))
+}
+
+/// The task pool: the sweep command's `## "slug"` sections, with the user's
+/// own merged in.
 pub fn tasks() -> &'static [Task] {
-    static TASKS: OnceLock<Vec<Task>> = OnceLock::new();
-    TASKS.get_or_init(parse_tasks)
+    &sweep().tasks
 }
 
-fn parse_tasks() -> Vec<Task> {
+/// Split a sweep command into prose, task sections and prose. The task
+/// sections are the run of `## "slug"` headings; the first other heading
+/// after them starts the trailer, and everything from there on is kept as it
+/// is.
+fn parse_sweep(source: &str) -> Result<Sweep> {
+    let mut preamble = String::new();
     let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
-    let mut inside = false;
-    for line in str::from_utf8(SWEEP).expect("sweep.md is UTF-8").lines() {
-        if let Some(slug) = line.strip_prefix("## \"").and_then(|s| s.strip_suffix('"')) {
+    let mut trailer = String::new();
+    for line in source.split_inclusive('\n') {
+        if !trailer.is_empty() {
+            trailer.push_str(line);
+        } else if let Some(slug) = section_slug(line) {
             sections.push((slug, Vec::new()));
-            inside = true;
-        } else if line.starts_with('#') {
-            // Any other heading ends the run of task sections.
-            inside = false;
-        } else if inside {
-            sections
-                .last_mut()
-                .expect("inside a section implies there is one")
-                .1
-                .push(line);
+        } else if let Some((_, lines)) = sections.last_mut() {
+            if line.starts_with('#') {
+                // Any other heading ends the run of task sections.
+                trailer.push_str(line);
+            } else {
+                lines.push(line);
+            }
+        } else {
+            preamble.push_str(line);
         }
     }
-    sections
+    let tasks = sections
         .into_iter()
-        .map(|(slug, lines)| Task {
-            slug: slug.to_owned(),
-            description: describe(&lines),
-        })
-        .collect()
+        .map(|(slug, lines)| section(slug, &lines))
+        .collect::<Result<_>>()?;
+    Ok(Sweep {
+        preamble,
+        tasks,
+        trailer,
+        rendered: String::new(),
+    })
+}
+
+/// The slug a `## "slug"` heading line names.
+fn section_slug(line: &str) -> Option<&str> {
+    line.trim_end()
+        .strip_prefix("## \"")
+        .and_then(|s| s.strip_suffix('"'))
+}
+
+/// One task section's lines as a task: its `<!-- cache: … -->` line read off
+/// and dropped, the rest kept as the body.
+fn section(slug: &str, lines: &[&str]) -> Result<Task> {
+    let mut basis = None;
+    let mut body = Vec::new();
+    for line in lines {
+        match cache_directive(line) {
+            Some(name) => {
+                basis = Some(Basis::from_name(name).with_context(|| {
+                    format!(
+                        "task \"{slug}\" declares an unknown cache basis \"{name}\" \
+                         (expected one of head, feed, prs, reviews)"
+                    )
+                })?);
+            }
+            None => body.push(line.trim_end_matches(['\n', '\r'])),
+        }
+    }
+    let body = body.join("\n").trim_matches('\n').to_owned();
+    Ok(Task {
+        slug: slug.to_owned(),
+        description: describe(&body.lines().collect::<Vec<_>>()),
+        basis,
+        body,
+    })
+}
+
+/// The basis a `<!-- cache: name -->` line names.
+fn cache_directive(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("<!--")?
+        .strip_suffix("-->")?
+        .trim()
+        .strip_prefix("cache:")
+        .map(str::trim)
+}
+
+/// The built-in command with the user's task file merged in, and rendered
+/// back out for the prompt. A custom section for a slug the command defines
+/// appends to its instructions, and replaces its cache basis when it declares
+/// one of its own; a section for any other slug is a new task, after the
+/// built-in ones. Anything in the file outside a task section is ignored.
+fn merge(mut sweep: Sweep, custom: &str) -> Result<Sweep> {
+    for task in parse_sweep(custom)?.tasks {
+        if let Some(existing) = sweep.tasks.iter_mut().find(|t| t.slug == task.slug) {
+            if !task.body.is_empty() {
+                if !existing.body.is_empty() {
+                    existing.body.push('\n');
+                }
+                existing.body.push_str(&task.body);
+                existing.description = describe(&existing.body.lines().collect::<Vec<_>>());
+            }
+            if task.basis.is_some() {
+                existing.basis = task.basis;
+            }
+        } else {
+            validate_slug(&task.slug)?;
+            sweep.tasks.push(task);
+        }
+    }
+    let mut rendered = sweep.preamble.clone();
+    for task in &sweep.tasks {
+        rendered.push_str(&format!("## \"{}\"\n\n{}\n\n", task.slug, task.body));
+    }
+    rendered.push_str(&sweep.trailer);
+    sweep.rendered = rendered;
+    Ok(sweep)
+}
+
+/// A new task's slug has to work everywhere a built-in one does: as a word
+/// in the prompt, a label in the UI, a key in config.json, and a part of the
+/// skip cache's colon-separated keys.
+fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty()
+        || !slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!("task slug \"{slug}\" may only contain ASCII letters, digits, '-' and '_'");
+    }
+    Ok(())
 }
 
 /// A task section's markdown bullets as tooltip text: one line per bullet,
@@ -425,6 +586,99 @@ mod tests {
             "{}",
             by_slug("roleplay")
         );
+    }
+
+    /// Taking the command apart and putting it back together changes nothing
+    /// but the cache lines, which are for the runner and not the agent.
+    #[test]
+    fn the_builtin_command_renders_as_written_less_its_cache_lines() {
+        let source = str::from_utf8(SWEEP).unwrap();
+        let expected: String = source
+            .split_inclusive('\n')
+            .filter(|line| cache_directive(line).is_none())
+            .collect();
+        assert_ne!(expected, source, "sweep.md declares no cache basis");
+        assert_eq!(sweep().rendered, expected);
+        assert!(sweep().trailer.starts_with("# General information"));
+    }
+
+    fn merged(custom: &str) -> Result<Sweep> {
+        merge(parse_sweep(str::from_utf8(SWEEP).unwrap()).unwrap(), custom)
+    }
+
+    #[test]
+    fn a_custom_section_for_a_builtin_task_appends_to_it() {
+        let pool =
+            merged("# My tasks\n\nprose nobody reads\n\n## \"todo\"\n\n- Also look in TODO.txt\n")
+                .unwrap();
+        let todo = pool.tasks.iter().find(|t| t.slug == "todo").unwrap();
+        assert_eq!(
+            todo.description,
+            format!("{}\n- Also look in TODO.txt", task("todo").unwrap().description)
+        );
+        assert!(
+            pool.rendered.contains("AGENTS.md\n- Also look in TODO.txt\n\n## \"roleplay\""),
+            "{}",
+            pool.rendered
+        );
+        assert!(!pool.rendered.contains("prose nobody reads"));
+        assert_eq!(pool.tasks.len(), tasks().len());
+        // Without a cache line of its own, the built-in basis stands.
+        let docs = merged("## \"docs\"\n- Also the wiki\n").unwrap();
+        let docs = docs.tasks.iter().find(|t| t.slug == "docs").unwrap();
+        assert_eq!(docs.basis, Some(Basis::Head));
+    }
+
+    #[test]
+    fn a_custom_section_can_change_a_builtin_tasks_basis() {
+        let pool = merged("## \"todo\"\n<!-- cache: head -->\n").unwrap();
+        let todo = pool.tasks.iter().find(|t| t.slug == "todo").unwrap();
+        assert_eq!(todo.basis, Some(Basis::Head));
+        assert_eq!(todo.description, task("todo").unwrap().description);
+    }
+
+    #[test]
+    fn a_custom_section_for_a_new_slug_is_a_new_task() {
+        let pool = merged(
+            "## \"changelog\"\n<!-- cache: head -->\n\n- Keep CHANGELOG.md in step \
+             with the\n  merged PRs on $2\n\n## \"triage\"\n\n- Label new issues\n",
+        )
+        .unwrap();
+        let slugs: Vec<&str> = pool.tasks.iter().map(|t| t.slug.as_str()).collect();
+        assert_eq!(&slugs[slugs.len() - 2..], ["changelog", "triage"]);
+        let changelog = &pool.tasks[slugs.len() - 2];
+        assert_eq!(changelog.basis, Some(Basis::Head));
+        assert_eq!(
+            changelog.description,
+            "- Keep CHANGELOG.md in step with the merged PRs on $2"
+        );
+        assert_eq!(pool.tasks[slugs.len() - 1].basis, None);
+        // New sections land after the built-in ones and before the trailer.
+        assert!(
+            pool.rendered.contains(
+                "## \"changelog\"\n\n- Keep CHANGELOG.md in step with the\n  merged PRs on \
+                 $2\n\n## \"triage\"\n\n- Label new issues\n\n# General information"
+            ),
+            "{}",
+            pool.rendered
+        );
+    }
+
+    #[test]
+    fn a_malformed_task_file_is_refused() {
+        let Err(err) = merged("## \"x\"\n<!-- cache: tree -->\n- y\n") else {
+            panic!("an unknown basis was accepted");
+        };
+        assert!(format!("{err:#}").contains("unknown cache basis \"tree\""), "{err:#}");
+        for slug in ["a:b", "two words", ""] {
+            assert!(merged(&format!("## \"{slug}\"\n- y\n")).is_err(), "{slug}");
+        }
+    }
+
+    #[test]
+    fn a_missing_task_file_is_no_custom_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        load_custom_tasks(&dir.path().join(CUSTOM_TASKS)).unwrap();
     }
 
     /// What the stored task pool is filtered through, so it has to answer for

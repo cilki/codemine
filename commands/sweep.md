@@ -68,6 +68,7 @@ If the task is too complicated for a single PR, open an issue instead and let
 the user decide what to do.
 
 ## "feedback"
+<!-- cache: feed -->
 
 - Respond to reviewer comments on your open PRs
 - If you are assigned an issue, create a PR to address it
@@ -75,6 +76,7 @@ the user decide what to do.
   task's, not yours: leave it, and leave its notification unread
 
 ## "rebase"
+<!-- cache: prs -->
 
 - Work only on branches that have an open PR your own forge account authored. A
   branch with no such PR is not yours: do not rebase it and do not delete it
@@ -89,6 +91,7 @@ the user decide what to do.
 - If the scope of the PR changes, edit the PR description accordingly
 
 ## "review"
+<!-- cache: reviews -->
 
 - Review the open PRs on which your own forge account is a pending requested
   reviewer. Who opened the PR doesn't matter: one of your own is yours to review
@@ -127,6 +130,7 @@ the user decide what to do.
     bump
 
 ## "simplify"
+<!-- cache: head -->
 
 - Search for dead code and remove it
 - Search for implementations that could be simplified
@@ -152,6 +156,7 @@ the user decide what to do.
 - Run the test suite and fix any failures
 
 ## "benchmark"
+<!-- cache: head -->
 
 - Run the software while measuring its performance: use the project's own
   benchmarks if it has any, otherwise measure whatever fits it best (startup
@@ -161,6 +166,7 @@ the user decide what to do.
   win, and include the before and after numbers in the PR description
 
 ## "audit"
+<!-- cache: head -->
 
 - Audit dependencies for known vulnerabilities (`cargo audit`, `npm audit`, or
   the ecosystem's equivalent) and update or patch the affected ones
@@ -169,6 +175,7 @@ the user decide what to do.
 - Open an issue instead of a PR for anything too large to fix safely in one turn
 
 ## "docs"
+<!-- cache: head -->
 
 - Compare the project's documentation against the source code and fix any drift
   such as:
@@ -181,6 +188,7 @@ the user decide what to do.
 - Verify that documented examples actually work before committing them
 
 ## "coverage"
+<!-- cache: head -->
 
 - Find an important code path with no test coverage and add a meaningful test
   for it
@@ -188,6 +196,7 @@ the user decide what to do.
 - Do not add trivial tests just to raise the count
 
 ## "mutation"
+<!-- cache: head -->
 
 - Mutation test the project: pick a well-tested module and mutate it, one
   load-bearing detail at a time (flip a comparison, swap a boundary, negate a
