@@ -1116,7 +1116,7 @@
       if (body.forge !== asked || $("f-kind").value !== asked) return;
       note.textContent = "";
       loadedRepos = true;
-      renderRepos(body.repos.map(r => r.name));
+      renderRepos(body.repos);
     } catch (err) {
       // The forge's own complaint can run to a CLI's whole stderr; the card
       // says that the listing failed and the hover says why.

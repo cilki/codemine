@@ -575,9 +575,10 @@ fn repo_choices(listing: crate::turn::Listing, enabled: &BTreeSet<String>) -> BT
 }
 
 /// Live repository listing for the configured forge, merged with the enabled
-/// set so the UI can render the picker (see `repo_choices`). The forge is
-/// named in the answer so a listing that arrives after the dropdown moved
-/// on can be told apart from the new forge's.
+/// set so the UI can render the picker (see `repo_choices`): names only,
+/// since which of them are enabled the page already knows from the settings
+/// it is editing. The forge is named in the answer so a listing that arrives
+/// after the dropdown moved on can be told apart from the new forge's.
 async fn api_repos(State(state): State<AppState>) -> Response {
     let (settings, _) = state.settings.snapshot();
     let Some(forge) = settings.runtime_forge() else {
@@ -594,10 +595,7 @@ async fn api_repos(State(state): State<AppState>) -> Response {
     let listed = tokio::task::spawn_blocking(move || crate::turn::list_repos(&forge)).await;
     match listed {
         Ok(Ok(listing)) => {
-            let repos: Vec<_> = repo_choices(listing, &enabled)
-                .into_iter()
-                .map(|name| json!({ "enabled": enabled.contains(&name), "name": name }))
-                .collect();
+            let repos = repo_choices(listing, &enabled);
             Json(json!({ "forge": kind.name(), "repos": repos })).into_response()
         }
         Ok(Err(err)) => (
@@ -640,12 +638,14 @@ mod tests {
         serde_json::from_str(body).unwrap()
     }
 
-    fn serve_in_tempdir() -> (SocketAddr, tempfile::TempDir) {
+    /// A server over a fresh workspace, sharing `status` with the test so it
+    /// can stage a running turn or a history and watch the page's side of it.
+    fn serve_in_tempdir(status: &Shared) -> (SocketAddr, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
         let addr = spawn(
             "127.0.0.1:0".parse().unwrap(),
-            Shared::new(),
+            status.clone(),
             store,
             dir.path().to_path_buf(),
         )
@@ -653,9 +653,23 @@ mod tests {
         (addr, dir)
     }
 
+    /// A turn under way, as the runner would show it, writing `log_path`.
+    fn running(log_path: &std::path::Path, pgid: i32) -> Activity {
+        Activity::Running {
+            task: "simplify".into(),
+            repo: "o/r".into(),
+            forge: "github".into(),
+            log_path: log_path.to_path_buf(),
+            pgid,
+            started: 0,
+            tokens: None,
+            rtk: None,
+        }
+    }
+
     #[test]
     fn serves_page_and_status() {
-        let (addr, _dir) = serve_in_tempdir();
+        let (addr, _dir) = serve_in_tempdir(&Shared::new());
 
         let response = request(addr, "GET", "/api/status", "");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -677,7 +691,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip_redacts_tokens() {
-        let (addr, dir) = serve_in_tempdir();
+        let (addr, dir) = serve_in_tempdir(&Shared::new());
 
         let response = request(addr, "GET", "/api/settings", "");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -775,16 +789,8 @@ mod tests {
     fn pause_stops_and_resumes_the_running_group() {
         use std::os::unix::process::CommandExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
         let status = Shared::new();
-        let addr = spawn(
-            "127.0.0.1:0".parse().unwrap(),
-            status.clone(),
-            store,
-            dir.path().to_path_buf(),
-        )
-        .unwrap();
+        let (addr, dir) = serve_in_tempdir(&status);
 
         // Nothing running: the toggle has nothing to signal.
         let response = request(addr, "PUT", "/api/paused", r#"{"paused":true}"#);
@@ -796,16 +802,7 @@ mod tests {
             .spawn()
             .unwrap();
         Status::update(&status, |s| {
-            s.activity = Activity::Running {
-                task: "simplify".into(),
-                repo: "o/r".into(),
-                forge: "github".into(),
-                log_path: dir.path().join("log"),
-                pgid: child.id() as i32,
-                started: 0,
-                tokens: None,
-                rtk: None,
-            }
+            s.activity = running(&dir.path().join("log"), child.id() as i32);
         });
 
         let response = request(addr, "PUT", "/api/paused", r#"{"paused":true}"#);
@@ -830,16 +827,8 @@ mod tests {
 
     #[test]
     fn cancel_flags_the_running_turn() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
         let status = Shared::new();
-        let addr = spawn(
-            "127.0.0.1:0".parse().unwrap(),
-            status.clone(),
-            store,
-            dir.path().to_path_buf(),
-        )
-        .unwrap();
+        let (addr, dir) = serve_in_tempdir(&status);
 
         // Nothing running: nothing to cancel.
         let response = request(addr, "POST", "/api/cancel", "");
@@ -847,16 +836,7 @@ mod tests {
         assert!(!status.lock().cancel_requested);
 
         Status::update(&status, |s| {
-            s.activity = Activity::Running {
-                task: "simplify".into(),
-                repo: "o/r".into(),
-                forge: "github".into(),
-                log_path: dir.path().join("log"),
-                pgid: 1,
-                started: 0,
-                tokens: None,
-                rtk: None,
-            }
+            s.activity = running(&dir.path().join("log"), 1)
         });
         let response = request(addr, "POST", "/api/cancel", "");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -865,7 +845,7 @@ mod tests {
 
     #[test]
     fn settings_validation_fails_with_422() {
-        let (addr, _dir) = serve_in_tempdir();
+        let (addr, _dir) = serve_in_tempdir(&Shared::new());
         let update = json!({ "turn_timeout_secs": 0 });
         let response = request(addr, "PUT", "/api/settings", &update.to_string());
         assert!(response.starts_with("HTTP/1.1 422"), "{response}");
@@ -896,7 +876,7 @@ mod tests {
 
     #[test]
     fn events_stream_pushes_status_and_log() {
-        let (addr, _dir) = serve_in_tempdir();
+        let (addr, _dir) = serve_in_tempdir(&Shared::new());
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
         write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
 
@@ -940,38 +920,27 @@ mod tests {
     /// every open page for a dozen token counts.
     #[test]
     fn the_history_is_sent_once_and_not_on_every_token_sample() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
         let status = Shared::new();
+        let (addr, dir) = serve_in_tempdir(&status);
+        // The running turn's token count moving, as the sampler moves it.
         let sample = |n: u64| {
-            Some(crate::status::TokenUsage {
-                input: n,
-                ..Default::default()
+            Status::update(&status, |s| {
+                if let Activity::Running { tokens, .. } = &mut s.activity {
+                    *tokens = Some(crate::status::TokenUsage {
+                        input: n,
+                        ..Default::default()
+                    });
+                }
             })
         };
         Status::update(&status, |s| {
-            s.activity = Activity::Running {
-                task: "benchmark".into(),
-                repo: "cilki/codemine".into(),
-                forge: "gitea".into(),
-                log_path: dir.path().join("turn.log"),
-                pgid: 0,
-                started: 1_760_000_000,
-                tokens: sample(1),
-                rtk: None,
-            };
+            s.activity = running(&dir.path().join("turn.log"), 0);
             // A full history, which is what the stream used to re-send.
             for n in 0..200 {
                 s.record_turn(record(1_760_000_000 - n * 1200));
             }
         });
-        let addr = spawn(
-            "127.0.0.1:0".parse().unwrap(),
-            status.clone(),
-            store,
-            dir.path().to_path_buf(),
-        )
-        .unwrap();
+        sample(1);
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
         write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
 
@@ -987,11 +956,7 @@ mod tests {
         // answers them one at a time the way five seconds apart would.
         let mut samples = String::new();
         for n in 2..=12 {
-            Status::update(&status, |s| {
-                if let Activity::Running { tokens: live, .. } = &mut s.activity {
-                    *live = sample(n);
-                }
-            });
+            sample(n);
             samples.push_str(&read_until(&mut stream, "event: status"));
         }
         // Each sample is answered, and none of them restates the history.
@@ -1015,17 +980,9 @@ mod tests {
     /// list the stream carries separately is spliced back into it.
     #[test]
     fn the_status_endpoint_still_carries_the_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
         let status = Shared::new();
+        let (addr, _dir) = serve_in_tempdir(&status);
         Status::update(&status, |s| s.record_turn(record(1_760_000_000)));
-        let addr = spawn(
-            "127.0.0.1:0".parse().unwrap(),
-            status,
-            store,
-            dir.path().to_path_buf(),
-        )
-        .unwrap();
         let value = body_json(&request(addr, "GET", "/api/status", ""));
         assert!(value["now"].as_u64().unwrap() > 1_700_000_000);
         assert_eq!(value["turns"][0]["started"], 1_760_000_000);
@@ -1035,31 +992,15 @@ mod tests {
 
     #[test]
     fn turn_log_serves_full_file_by_start_epoch() {
-        let dir = tempfile::tempdir().unwrap();
+        let status = Shared::new();
+        let (addr, dir) = serve_in_tempdir(&status);
         let path = dir.path().join("100.log");
         std::fs::write(&path, "\x1b[32mall good\x1b[0m\n").unwrap();
-        let status = Shared::new();
         Status::update(&status, |s| {
-            s.record_turn(crate::status::TurnRecord {
-                task: "todo".into(),
-                repo: "o/r".into(),
-                forge: "gitea".into(),
-                started: 100,
-                duration_secs: 1,
-                outcome: crate::status::Outcome::Completed,
-                tokens: None,
-                rtk: None,
-                log_path: path.clone(),
-            })
+            let mut turn = record(100);
+            turn.log_path = path.clone();
+            s.record_turn(turn);
         });
-        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
-        let addr = spawn(
-            "127.0.0.1:0".parse().unwrap(),
-            status,
-            store,
-            dir.path().to_path_buf(),
-        )
-        .unwrap();
 
         // The full log comes back raw, ANSI escapes included.
         let response = request(addr, "GET", "/api/turns/100/log", "");
@@ -1073,7 +1014,7 @@ mod tests {
 
     #[test]
     fn options_lists_models_and_tasks() {
-        let (addr, _dir) = serve_in_tempdir();
+        let (addr, _dir) = serve_in_tempdir(&Shared::new());
         let value = body_json(&request(addr, "GET", "/api/options", ""));
         // The model list mirrors `opencode models`, so its content depends on
         // the machine; every entry is a provider/model ID either way.
@@ -1097,7 +1038,7 @@ mod tests {
 
     #[test]
     fn events_stream_pushes_auth_health() {
-        let (addr, _dir) = serve_in_tempdir();
+        let (addr, _dir) = serve_in_tempdir(&Shared::new());
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
         write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
         let seen = read_until(&mut stream, "event: proxy");
@@ -1107,7 +1048,7 @@ mod tests {
 
     #[test]
     fn repos_endpoint_guards() {
-        let (addr, _dir) = serve_in_tempdir();
+        let (addr, _dir) = serve_in_tempdir(&Shared::new());
         // No token stored, so there is no forge to list.
         let response = request(addr, "GET", "/api/repos", "");
         assert!(response.starts_with("HTTP/1.1 409"), "{response}");
@@ -1122,7 +1063,7 @@ mod tests {
     /// forge: the page has one dot to paint.
     #[test]
     fn events_stream_pushes_forge_health() {
-        let (addr, _dir) = serve_in_tempdir();
+        let (addr, _dir) = serve_in_tempdir(&Shared::new());
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
         write!(stream, "GET /api/events HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
         let seen = read_until(&mut stream, r#""state":"no-token""#);
@@ -1191,16 +1132,6 @@ mod tests {
         let path = dir.path().join("turn.log");
         std::fs::write(&path, "first\n").unwrap();
         let status = Shared::new();
-        let running = |path: &std::path::Path| Activity::Running {
-            task: "benchmark".into(),
-            repo: "o/r".into(),
-            forge: "gitea".into(),
-            log_path: path.to_path_buf(),
-            pgid: 0,
-            started: 0,
-            tokens: None,
-            rtk: None,
-        };
         let append = |path: &std::path::Path, text: &str| {
             let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
             file.write_all(text.as_bytes()).unwrap();
@@ -1217,7 +1148,7 @@ mod tests {
         assert_eq!(update(&mut cursor), None);
 
         // A turn starts: the window it has so far, then only what it adds.
-        Status::update(&status, |s| s.activity = running(&path));
+        Status::update(&status, |s| s.activity = running(&path, 0));
         assert_eq!(update(&mut cursor), Some(("log", "first\n".to_owned())));
         assert_eq!(update(&mut cursor), None);
         append(&path, "second\n");
@@ -1251,7 +1182,7 @@ mod tests {
         // append to and the window is stated again.
         let next = dir.path().join("next.log");
         std::fs::write(&next, "next turn\n").unwrap();
-        Status::update(&status, |s| s.activity = running(&next));
+        Status::update(&status, |s| s.activity = running(&next, 0));
         assert_eq!(update(&mut cursor), Some(("log", "next turn\n".to_owned())));
 
         // And so is a log that shrank under the page: whatever it holds is

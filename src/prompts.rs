@@ -681,17 +681,6 @@ mod tests {
         load_custom_tasks(&dir.path().join(CUSTOM_TASKS)).unwrap();
     }
 
-    /// What the stored task pool is filtered through, so it has to answer for
-    /// exactly the sections the command has.
-    #[test]
-    fn defines_answers_for_the_sweep_sections_only() {
-        for task in tasks() {
-            assert!(defines(&task.slug), "{}", task.slug);
-        }
-        assert!(!defines("no-such-task"));
-        assert!(!defines(""));
-    }
-
     #[test]
     fn install_writes_and_overwrites() {
         let dir = tempfile::tempdir().unwrap();

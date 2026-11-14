@@ -293,22 +293,22 @@ impl Window {
     }
 }
 
+/// What the page's counters add up, across every turn including the ones
+/// that have aged out of `Status::turns`. A cancelled turn counts in none of
+/// them: the page shows completed, skipped, and failed (with timeouts), and
+/// a turn somebody stopped by hand is none of those.
 #[derive(Serialize, Clone, Default)]
 pub struct Totals {
-    pub turns: u64,
     pub completed: u64,
     pub skipped: u64,
     pub failed: u64,
     pub timeout: u64,
-    pub canceled: u64,
     pub tokens: TokenUsage,
     pub rtk: Savings,
 }
 
 #[derive(Serialize)]
 pub struct Status {
-    /// Process start, epoch seconds.
-    pub started: u64,
     pub activity: Activity,
     /// Whether the running turn's process tree is currently SIGSTOPped
     /// through the web UI.
@@ -356,7 +356,6 @@ impl Shared {
     pub fn new() -> Shared {
         Shared {
             status: Arc::new(Mutex::new(Status {
-                started: epoch_now(),
                 activity: Activity::Starting,
                 paused: false,
                 cancel_requested: false,
@@ -385,13 +384,12 @@ impl Status {
     }
 
     pub fn record_turn(&mut self, record: TurnRecord) {
-        self.totals.turns += 1;
         match record.outcome {
             Outcome::Completed => self.totals.completed += 1,
             Outcome::Skipped => self.totals.skipped += 1,
             Outcome::Failed => self.totals.failed += 1,
             Outcome::Timeout => self.totals.timeout += 1,
-            Outcome::Canceled => self.totals.canceled += 1,
+            Outcome::Canceled => {}
         }
         if let Some(tokens) = &record.tokens {
             self.totals.tokens.add(tokens);
@@ -467,7 +465,6 @@ mod tests {
         // compares nothing else — so every record has to move it.
         assert_eq!(status.turns_revision, 61);
         assert_eq!(status.turns[0].outcome, Outcome::Skipped);
-        assert_eq!(status.totals.turns, 61);
         assert_eq!(status.totals.completed, 60);
         assert_eq!(status.totals.skipped, 1);
         assert_eq!(status.totals.tokens.input, 61 * 10);
@@ -496,7 +493,7 @@ mod tests {
 
         let status = shared.lock();
         assert_eq!(status.turns.len(), HISTORY);
-        assert_eq!(status.totals.turns, turns);
+        assert_eq!(status.totals.completed, turns);
         assert_eq!(status.totals.tokens.input, turns * 10);
         // Newest first, and the oldest ten are gone from both the list and
         // the disk.
