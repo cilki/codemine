@@ -493,13 +493,6 @@ pub fn clear_clones(workspace: &Path) -> Result<()> {
         };
         removed.with_context(|| format!("failed to remove {}", path.display()))?;
     }
-    // Left behind by the weekly tidy-up this replaced.
-    let stale = workspace.join("tidy.json");
-    if let Err(err) = std::fs::remove_file(&stale)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(err).with_context(|| format!("failed to remove {}", stale.display()));
-    }
     Ok(())
 }
 
@@ -1098,7 +1091,7 @@ mod tests {
         for dir in ["logs", "cliproxyapi/auth"] {
             std::fs::create_dir_all(ws.join(dir)).unwrap();
         }
-        for file in ["config.json", "skips.json", "tidy.json"] {
+        for file in ["config.json", "skips.json"] {
             std::fs::write(ws.join(file), "{}").unwrap();
         }
 
@@ -1107,7 +1100,6 @@ mod tests {
         for kind in ForgeKind::ALL {
             assert!(!ws.join(kind.name()).exists(), "{} survived", kind.name());
         }
-        assert!(!ws.join("tidy.json").exists(), "tidy.json survived");
         for kept in ["logs", "cliproxyapi/auth", "config.json", "skips.json"] {
             assert!(ws.join(kept).exists(), "{kept} was removed");
         }

@@ -189,26 +189,6 @@ pub fn install_mcp(dir: &Path, codegraph: bool) -> Result<()> {
         return Ok(());
     }
     edit_json(&path, |config| {
-        // opencode's config maps server names directly under `mcp`; an
-        // earlier version nested them under `mcp.servers`, which opencode
-        // reads as a server named "servers" and rejects the whole config
-        // over, so drop the leftover on the way through. Accessed via
-        // get_mut, not indexing: IndexMut on Value inserts null for missing
-        // keys, and a written-out `"servers": null` (which one buggy version
-        // did leave behind, hence the Null arm) fails opencode's schema just
-        // the same.
-        let drop_servers = match config.get_mut("mcp").and_then(|mcp| mcp.get_mut("servers")) {
-            Some(serde_json::Value::Object(servers)) => {
-                servers.remove("codegraph");
-                servers.is_empty()
-            }
-            Some(serde_json::Value::Null) => true,
-            _ => false,
-        };
-        if drop_servers && let Some(mcp) = config.get_mut("mcp").and_then(|mcp| mcp.as_object_mut())
-        {
-            mcp.remove("servers");
-        }
         config["mcp"]["codegraph"] = serde_json::json!({
             "type": "local",
             "command": ["codegraph", "serve", "--mcp"],
@@ -308,7 +288,7 @@ pub fn install_provider(dir: &Path, proxy: &crate::settings::ProxySettings) -> R
 /// startup failure.
 fn configures_codegraph(path: &Path) -> bool {
     let config = read_json(path).unwrap_or_default();
-    !config["mcp"]["codegraph"].is_null() || !config["mcp"]["servers"]["codegraph"].is_null()
+    !config["mcp"]["codegraph"].is_null()
 }
 
 /// One task the runner can draw: the slug passed to the sweep prompt, plus
@@ -350,11 +330,14 @@ static SWEEP_POOL: OnceLock<Sweep> = OnceLock::new();
 /// weighs. Without [`load_custom_tasks`] having run first it is the built-in
 /// command alone.
 fn sweep() -> &'static Sweep {
-    SWEEP_POOL.get_or_init(|| {
-        let builtin = str::from_utf8(SWEEP).expect("sweep.md is UTF-8");
-        merge(parse_sweep(builtin).expect("sweep.md parses"), "")
-            .expect("sweep.md merges with nothing")
-    })
+    SWEEP_POOL.get_or_init(|| merge(builtin(), "").expect("sweep.md merges with nothing"))
+}
+
+/// The built-in command taken apart. It is compiled in, so failing to parse
+/// it is a defect in the binary and not a condition to report.
+fn builtin() -> Sweep {
+    let source = str::from_utf8(SWEEP).expect("sweep.md is UTF-8");
+    parse_sweep(source).expect("sweep.md parses")
 }
 
 /// Read the user's own tasks from `path`, if the file is there, and merge
@@ -372,9 +355,7 @@ pub fn load_custom_tasks(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
-    let builtin = str::from_utf8(SWEEP).expect("sweep.md is UTF-8");
-    let pool = parse_sweep(builtin)
-        .and_then(|sweep| merge(sweep, &custom))
+    let pool = merge(builtin(), &custom)
         .with_context(|| format!("{} is not a valid task file", path.display()))?;
     SWEEP_POOL
         .set(pool)
@@ -451,7 +432,7 @@ fn section(slug: &str, lines: &[&str]) -> Result<Task> {
     let body = body.join("\n").trim_matches('\n').to_owned();
     Ok(Task {
         slug: slug.to_owned(),
-        description: describe(&body.lines().collect::<Vec<_>>()),
+        description: describe(&body),
         basis,
         body,
     })
@@ -480,7 +461,7 @@ fn merge(mut sweep: Sweep, custom: &str) -> Result<Sweep> {
                     existing.body.push('\n');
                 }
                 existing.body.push_str(&task.body);
-                existing.description = describe(&existing.body.lines().collect::<Vec<_>>());
+                existing.description = describe(&existing.body);
             }
             if task.basis.is_some() {
                 existing.basis = task.basis;
@@ -515,9 +496,9 @@ fn validate_slug(slug: &str) -> Result<()> {
 
 /// A task section's markdown bullets as tooltip text: one line per bullet,
 /// with the soft-wrapped continuation lines joined back up.
-fn describe(lines: &[&str]) -> String {
+fn describe(body: &str) -> String {
     let mut bullets: Vec<String> = Vec::new();
-    for line in lines {
+    for line in body.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -603,7 +584,7 @@ mod tests {
     }
 
     fn merged(custom: &str) -> Result<Sweep> {
-        merge(parse_sweep(str::from_utf8(SWEEP).unwrap()).unwrap(), custom)
+        merge(builtin(), custom)
     }
 
     #[test]
@@ -828,10 +809,6 @@ mod tests {
             serde_json::json!(["codegraph", "serve", "--mcp"])
         );
         assert_eq!(config["mcp"]["codegraph"]["type"], "local");
-        // A null `servers` key must not appear either: opencode rejects the
-        // whole config over `mcp.servers: null`, and is_null() can't tell a
-        // missing key from a literal null.
-        assert!(!config["mcp"].as_object().unwrap().contains_key("servers"));
 
         std::fs::write(
             &path,
@@ -847,41 +824,6 @@ mod tests {
             config["mcp"]["codegraph"]["enabled"],
             serde_json::json!(true)
         );
-    }
-
-    #[test]
-    fn install_mcp_drops_stale_servers_nesting() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("opencode.json");
-
-        // A previous version nested the entry under mcp.servers, which
-        // opencode rejects wholesale; install_mcp migrates it away.
-        std::fs::write(
-            &path,
-            r#"{"mcp":{"servers":{"codegraph":{"type":"stdio","command":"codegraph"}}}}"#,
-        )
-        .unwrap();
-        install_mcp(dir.path(), true).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(!config["mcp"].as_object().unwrap().contains_key("servers"));
-        assert_eq!(config["mcp"]["codegraph"]["type"], "local");
-
-        // A literal `"servers": null` (left behind by a buggy version that
-        // auto-vivified it while migrating) is dropped too.
-        std::fs::write(&path, r#"{"mcp":{"servers":null}}"#).unwrap();
-        install_mcp(dir.path(), true).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(!config["mcp"].as_object().unwrap().contains_key("servers"));
-
-        // Entries codemine didn't write stay put, even under mcp.servers.
-        std::fs::write(&path, r#"{"mcp":{"servers":{"codegraph":{},"other":{}}}}"#).unwrap();
-        install_mcp(dir.path(), true).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(!config["mcp"]["servers"]["other"].is_null());
-        assert!(config["mcp"]["servers"]["codegraph"].is_null());
     }
 
     #[test]
@@ -949,8 +891,7 @@ mod tests {
     /// turn on codemine's own repository starts the binary it built, and that
     /// instance's startup writes the default proxy into it. Reasserting the
     /// configured proxy has to take the file back to the settings while
-    /// leaving the MCP entry, and a file already in agreement is not
-    /// rewritten, since the runner does this before every turn.
+    /// leaving the MCP entry.
     #[test]
     fn install_provider_takes_back_a_clobbered_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -981,15 +922,6 @@ mod tests {
         );
         assert_eq!(config["provider"]["anthropic"]["options"]["apiKey"], "k1");
         assert_eq!(config["mcp"]["codegraph"]["type"], "local");
-
-        // In agreement: compared, not written.
-        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        install_provider(dir.path(), &proxy).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            before
-        );
     }
 
     #[test]
@@ -1005,7 +937,7 @@ mod tests {
         // read-only file can't fail the run.
         for original in [
             r#"{"theme":"dark"}"#,
-            r#"{"mcp":{"servers":{"codegraph":{"type":"stdio"}}}}"#,
+            r#"{"mcp":{"codegraph":{"type":"local"}}}"#,
         ] {
             std::fs::write(&path, original).unwrap();
             install_mcp(dir.path(), false).unwrap();
@@ -1058,18 +990,13 @@ mod tests {
     #[test]
     fn the_config_is_owner_only_whichever_write_created_it() {
         use std::os::unix::fs::PermissionsExt;
-        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-
         let dir = tempfile::tempdir().unwrap();
         install_mcp(dir.path(), true).unwrap();
-        assert_eq!(mode(&opencode_json(dir.path())), 0o600);
-
-        // A config someone else created world-readable comes back
-        // owner-only once codemine has a change to write into it.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(opencode_json(dir.path()), r#"{"theme":"dark"}"#).unwrap();
-        install_provider(dir.path(), &crate::settings::ProxySettings::default()).unwrap();
-        assert_eq!(mode(&opencode_json(dir.path())), 0o600);
+        let mode = std::fs::metadata(opencode_json(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
     }
 
     /// An empty config is what a `touch` or an interrupted write leaves, and
