@@ -181,6 +181,18 @@ heading in `commands/sweep.md` — `head`, `feed`, `prs`, or `reviews`, as above
 — and a task without one is never cached. The line is read by **codemine** and
 dropped from the prompt the agent sees.
 
+#### Drawing turns
+
+Each pass first probes the tasks that answer to the forge — `feedback`,
+`rebase`, `review` — on every repository, and the first with work gets the
+turn. Only when none has is a turn drawn from the rest, and that draw is
+weighted rather than uniform: a (task, repository) pair is favoured the longer
+it has gone without a turn (up to a week) and the more often its turns have
+completed rather than skipped. A pair that has never run outranks one that
+just did; one that keeps skipping sinks, without ever dropping out. The history
+behind the weights lives in `ledger.json` in the workspace, beside the skip
+cache, and survives restarts.
+
 #### Custom tasks
 
 Put your own tasks in `tasks.md` in the workspace, written the way

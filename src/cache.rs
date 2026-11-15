@@ -176,8 +176,8 @@ impl Cache {
 /// One task's entry for one repository. None of the three parts can contain a
 /// colon — forge and task are fixed slugs, and forge paths are
 /// `<owner>/<repo>` — so a flat key stays unambiguous and readable in the
-/// file.
-fn key(task: &str, forge: ForgeKind, repo: &str) -> String {
+/// file. The draw ledger (`ledger.rs`) keys its entries the same way.
+pub fn key(task: &str, forge: ForgeKind, repo: &str) -> String {
     format!("{}:{repo}:{task}", forge.name())
 }
 

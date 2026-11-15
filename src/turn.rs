@@ -13,6 +13,7 @@ use wait_timeout::ChildExt;
 
 use crate::cache;
 use crate::config::{Config, Forge, ForgeKind};
+use crate::ledger::Ledger;
 use crate::precheck;
 use crate::scan::{Verdict, last_lines};
 use crate::status::{
@@ -114,11 +115,22 @@ impl Turn<'_> {
         }
     }
 
-    /// Hand the finished turn to the status: the tail of its log becomes what
-    /// an idle page shows, and the turn joins the list and the totals. The
-    /// one place a turn is recorded, whether it ran to the end or never got
-    /// past preparing its clone.
-    fn finish(&self, status: &Shared, tail: &str, outcome: Outcome, elapsed: u64, spent: Spent) {
+    /// Hand the finished turn to the status and the draw ledger: the tail of
+    /// its log becomes what an idle page shows, the turn joins the list and
+    /// the totals, and the pair it ran on is weighed accordingly next draw.
+    /// The one place a turn is recorded, whether it ran to the end or never
+    /// got past preparing its clone — a pair whose clone won't prepare has
+    /// had its turn too, and shouldn't be the very next draw.
+    fn finish(
+        &self,
+        status: &Shared,
+        ledger: &Ledger,
+        tail: &str,
+        outcome: Outcome,
+        elapsed: u64,
+        spent: Spent,
+    ) {
+        ledger.record(self.task, self.forge.kind, self.repo, self.started, outcome);
         let record = TurnRecord {
             task: self.task.to_owned(),
             repo: self.repo.to_owned(),
@@ -143,13 +155,15 @@ impl Turn<'_> {
 /// under `<workspace>/logs`, for as long as the process runs. `opencode` is
 /// the version the agent is started with, which settles its flags, and
 /// `draw` is whether the random draw is on the table or only what the forge
-/// queued — see `Draw`.
+/// queued — see `Draw`. `cache` holds the draw back from pairs that have
+/// already answered for the current state, and `ledger` weighs the rest.
 pub fn run(
     cfg: &Config,
     opencode: &crate::opencode::Version,
     status: &Shared,
     pending: &crate::events::Pending,
     cache: &cache::Cache,
+    ledger: &Ledger,
     draw: Draw,
 ) -> Result<Report> {
     let forge = &cfg.forge;
@@ -164,9 +178,15 @@ pub fn run(
     // The precondition probes plus the skip cache, sharing one set of forge
     // lookups across everything this draw asks about.
     let probe = cache::Probe::new(cache, forge);
-    let Some((task, repo)) = pick(forge, &pool, pending, draw, |task, repo| {
-        probe.actionable(task, repo)
-    }) else {
+    let now = epoch_now();
+    let Some((task, repo)) = pick(
+        forge,
+        &pool,
+        pending,
+        draw,
+        |task, repo| probe.actionable(task, repo),
+        |task, repo| ledger.weight(task, forge.kind, repo, now),
+    ) else {
         return Ok(Report::Idle(Idle::NothingToDo));
     };
 
@@ -203,7 +223,14 @@ pub fn run(
             "failed to prepare {repo} in {elapsed}s: {err:#}\n{}",
             last_lines(&tail, 20)
         );
-        turn.finish(status, &tail, Outcome::Failed, elapsed, Spent::default());
+        turn.finish(
+            status,
+            ledger,
+            &tail,
+            Outcome::Failed,
+            elapsed,
+            Spent::default(),
+        );
         return Ok(Report::Ran {
             verdict: Verdict::default(),
             canceled: false,
@@ -238,7 +265,7 @@ pub fn run(
         }
     }
 
-    turn.finish(status, &tail, outcome, elapsed, spent);
+    turn.finish(status, ledger, &tail, outcome, elapsed, spent);
 
     Ok(Report::Ran { verdict, canceled })
 }
@@ -268,13 +295,15 @@ fn pool(forge: &Forge) -> Result<Vec<String>> {
 /// schedule's window takes the turns the forge asked for and none the
 /// runner would pick on its own. `check` is whether a (task, repository)
 /// pair has work, which the caller answers from the prechecks and the skip
-/// cache.
+/// cache; `weigh` is how much the random draw should favour one, which it
+/// answers from the ledger.
 fn pick<'a>(
     forge: &'a Forge,
     pool: &'a [String],
     pending: &crate::events::Pending,
     draw: Draw,
     check: impl Fn(&str, &str) -> bool,
+    weigh: impl Fn(&str, &str) -> f64,
 ) -> Option<(&'a str, &'a str)> {
     while let Some((kind, repo)) = pending.pop() {
         if kind != forge.kind {
@@ -291,7 +320,7 @@ fn pick<'a>(
         }
     }
     match draw {
-        Draw::Any => precheck::draw(forge, pool, check),
+        Draw::Any => precheck::draw(forge, pool, check, weigh),
         Draw::QueuedOnly => None,
     }
 }
@@ -669,6 +698,12 @@ mod tests {
     use crate::config::{Forge, ForgeKind};
     use crate::events::Pending;
 
+    /// Every pair weighted alike: the queue tests are about what the queue
+    /// does ahead of the draw, not how the draw orders what is left.
+    fn alike(_: &str, _: &str) -> f64 {
+        1.0
+    }
+
     /// Fresh activity is drawn whether or not the window is open, and
     /// `review` asks before `feedback`.
     #[test]
@@ -678,7 +713,7 @@ mod tests {
                 Forge::sweep(&["me/one", "me/two"], &["review", "feedback", "rebase"]);
             let pending = Pending::new();
             pending.push(ForgeKind::Github, "me/two".into());
-            let picked = pick(&forge, &pool, &pending, draw, |_, _| true);
+            let picked = pick(&forge, &pool, &pending, draw, |_, _| true, alike);
             assert_eq!(picked, Some(("review", "me/two")), "{draw:?}");
             assert!(pending.is_empty());
         }
@@ -691,10 +726,17 @@ mod tests {
         let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback", "rebase"]);
         let pending = Pending::new();
         let probed = std::cell::Cell::new(0);
-        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| {
-            probed.set(probed.get() + 1);
-            true
-        });
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::QueuedOnly,
+            |_, _| {
+                probed.set(probed.get() + 1);
+                true
+            },
+            alike,
+        );
         assert_eq!(picked, None);
         assert_eq!(probed.get(), 0);
     }
@@ -709,17 +751,31 @@ mod tests {
 
         let pending = Pending::new();
         pending.push(ForgeKind::Github, "me/repo".into());
-        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| false);
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::QueuedOnly,
+            |_, _| false,
+            alike,
+        );
         assert_eq!(picked, None);
         assert!(pending.is_empty());
 
         let pending = Pending::new();
         pending.push(ForgeKind::Github, "me/repo".into());
         let seen = std::cell::RefCell::new(Vec::new());
-        let picked = pick(&forge, &pool, &pending, Draw::Any, |task, repo| {
-            seen.borrow_mut().push(task.to_owned());
-            !queued_only(task, repo)
-        });
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::Any,
+            |task, repo| {
+                seen.borrow_mut().push(task.to_owned());
+                !queued_only(task, repo)
+            },
+            alike,
+        );
         assert_eq!(picked, Some(("rebase", "me/repo")));
         assert!(seen.borrow().iter().any(|task| task == "rebase"));
     }
@@ -732,7 +788,14 @@ mod tests {
         let pending = Pending::new();
         pending.push(ForgeKind::Gitea, "me/repo".into());
         pending.push(ForgeKind::Github, "me/gone".into());
-        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| true);
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::QueuedOnly,
+            |_, _| true,
+            alike,
+        );
         assert_eq!(picked, None);
         assert!(pending.is_empty());
     }

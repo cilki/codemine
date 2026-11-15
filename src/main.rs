@@ -13,6 +13,7 @@ mod events;
 mod host;
 mod http;
 mod identity;
+mod ledger;
 mod opencode;
 mod precheck;
 mod prompts;
@@ -73,6 +74,9 @@ fn main() -> Result<()> {
     // tree's commit, or the notification feed for `feedback` — so it isn't
     // drawn again until that moves.
     let cache = cache::Cache::load(cli.workspace.join("skips.json"));
+    // What every pair has yielded and when it last ran, which weighs the
+    // draw among the pairs the cache lets through.
+    let ledger = ledger::Ledger::load(cli.workspace.join("ledger.json"));
     let status = Shared::new();
     let addr = webui::spawn(
         cli.listen,
@@ -220,7 +224,7 @@ fn main() -> Result<()> {
             continue;
         }
 
-        match turn::run(&cfg, &opencode, &status, &pending, &cache, draw) {
+        match turn::run(&cfg, &opencode, &status, &pending, &cache, &ledger, draw) {
             // An off-hours pass whose queued activity turned out to be
             // handled already (or on a repository since disabled) says
             // nothing about the pool: it never drew from it. Straight back
