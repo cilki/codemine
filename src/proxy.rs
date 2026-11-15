@@ -129,7 +129,7 @@ type Cached<T> = Mutex<Option<(Instant, String, T)>>;
 /// the settings the answer depends on, so a just-saved URL or key is probed
 /// at once rather than waiting out the old answer's TTL.
 fn cached<T: Clone>(slot: &Cached<T>, key: String, probe: impl FnOnce() -> T) -> T {
-    let mut cached = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cached = crate::sync::lock(slot);
     if let Some((at, for_key, answer)) = &*cached
         && at.elapsed() < PROBE_TTL
         && *for_key == key

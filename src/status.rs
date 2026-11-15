@@ -24,12 +24,8 @@ pub struct Shared {
 }
 
 impl Shared {
-    /// Lock for reading, shrugging off poisoning so a panic on either side of
-    /// the mutex can't wedge the other.
     pub fn lock(&self) -> MutexGuard<'_, Status> {
-        self.status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::sync::lock(&self.status)
     }
 
     /// A receiver whose `changed()` resolves on every later update.

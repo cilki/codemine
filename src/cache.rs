@@ -169,9 +169,7 @@ impl Cache {
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Mark>> {
-        self.marks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::sync::lock(&self.marks)
     }
 }
 
@@ -403,14 +401,7 @@ mod tests {
     }
 
     fn forge(kind: ForgeKind) -> Forge {
-        Forge {
-            kind,
-            token: "tok".into(),
-            login: String::new(),
-            email: String::new(),
-            url: "https://github.com".into(),
-            repos: BTreeMap::new(),
-        }
+        Forge::test(kind, "https://github.com")
     }
 
     /// The forge every probe below draws on.
@@ -440,24 +431,19 @@ mod tests {
         probe
     }
 
-    /// And for the conflicting-PR listing `rebase` is probed out of; `None`
-    /// is a listing that couldn't be read.
-    fn conflict_probe<'a>(cache: &'a Cache, prs: Option<&[&str]>) -> Probe<'a> {
+    /// And for the PR keys `rebase` and `review` are probed out of — the
+    /// bot's conflicting PRs for the one, its review requests for the other.
+    /// `None` is a listing that couldn't be read.
+    fn pr_probe<'a>(cache: &'a Cache, task: &str, prs: Option<&[&str]>) -> Probe<'a> {
         let probe = Probe::new(cache, &GITHUB);
-        probe.conflicts.borrow_mut().insert(
-            "me/repo".into(),
-            prs.map(|prs| prs.iter().map(|pr| (*pr).to_owned()).collect()),
-        );
-        probe
-    }
-
-    /// And for the review-request listing `review` is probed out of.
-    fn review_probe<'a>(cache: &'a Cache, prs: Option<&[&str]>) -> Probe<'a> {
-        let probe = Probe::new(cache, &GITHUB);
-        probe.reviews.borrow_mut().insert(
-            "me/repo".into(),
-            prs.map(|prs| prs.iter().map(|pr| (*pr).to_owned()).collect()),
-        );
+        let keys = prs.map(|prs| prs.iter().map(|pr| (*pr).to_owned()).collect());
+        match task {
+            "rebase" => &probe.conflicts,
+            "review" => &probe.reviews,
+            other => panic!("{other} is not probed out of the PR page"),
+        }
+        .borrow_mut()
+        .insert("me/repo".into(), keys);
         probe
     }
 
@@ -603,100 +589,64 @@ mod tests {
         assert!(!probe.actionable("feedback", "me/repo"));
     }
 
-    /// `rebase` is drawn only when the bot has an open conflicting PR, and —
-    /// unlike the feed — an unreadable listing holds it back rather than
-    /// drawing it: with nothing to remember a skip against, a probe that
+    /// `rebase` is drawn only when the bot has an open conflicting PR, and
+    /// `review` only when someone has asked it for a review it hasn't given.
+    /// Unlike the feed, an unreadable listing holds both back rather than
+    /// drawing them: with nothing to remember a skip against, a probe that
     /// stayed broken used to cost an agent session per draw, forever.
     #[test]
-    fn rebase_is_drawn_only_when_an_owned_pr_conflicts() {
+    fn a_pr_task_is_drawn_only_when_the_listing_names_a_pr() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        assert!(conflict_probe(&cache, Some(&["12@abc"])).actionable("rebase", "me/repo"));
-        assert!(!conflict_probe(&cache, Some(&[])).actionable("rebase", "me/repo"));
-        assert!(!conflict_probe(&cache, None).actionable("rebase", "me/repo"));
+        for task in ["rebase", "review"] {
+            let probe = |prs| pr_probe(&cache, task, prs);
+            assert!(
+                probe(Some(&["12@abc"])).actionable(task, "me/repo"),
+                "{task}"
+            );
+            assert!(!probe(Some(&[])).actionable(task, "me/repo"), "{task}");
+            assert!(!probe(None).actionable(task, "me/repo"), "{task}");
+        }
     }
 
-    /// A `rebase` skip is keyed on the conflict set: it stands while the set
-    /// sits still, and any move — a force-push, a new conflict, the set
-    /// emptying — redraws the task. Without this, one conflict the agent
-    /// declines to resolve keeps the precheck true and `rebase` — gated, so
-    /// probed ahead of the blind draw — is drawn every single turn until the
-    /// branch moves.
-    #[test]
-    fn a_rebase_skip_stands_until_the_conflict_set_moves() {
-        let root = tempfile::tempdir().unwrap();
-        let cache = cache(&root);
-        cache.remember("rebase", ForgeKind::Github, "me/repo", "12@abc");
-
-        assert!(conflict_probe(&cache, Some(&["12@abc"])).remembered("rebase", "me/repo"));
-        // A force-push moves the head.
-        assert!(!conflict_probe(&cache, Some(&["12@def"])).remembered("rebase", "me/repo"));
-        // A second conflict appears.
-        assert!(
-            !conflict_probe(&cache, Some(&["12@abc", "15@eee"])).remembered("rebase", "me/repo")
-        );
-        // The set empties: the mark no longer stands, and the precondition
-        // holds the task back anyway.
-        assert!(!conflict_probe(&cache, Some(&[])).remembered("rebase", "me/repo"));
-    }
-
-    /// The memory outranks the precondition here too: a conflict `rebase`
-    /// has already answered for keeps it out of the draw even though the
-    /// forge still reports it.
-    #[test]
-    fn a_remembered_rebase_skip_beats_the_precondition() {
-        let root = tempfile::tempdir().unwrap();
-        let cache = cache(&root);
-        cache.remember("rebase", ForgeKind::Github, "me/repo", "12@abc");
-        let probe = conflict_probe(&cache, Some(&["12@abc"]));
-        assert!(!probe.actionable("rebase", "me/repo"));
-    }
-
-    /// An unreadable listing neither stands a mark up nor draws the task:
+    /// A `rebase` skip is keyed on the conflict set and a `review` skip on
+    /// the request set: each stands while its set sits still, and any move —
+    /// a force-push, a PR joining the set, the set emptying — redraws the
+    /// task. The memory outranks the precondition, so one conflict the agent
+    /// declines to resolve, or one request it answered without submitting,
+    /// doesn't win every draw for as long as the forge reports it. An
+    /// unreadable listing neither stands the mark up nor draws the task:
     /// `remembered` fails open as usual, and the fail-closed precondition
     /// holds the task back on the same answer.
     #[test]
-    fn an_unreadable_pr_listing_holds_rebase_back() {
+    fn a_pr_skip_stands_until_its_pr_set_moves() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
-        cache.remember("rebase", ForgeKind::Github, "me/repo", "12@abc");
-        let probe = conflict_probe(&cache, None);
-        assert!(!probe.remembered("rebase", "me/repo"));
-        assert!(!probe.actionable("rebase", "me/repo"));
-    }
+        for task in ["rebase", "review"] {
+            cache.remember(task, ForgeKind::Github, "me/repo", "12@abc");
+            let probe = |prs| pr_probe(&cache, task, prs);
 
-    /// `review` is drawn only when someone has asked the bot for a review it
-    /// hasn't given, and like `rebase` an unreadable listing holds it back.
-    #[test]
-    fn review_is_drawn_only_when_a_review_is_requested() {
-        let root = tempfile::tempdir().unwrap();
-        let cache = cache(&root);
-        assert!(review_probe(&cache, Some(&["12@abc"])).actionable("review", "me/repo"));
-        assert!(!review_probe(&cache, Some(&[])).actionable("review", "me/repo"));
-        assert!(!review_probe(&cache, None).actionable("review", "me/repo"));
-    }
+            let same = probe(Some(&["12@abc"]));
+            assert!(same.remembered(task, "me/repo"), "{task}");
+            assert!(!same.actionable(task, "me/repo"), "{task}");
+            // A force-push moves the head.
+            assert!(
+                !probe(Some(&["12@def"])).remembered(task, "me/repo"),
+                "{task}"
+            );
+            // A second PR joins the set.
+            assert!(
+                !probe(Some(&["12@abc", "15@eee"])).remembered(task, "me/repo"),
+                "{task}"
+            );
+            // The set empties: the mark no longer stands, and the
+            // precondition holds the task back anyway.
+            assert!(!probe(Some(&[])).remembered(task, "me/repo"), "{task}");
 
-    /// A `review` skip is keyed on the request set: it stands while the set
-    /// sits still, and any move — a push to the branch, a new request, the
-    /// review being submitted — redraws the task. The memory outranks the
-    /// precondition, so a request the agent already answered for without
-    /// submitting doesn't win every draw.
-    #[test]
-    fn a_review_skip_stands_until_the_request_set_moves() {
-        let root = tempfile::tempdir().unwrap();
-        let cache = cache(&root);
-        cache.remember("review", ForgeKind::Github, "me/repo", "12@abc");
-
-        let same = review_probe(&cache, Some(&["12@abc"]));
-        assert!(same.remembered("review", "me/repo"));
-        assert!(!same.actionable("review", "me/repo"));
-        assert!(!review_probe(&cache, Some(&["12@def"])).remembered("review", "me/repo"));
-        assert!(!review_probe(&cache, Some(&["12@abc", "15@eee"])).remembered("review", "me/repo"));
-        assert!(!review_probe(&cache, Some(&[])).remembered("review", "me/repo"));
-
-        let unreadable = review_probe(&cache, None);
-        assert!(!unreadable.remembered("review", "me/repo"));
-        assert!(!unreadable.actionable("review", "me/repo"));
+            let unreadable = probe(None);
+            assert!(!unreadable.remembered(task, "me/repo"), "{task}");
+            assert!(!unreadable.actionable(task, "me/repo"), "{task}");
+        }
     }
 
     /// A task with no precondition of its own is drawn without any forge

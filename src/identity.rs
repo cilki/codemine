@@ -53,9 +53,7 @@ struct Entry {
 static ENTRIES: Mutex<BTreeMap<Key, Entry>> = Mutex::new(BTreeMap::new());
 
 fn entries() -> MutexGuard<'static, BTreeMap<Key, Entry>> {
-    ENTRIES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::sync::lock(&ENTRIES)
 }
 
 fn key(forge: &Forge) -> Key {
@@ -296,12 +294,8 @@ mod tests {
 
     fn forge(kind: ForgeKind, token: &str) -> Forge {
         Forge {
-            kind,
             token: token.into(),
-            login: String::new(),
-            email: String::new(),
-            url: "https://forge.example.com".into(),
-            repos: BTreeMap::new(),
+            ..Forge::test(kind, "https://forge.example.com")
         }
     }
 

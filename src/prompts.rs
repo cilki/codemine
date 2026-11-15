@@ -802,8 +802,7 @@ mod tests {
         let path = dir.path().join("opencode.json");
 
         install_mcp(dir.path(), true).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let config = read_json(&path).unwrap();
         assert_eq!(
             config["mcp"]["codegraph"]["command"],
             serde_json::json!(["codegraph", "serve", "--mcp"])
@@ -816,8 +815,7 @@ mod tests {
         )
         .unwrap();
         install_mcp(dir.path(), true).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let config = read_json(&path).unwrap();
         assert_eq!(config["theme"], "dark");
         assert_eq!(config["mcp"]["other"]["type"], "remote");
         assert_eq!(
@@ -846,16 +844,14 @@ mod tests {
             },
         )
         .unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let config = read_json(&path).unwrap();
         assert_eq!(
             config["provider"]["anthropic"]["options"]["apiKey"],
             UNUSED_API_KEY
         );
 
         install_provider(dir.path(), &proxy).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let config = read_json(&path).unwrap();
         assert_eq!(
             config["provider"]["anthropic"]["options"]["baseURL"],
             format!("{}/v1", crate::proxy::DEFAULT_BASE_URL)
@@ -880,8 +876,7 @@ mod tests {
         )
         .unwrap();
         install_provider(dir.path(), &proxy).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let config = read_json(&path).unwrap();
         assert_eq!(config["theme"], "dark");
         assert_eq!(config["provider"]["anthropic"]["options"]["apiKey"], "k1");
         assert!(config["provider"]["anthropic"]["options"]["stale"].is_null());
@@ -906,16 +901,14 @@ mod tests {
 
         // What a default-settings instance leaves behind.
         install_provider(dir.path(), &crate::settings::ProxySettings::default()).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let config = read_json(&path).unwrap();
         assert_eq!(
             config["provider"]["anthropic"]["options"]["baseURL"],
             format!("{}/v1", crate::proxy::DEFAULT_BASE_URL)
         );
 
         install_provider(dir.path(), &proxy).unwrap();
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let config = read_json(&path).unwrap();
         assert_eq!(
             config["provider"]["anthropic"]["options"]["baseURL"],
             "https://proxy.example:8317/v1"

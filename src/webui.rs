@@ -108,19 +108,23 @@ async fn index() -> Html<&'static str> {
 }
 
 /// The codemine emblem the page shows in place of a textual title.
-async fn emblem() -> impl IntoResponse {
-    (
-        [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
-        crate::emblem::SVG.as_str(),
-    )
+async fn emblem() -> Response {
+    svg(&crate::emblem::SVG)
 }
 
 /// The emblem's icon alone, as the tab favicon.
-async fn favicon() -> impl IntoResponse {
-    (
-        [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
-        crate::emblem::ICON.as_str(),
-    )
+async fn favicon() -> Response {
+    svg(&crate::emblem::ICON)
+}
+
+fn svg(body: &'static str) -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "image/svg+xml")], body).into_response()
+}
+
+/// An API refusal: the status with the reason as `{"error": …}`, which is
+/// the one shape the page knows how to show.
+fn error(status: StatusCode, reason: impl std::fmt::Display) -> Response {
+    (status, Json(json!({ "error": reason.to_string() }))).into_response()
 }
 
 /// The whole status, turn list included: nothing polls this, so the one-off
@@ -496,11 +500,7 @@ async fn api_put_settings(
             });
             Json(settings.redacted()).into_response()
         }
-        Err(err) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": format!("{err:#}") })),
-        )
-            .into_response(),
+        Err(err) => error(StatusCode::UNPROCESSABLE_ENTITY, format!("{err:#}")),
     }
 }
 
@@ -518,22 +518,14 @@ async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paus
         _ => 0,
     };
     if pgid <= 0 {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "no turn is running" })),
-        )
-            .into_response();
+        return error(StatusCode::CONFLICT, "no turn is running");
     }
     match crate::workspace::pause_group(pgid, incoming.paused) {
         Ok(()) => {
             Status::update(&state.status, |s| s.paused = incoming.paused);
             Json(json!({ "paused": incoming.paused })).into_response()
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{err:#}") })),
-        )
-            .into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
     }
 }
 
@@ -544,11 +536,7 @@ async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paus
 async fn api_post_cancel(State(state): State<AppState>) -> Response {
     let mut status = state.status.lock();
     if !matches!(status.activity, Activity::Running { .. }) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "no turn is running" })),
-        )
-            .into_response();
+        return error(StatusCode::CONFLICT, "no turn is running");
     }
     status.cancel_requested = true;
     Json(json!({ "canceled": true })).into_response()
@@ -582,11 +570,10 @@ fn repo_choices(listing: crate::turn::Listing, enabled: &BTreeSet<String>) -> BT
 async fn api_repos(State(state): State<AppState>) -> Response {
     let (settings, _) = state.settings.snapshot();
     let Some(forge) = settings.runtime_forge() else {
-        return (
+        return error(
             StatusCode::CONFLICT,
-            Json(json!({ "error": format!("{} is not configured", settings.forge.kind.name()) })),
-        )
-            .into_response();
+            format!("{} is not configured", settings.forge.kind.name()),
+        );
     };
     let kind = forge.kind;
     let enabled: BTreeSet<String> = forge.repos.keys().cloned().collect();
@@ -598,16 +585,8 @@ async fn api_repos(State(state): State<AppState>) -> Response {
             let repos = repo_choices(listing, &enabled);
             Json(json!({ "forge": kind.name(), "repos": repos })).into_response()
         }
-        Ok(Err(err)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": format!("{err:#}") })),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{err}") })),
-        )
-            .into_response(),
+        Ok(Err(err)) => error(StatusCode::BAD_GATEWAY, format!("{err:#}")),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
 
