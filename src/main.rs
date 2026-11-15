@@ -23,6 +23,7 @@ mod scan;
 mod schedule;
 mod settings;
 mod status;
+mod sync;
 mod turn;
 mod usage;
 mod webui;
@@ -1018,12 +1019,9 @@ mod tests {
     /// is what lands in the credential line's userinfo.
     fn forge(user: &str, token: &str) -> Forge {
         Forge {
-            kind: ForgeKind::Gitea,
             token: token.to_owned(),
             login: user.to_owned(),
-            email: String::new(),
-            url: "https://forge.example.com".to_owned(),
-            repos: std::collections::BTreeMap::new(),
+            ..Forge::test(ForgeKind::Gitea, "https://forge.example.com")
         }
     }
 

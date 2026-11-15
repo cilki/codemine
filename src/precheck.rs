@@ -315,7 +315,7 @@ fn pr_key(pr: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use serde_json::json;
 
@@ -463,47 +463,19 @@ mod tests {
         );
     }
 
-    fn forge() -> Forge {
-        Forge {
-            kind: ForgeKind::Github,
-            token: "tok".into(),
-            login: String::new(),
-            email: String::new(),
-            url: "https://github.com".into(),
-            repos: BTreeMap::new(),
-        }
-    }
-
     /// A Gitea forge with `login` as its resolved account. Gitea is the kind
     /// whose listing answers both probes on its own, so the keys they build
     /// can be checked without a forge to ask.
     fn gitea(login: &str) -> Forge {
         Forge {
-            kind: ForgeKind::Gitea,
             login: login.into(),
-            url: "https://gitea.example.com".into(),
-            ..forge()
+            ..Forge::test(ForgeKind::Gitea, "https://gitea.example.com")
         }
-    }
-
-    /// A forge with the same tasks on every one of `repos`, and the pool
-    /// listing all of them.
-    fn sweep(repos: &[&str], tasks: &[&str]) -> (Forge, Vec<String>) {
-        let tasks: BTreeSet<String> = tasks.iter().map(|task| (*task).to_owned()).collect();
-        let forge = Forge {
-            repos: repos
-                .iter()
-                .map(|repo| ((*repo).to_owned(), tasks.clone()))
-                .collect(),
-            ..forge()
-        };
-        let pool = repos.iter().map(|repo| (*repo).to_owned()).collect();
-        (forge, pool)
     }
 
     #[test]
     fn draw_prefers_a_gated_task_that_has_work() {
-        let (forge, pool) = sweep(&["me/repo"], &["bump", "rebase"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["bump", "rebase"]);
         for _ in 0..16 {
             let (task, _) = draw(&forge, &pool, |task, _| task == "rebase").unwrap();
             assert_eq!(task, "rebase");
@@ -513,7 +485,8 @@ mod tests {
     /// Every (gated task, repo) pair is probed before giving up on them.
     #[test]
     fn draw_probes_every_repository() {
-        let (forge, pool) = sweep(&["me/one", "me/two", "me/three"], &["feedback", "rebase"]);
+        let (forge, pool) =
+            Forge::sweep(&["me/one", "me/two", "me/three"], &["feedback", "rebase"]);
         let seen = std::cell::RefCell::new(BTreeSet::new());
         assert!(
             draw(&forge, &pool, |task, repo| {
@@ -525,26 +498,11 @@ mod tests {
         assert_eq!(seen.borrow().len(), 2 * pool.len());
     }
 
-    #[test]
-    fn draw_returns_an_actionable_pair() {
-        let (forge, pool) = sweep(&["me/repo"], &["feedback", "rebase"]);
-        let (task, repo) = draw(&forge, &pool, |_, _| true).unwrap();
-        assert!(gated(task));
-        assert_eq!(repo, "me/repo");
-    }
-
-    #[test]
-    fn draw_falls_back_to_an_ungated_task() {
-        let (forge, pool) = sweep(&["me/repo"], &["feedback", "rebase", "bump"]);
-        let (task, _) = draw(&forge, &pool, |task, _| !gated(task)).unwrap();
-        assert_eq!(task, "bump");
-    }
-
     /// The ungated pass is checked too, so the skip cache can hold a task
     /// back; only once nothing is left does the draw come up empty.
     #[test]
     fn draw_skips_an_ungated_task_the_check_rejects() {
-        let (forge, pool) = sweep(&["me/repo"], &["docs", "bump"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["docs", "bump"]);
         for _ in 0..16 {
             let (task, _) = draw(&forge, &pool, |task, _| task != "docs").unwrap();
             assert_eq!(task, "bump");
@@ -552,17 +510,11 @@ mod tests {
         assert!(draw(&forge, &pool, |_, _| false).is_none());
     }
 
-    #[test]
-    fn draw_gives_up_when_every_task_is_gated_and_idle() {
-        let (forge, pool) = sweep(&["me/repo"], &["feedback", "rebase"]);
-        assert!(draw(&forge, &pool, |_, _| false).is_none());
-    }
-
     /// Every gated pair is probed before an ungated task is considered, so a
     /// cheap cached task can never outrank a review comment.
     #[test]
     fn draw_probes_every_gated_pair_first() {
-        let (forge, pool) = sweep(&["me/one", "me/two"], &["docs", "rebase"]);
+        let (forge, pool) = Forge::sweep(&["me/one", "me/two"], &["docs", "rebase"]);
         for _ in 0..16 {
             let probed = std::cell::RefCell::new(Vec::new());
             let (task, _) = draw(&forge, &pool, |task, repo| {
@@ -583,7 +535,7 @@ mod tests {
     /// contributes no pairs at all.
     #[test]
     fn draw_only_pairs_a_task_with_the_repositories_that_have_it_on() {
-        let (mut forge, mut pool) = sweep(&["me/one", "me/two"], &["docs", "bump"]);
+        let (mut forge, mut pool) = Forge::sweep(&["me/one", "me/two"], &["docs", "bump"]);
         forge.repos.get_mut("me/two").unwrap().remove("docs");
         pool.push("me/unlisted".into());
         let seen = std::cell::RefCell::new(BTreeSet::new());

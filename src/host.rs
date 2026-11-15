@@ -70,9 +70,7 @@ static MEMORY: Mutex<Option<System>> = Mutex::new(None);
 /// Total and available RAM in bytes.
 fn memory() -> (u64, u64) {
     let ram = MemoryRefreshKind::nothing().with_ram();
-    let mut cached = MEMORY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cached = crate::sync::lock(&MEMORY);
     let system = match &mut *cached {
         // A freshly built System carries its first reading already.
         Some(system) => {
@@ -117,7 +115,7 @@ const CPU_WINDOW: Duration = Duration::from_millis(500);
 
 /// Busy time as a percentage of all CPU time since the previous reading.
 fn cpu_usage() -> f32 {
-    let mut cached = CPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cached = crate::sync::lock(&CPU);
     // The first call has no previous reading to diff against, so the figure
     // it gets is busy time since boot — the host's average rather than this
     // moment's, but a figure, and the next snapshot two seconds later
@@ -222,9 +220,7 @@ static DISKS: Mutex<Option<Listed<Disks, PathBuf>>> = Mutex::new(None);
 /// leaves out the root reserve.
 fn disk_info(path: &Path) -> (u64, u64) {
     let storage = DiskRefreshKind::nothing().with_storage();
-    let mut cached = DISKS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cached = crate::sync::lock(&DISKS);
     chosen(
         &mut cached,
         path.to_path_buf(),
@@ -258,9 +254,7 @@ static SENSORS: Mutex<Option<Listed<Components, ()>>> = Mutex::new(None);
 /// The CPU's temperature in degrees Celsius; None when the host exposes no
 /// sensor to read it from.
 fn cpu_temp() -> Option<f32> {
-    let mut cached = SENSORS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cached = crate::sync::lock(&SENSORS);
     let (components, index) = chosen(
         &mut cached,
         (),
@@ -327,9 +321,7 @@ mod tests {
         // Both readings are live, and a busy host's CPU can move several
         // degrees between them, so the figures themselves aren't compared;
         // what must not differ is which sensor was read.
-        let cached = SENSORS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = crate::sync::lock(&SENSORS);
         let remembered = cached
             .as_ref()
             .and_then(|sensors| sensors.chosen.map(|at| &sensors.list[at]));

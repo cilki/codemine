@@ -675,32 +675,13 @@ mod tests {
     use crate::config::{Forge, ForgeKind};
     use crate::events::Pending;
 
-    /// A GitHub forge with the same tasks on every one of `repos`, and the
-    /// pool listing all of them.
-    fn sweep(repos: &[&str], tasks: &[&str]) -> (Forge, Vec<String>) {
-        let tasks: std::collections::BTreeSet<String> =
-            tasks.iter().map(|task| (*task).to_owned()).collect();
-        let forge = Forge {
-            kind: ForgeKind::Github,
-            token: "tok".into(),
-            login: String::new(),
-            email: String::new(),
-            url: "https://github.com".into(),
-            repos: repos
-                .iter()
-                .map(|repo| ((*repo).to_owned(), tasks.clone()))
-                .collect(),
-        };
-        let pool = repos.iter().map(|repo| (*repo).to_owned()).collect();
-        (forge, pool)
-    }
-
     /// Fresh activity is drawn whether or not the window is open, and
     /// `review` asks before `feedback`.
     #[test]
     fn a_queued_repository_is_drawn_inside_and_outside_the_window() {
         for draw in [Draw::Any, Draw::QueuedOnly] {
-            let (forge, pool) = sweep(&["me/one", "me/two"], &["review", "feedback", "rebase"]);
+            let (forge, pool) =
+                Forge::sweep(&["me/one", "me/two"], &["review", "feedback", "rebase"]);
             let pending = Pending::new();
             pending.push(ForgeKind::Github, "me/two".into());
             let picked = pick(&forge, &pool, &pending, draw, |_, _| true);
@@ -713,7 +694,7 @@ mod tests {
     /// queued the pass draws nothing, and probes nothing either.
     #[test]
     fn off_hours_takes_no_automatic_turn() {
-        let (forge, pool) = sweep(&["me/repo"], &["review", "feedback", "rebase"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback", "rebase"]);
         let pending = Pending::new();
         let probed = std::cell::Cell::new(0);
         let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| {
@@ -729,7 +710,7 @@ mod tests {
     /// is not consulted. Inside the window it is.
     #[test]
     fn a_handled_queue_entry_falls_through_to_the_draw_only_inside_the_window() {
-        let (forge, pool) = sweep(&["me/repo"], &["review", "feedback", "rebase"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback", "rebase"]);
         let queued_only = |task: &str, _: &str| crate::events::QUEUED_TASKS.contains(&task);
 
         let pending = Pending::new();
@@ -753,7 +734,7 @@ mod tests {
     /// forge since switched, or the repository left the pool.
     #[test]
     fn stale_queue_entries_are_dropped() {
-        let (forge, pool) = sweep(&["me/repo"], &["review", "feedback"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback"]);
         let pending = Pending::new();
         pending.push(ForgeKind::Gitea, "me/repo".into());
         pending.push(ForgeKind::Github, "me/gone".into());

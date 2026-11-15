@@ -73,9 +73,7 @@ impl Pending {
     }
 
     fn lock(&self) -> MutexGuard<'_, VecDeque<(ForgeKind, String)>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::sync::lock(&self.inner)
     }
 }
 

@@ -96,12 +96,12 @@ pub fn models(proxy: &crate::settings::ProxySettings) -> Vec<String> {
 /// the fetch, so concurrent callers may both fetch live — both results came
 /// from opencode, either is fine to keep.
 fn listing() -> Vec<String> {
-    if let Some(models) = &*lock(&MODELS) {
+    if let Some(models) = &*crate::sync::lock(&MODELS) {
         return models.clone();
     }
     let models = available_models();
     if !models.is_empty() {
-        *lock(&MODELS) = Some(models.clone());
+        *crate::sync::lock(&MODELS) = Some(models.clone());
     }
     models
 }
@@ -110,17 +110,7 @@ fn listing() -> Vec<String> {
 /// a Claude login lands, which typically turns an empty or anthropic-less
 /// listing into a full one.
 pub fn invalidate_models() {
-    *lock(&MODELS) = None;
-}
-
-/// A poison-tolerant lock: the cache is a plain value, so a panicking holder
-/// can't leave it inconsistent.
-fn lock(
-    models: &'static Mutex<Option<Vec<String>>>,
-) -> std::sync::MutexGuard<'static, Option<Vec<String>>> {
-    models
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    *crate::sync::lock(&MODELS) = None;
 }
 
 /// The models straight from `opencode models`: the exact provider/model IDs
@@ -242,6 +232,39 @@ impl Forge {
                 env
             }
         }
+    }
+}
+
+/// The forges the tests build: every test module used to spell out the same
+/// six fields to get one.
+#[cfg(test)]
+impl Forge {
+    /// A `kind` forge at `url` with the token `tok`, an account nothing has
+    /// resolved yet, and no repositories enabled.
+    pub fn test(kind: ForgeKind, url: &str) -> Forge {
+        Forge {
+            kind,
+            token: "tok".into(),
+            login: String::new(),
+            email: String::new(),
+            url: url.into(),
+            repos: BTreeMap::new(),
+        }
+    }
+
+    /// A GitHub forge with the same tasks on every one of `repos`, and the
+    /// draw pool listing all of them.
+    pub fn sweep(repos: &[&str], tasks: &[&str]) -> (Forge, Vec<String>) {
+        let tasks: BTreeSet<String> = tasks.iter().map(|task| (*task).to_owned()).collect();
+        let forge = Forge {
+            repos: repos
+                .iter()
+                .map(|repo| ((*repo).to_owned(), tasks.clone()))
+                .collect(),
+            ..Forge::test(ForgeKind::Github, "https://github.com")
+        };
+        let pool = repos.iter().map(|repo| (*repo).to_owned()).collect();
+        (forge, pool)
     }
 }
 
@@ -456,14 +479,7 @@ mod tests {
 
     #[test]
     fn forge_env_hosts() {
-        let forge = |kind, url: &str| Forge {
-            kind,
-            token: "tok".into(),
-            login: String::new(),
-            email: String::new(),
-            url: url.into(),
-            repos: BTreeMap::new(),
-        };
+        let forge = Forge::test;
         assert!(
             forge(ForgeKind::Gitea, "https://git.example.com")
                 .env()
