@@ -15,6 +15,7 @@ mod events;
 mod host;
 mod http;
 mod identity;
+mod ledger;
 mod opencode;
 mod precheck;
 mod prompts;
@@ -91,6 +92,9 @@ fn main() -> Result<()> {
     let ledger = Arc::new(deliveries::Deliveries::load(
         cli.workspace.join("deliveries.json"),
     ));
+    // What every pair has yielded and when it last ran, which weighs the
+    // draw among the pairs the cache lets through.
+    let weights = ledger::Ledger::load(cli.workspace.join("ledger.json"));
     let status = Shared::new();
     // The stored limit, from here on kept current by the web UI's settings
     // edits, which are the only way the settings change.
@@ -259,7 +263,9 @@ fn main() -> Result<()> {
         // Ask what became of the PRs and issues earlier turns opened, the
         // ones not asked about within the hour; nothing at all most passes.
         ledger.settle(&cfg.forge, status::epoch_now());
-        match turn::run(&cfg, &opencode, &status, &pending, &cache, &ledger, draw) {
+        match turn::run(
+            &cfg, &opencode, &status, &pending, &cache, &ledger, &weights, draw,
+        ) {
             // An off-hours pass whose queued activity turned out to be
             // handled already (or on a repository since disabled) says
             // nothing about the pool: it never drew from it. Straight back

@@ -22,21 +22,23 @@ pub const PR_LIMIT: usize = 20;
 /// tasks are probed first, in a shuffled order, and the first pair with work
 /// wins, so responsive work (a conflicting PR, a review comment, a review
 /// request) is never waiting on a lucky draw. Only once nothing is pending do
-/// the rest get their turn, as one shuffled pass over every remaining pair:
-/// `check` waves most of them straight through, so this is the uniform draw
-/// it used to be, but a pair the skip cache has already answered for is
-/// passed over instead of drawn. The cache applies to the gated pass too —
-/// every gated task is probed out of the same state its memory is keyed on —
-/// so a gated task can no longer monopolize the draw on a precondition that
-/// stays true. None when nothing at all is worth a turn.
+/// the rest get their turn, as one pass over every remaining pair in an
+/// order drawn by `weigh`: a pair is placed ahead of another with the odds
+/// their weights give it, so a heavier pair is more likely — never certain —
+/// to go first. `check` waves most of them straight through, but a pair the
+/// skip cache has already answered for is passed over instead of drawn. The
+/// cache applies to the gated pass too — every gated task is probed out of
+/// the same state its memory is keyed on — so a gated task can no longer
+/// monopolize the draw on a precondition that stays true. None when nothing
+/// at all is worth a turn.
 pub fn draw<'a>(
     forge: &'a Forge,
     pool: &'a [String],
     check: impl Fn(&str, &str) -> bool,
+    weigh: impl Fn(&str, &str) -> f64,
 ) -> Option<(&'a str, &'a str)> {
-    let candidates = |want_gated: bool| {
-        let mut candidates: Vec<(&'a str, &'a str)> = pool
-            .iter()
+    let candidates = |want_gated: bool| -> Vec<(&'a str, &'a str)> {
+        pool.iter()
             .flat_map(|repo| {
                 forge
                     .repos
@@ -46,11 +48,12 @@ pub fn draw<'a>(
                     .filter(|task| gated(task) == want_gated)
                     .map(move |task| (task.as_str(), repo.as_str()))
             })
-            .collect();
-        fastrand::shuffle(&mut candidates);
-        candidates
+            .collect()
     };
-    for (task, repo) in candidates(true).into_iter().chain(candidates(false)) {
+    let mut gated_pairs = candidates(true);
+    fastrand::shuffle(&mut gated_pairs);
+    let ungated = weighted_order(candidates(false), |(task, repo)| weigh(task, repo));
+    for (task, repo) in gated_pairs.into_iter().chain(ungated) {
         if check(task, repo) {
             return Some((task, repo));
         }
@@ -63,6 +66,29 @@ pub fn draw<'a>(
         }
     }
     None
+}
+
+/// `items` in a random order where each is placed with the odds its weight
+/// gives it: a weighted sample without replacement, taken all at once by
+/// keying every item with `u^(1/w)` for a uniform `u` and sorting the keys
+/// down (Efraimidis and Spirakis). The whole order is wanted, not just the
+/// first item, because the caller walks it until `check` accepts one; an
+/// order makes that one pass where a redraw per rejected item would not.
+/// A weight that isn't positive keys as 0, which lands the item last.
+fn weighted_order<T>(items: Vec<T>, weight: impl Fn(&T) -> f64) -> Vec<T> {
+    let mut keyed: Vec<(f64, T)> = items
+        .into_iter()
+        .map(|item| {
+            let weight = weight(&item);
+            let key = match weight > 0.0 {
+                true => fastrand::f64().powf(1.0 / weight),
+                false => 0.0,
+            };
+            (key, item)
+        })
+        .collect();
+    keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
+    keyed.into_iter().map(|(_, item)| item).collect()
 }
 
 /// One GET against a forge's API, through whichever CLI speaks it: `tea` has
@@ -716,11 +742,105 @@ mod tests {
         }
     }
 
+    /// A draw with every pair weighted alike, which is the uniform draw the
+    /// tests below were written against.
+    fn uniform<'a>(
+        forge: &'a Forge,
+        pool: &'a [String],
+        check: impl Fn(&str, &str) -> bool,
+    ) -> Option<(&'a str, &'a str)> {
+        draw(forge, pool, check, |_, _| 1.0)
+    }
+
+    /// The weights decide the ungated order: a pair weighted so far above
+    /// the rest that its key rounds to 1 comes first every time, and a pair
+    /// weighted at nothing comes last.
+    #[test]
+    fn draw_takes_the_ungated_pairs_in_weighted_order() {
+        let (forge, pool) = Forge::sweep(&["me/one", "me/two", "me/three"], &["docs"]);
+        for _ in 0..64 {
+            let probed = std::cell::RefCell::new(Vec::new());
+            assert!(
+                draw(
+                    &forge,
+                    &pool,
+                    |_, repo| {
+                        probed.borrow_mut().push(repo.to_owned());
+                        false
+                    },
+                    |_, repo| match repo {
+                        "me/one" => 1e300,
+                        "me/two" => 1.0,
+                        _ => 0.0,
+                    },
+                )
+                .is_none()
+            );
+            let probed = probed.borrow();
+            assert_eq!(*probed, ["me/one", "me/two", "me/three"]);
+        }
+    }
+
+    /// A heavier pair is more likely to go first, not certain to: the order
+    /// is still a draw, so a lighter pair gets its turn now and then.
+    #[test]
+    fn a_lighter_pair_is_still_drawn_sometimes() {
+        let (forge, pool) = Forge::sweep(&["me/heavy", "me/light"], &["docs"]);
+        let mut light_first = 0;
+        for _ in 0..512 {
+            let (_, repo) = draw(
+                &forge,
+                &pool,
+                |_, _| true,
+                |_, repo| if repo == "me/heavy" { 3.0 } else { 1.0 },
+            )
+            .unwrap();
+            if repo == "me/light" {
+                light_first += 1;
+            }
+        }
+        // Expected one in four; the bounds are many standard deviations
+        // out, so the test is about the shape of the draw and not its seed.
+        assert!((40..=220).contains(&light_first), "{light_first}");
+    }
+
+    /// The gated pass is not weighted: every gated pair is probed before
+    /// any ungated one however the weights fall.
+    #[test]
+    fn weights_do_not_reach_the_gated_pass() {
+        let (forge, pool) = Forge::sweep(&["me/one", "me/two"], &["docs", "rebase"]);
+        for _ in 0..16 {
+            let probed = std::cell::RefCell::new(Vec::new());
+            let (task, _) = draw(
+                &forge,
+                &pool,
+                |task, repo| {
+                    probed.borrow_mut().push(format!("{task} {repo}"));
+                    task == "docs"
+                },
+                |task, _| if task == "docs" { 1e6 } else { 0.0 },
+            )
+            .unwrap();
+            assert_eq!(task, "docs");
+            let probed = probed.borrow();
+            assert_eq!(probed.len(), 3, "{probed:?}");
+            assert!(probed[..2].iter().all(|entry| entry.starts_with("rebase")));
+        }
+    }
+
+    #[test]
+    fn weighted_order_keeps_every_item_and_sinks_weightless_ones() {
+        let order = weighted_order(vec![0.0, 2.0, -1.0, 5.0, 1.0], |w| *w);
+        assert_eq!(order.len(), 5);
+        assert!(order[3..].iter().all(|w| *w <= 0.0), "{order:?}");
+        assert!(weighted_order(Vec::<f64>::new(), |w| *w).is_empty());
+    }
+
     #[test]
     fn draw_prefers_a_gated_task_that_has_work() {
         let (forge, pool) = Forge::sweep(&["me/repo"], &["bump", "rebase"]);
         for _ in 0..16 {
-            let (task, _) = draw(&forge, &pool, |task, _| task == "rebase").unwrap();
+            let (task, _) = uniform(&forge, &pool, |task, _| task == "rebase").unwrap();
             assert_eq!(task, "rebase");
         }
     }
@@ -731,7 +851,7 @@ mod tests {
         let (forge, pool) = Forge::sweep(&["me/one", "me/two", "me/three"], &["respond", "rebase"]);
         let seen = std::cell::RefCell::new(BTreeSet::new());
         assert!(
-            draw(&forge, &pool, |task, repo| {
+            uniform(&forge, &pool, |task, repo| {
                 seen.borrow_mut().insert(format!("{task} {repo}"));
                 false
             })
@@ -746,10 +866,10 @@ mod tests {
     fn draw_skips_an_ungated_task_the_check_rejects() {
         let (forge, pool) = Forge::sweep(&["me/repo"], &["docs", "bump"]);
         for _ in 0..16 {
-            let (task, _) = draw(&forge, &pool, |task, _| task != "docs").unwrap();
+            let (task, _) = uniform(&forge, &pool, |task, _| task != "docs").unwrap();
             assert_eq!(task, "bump");
         }
-        assert!(draw(&forge, &pool, |_, _| false).is_none());
+        assert!(uniform(&forge, &pool, |_, _| false).is_none());
     }
 
     /// Every gated pair is probed before an ungated task is considered, so a
@@ -759,7 +879,7 @@ mod tests {
         let (forge, pool) = Forge::sweep(&["me/one", "me/two"], &["docs", "rebase"]);
         for _ in 0..16 {
             let probed = std::cell::RefCell::new(Vec::new());
-            let (task, _) = draw(&forge, &pool, |task, repo| {
+            let (task, _) = uniform(&forge, &pool, |task, repo| {
                 probed.borrow_mut().push(format!("{task} {repo}"));
                 task == "docs"
             })
@@ -782,7 +902,7 @@ mod tests {
         pool.push("me/unlisted".into());
         let seen = std::cell::RefCell::new(BTreeSet::new());
         assert!(
-            draw(&forge, &pool, |task, repo| {
+            uniform(&forge, &pool, |task, repo| {
                 seen.borrow_mut().insert(format!("{task} {repo}"));
                 false
             })
