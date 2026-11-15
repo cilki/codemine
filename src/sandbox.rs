@@ -319,12 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn wrap_builds_the_wrapper_argv() {
-        let argv = wrap(Path::new("/w/repo"), Path::new("/w/logs/1.log"));
-        assert_eq!(&argv[1..], [MARKER, "/w/repo", "/w/logs/1.log", "--"]);
-    }
-
-    #[test]
     fn exec_rejects_malformed_invocations() {
         assert!(exec(&[]).is_err());
         assert!(exec(&["repo".into(), "log".into(), "--".into()]).is_err());

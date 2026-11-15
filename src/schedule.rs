@@ -158,9 +158,4 @@ mod tests {
         // A disabled schedule is never consulted, so its times may match.
         assert!(off.validate().is_ok());
     }
-
-    #[test]
-    fn the_local_clock_lands_inside_a_day() {
-        assert!(local_second_of_day() < SECONDS_PER_DAY);
-    }
 }

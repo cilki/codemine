@@ -151,25 +151,70 @@ fn cpu_usage() -> f32 {
     sample.usage
 }
 
-/// The host's mounts, and which of them holds the workspace. Process wide
-/// like `CPU` and `SENSORS`, and for the same reason: listing the mounts
-/// walks `/proc/mounts` and `statvfs`es every entry on it, and every open
-/// event stream asks for the same one filesystem's figures on its own tick.
-/// Only the chosen mount is ever re-read, so a host with thirty of them
-/// costs no more than one with a single root.
-static DISKS: Mutex<Option<Volumes>> = Mutex::new(None);
-
-struct Volumes {
-    disks: Disks,
-    /// Where in `disks` the mount holding `for_path` sits, settled when the
-    /// list was built; None when no mount claims it.
+/// A sysinfo listing kept across calls, and which one entry of it the page
+/// is shown. Process wide like `CPU`, and for the same reason: every open
+/// event stream asks for the same one figure on its own tick, and both
+/// halves of the work are wasted on repeat. Listing the mounts walks
+/// `/proc/mounts` and `statvfs`es every entry on it; listing the sensors
+/// walks `/sys/class/hwmon` and reads every one's name, label, and
+/// thresholds, and reading them all out costs a file read each — some of
+/// them, an NVMe drive's among them, served by the device rather than the
+/// kernel and slow in proportion. Only the chosen entry is ever re-read, so
+/// a host with thirty mounts or a dozen drive sensors costs no more than
+/// one with a single root and none.
+struct Listed<L, K> {
+    list: L,
+    /// Where in `list` the entry sits, settled when the list was built; None
+    /// when nothing in it qualifies.
     chosen: Option<usize>,
-    /// The path `chosen` was picked for, so a snapshot of some other
-    /// directory can't be answered with this one's filesystem.
-    for_path: PathBuf,
+    /// What `chosen` was picked for, so an ask about something else — a
+    /// snapshot of a directory on another filesystem — isn't answered with
+    /// this one's entry.
+    key: K,
     /// When the list itself was built, as opposed to re-read.
     listed: Instant,
 }
+
+/// The listing in `slot` and the index of its chosen entry, re-reading that
+/// one entry in place while the list stands, and rebuilding the list —
+/// which carries its first reading already — once it has stood `LIST_TTL`
+/// or was built for another `key`. `build` is the listing and the pick made
+/// off it; None from it, or no entry chosen, is None here.
+fn chosen<L, K: PartialEq>(
+    slot: &mut Option<Listed<L, K>>,
+    key: K,
+    build: impl FnOnce() -> Option<(L, Option<usize>)>,
+    reread: impl FnOnce(&mut L, usize),
+) -> Option<(&L, usize)> {
+    // Decided before the slot is borrowed for the answer: a borrow taken in
+    // the match itself would have to outlive the insert in the other arm.
+    let stands = slot
+        .as_ref()
+        .is_some_and(|listed| listed.listed.elapsed() < LIST_TTL && listed.key == key);
+    let listed = match stands {
+        true => {
+            // Standing, so there is one in the slot.
+            let listed = slot.as_mut()?;
+            if let Some(index) = listed.chosen {
+                reread(&mut listed.list, index);
+            }
+            listed
+        }
+        false => {
+            let (list, chosen) = build()?;
+            slot.insert(Listed {
+                list,
+                chosen,
+                key,
+                listed: Instant::now(),
+            })
+        }
+    };
+    Some((&listed.list, listed.chosen?))
+}
+
+/// The host's mounts, and which of them holds the workspace.
+static DISKS: Mutex<Option<Listed<Disks, PathBuf>>> = Mutex::new(None);
 
 /// Size and free space of the filesystem `path` lives on, in bytes — the
 /// mount closest to it, since every ancestor's filesystem also "holds" it.
@@ -180,33 +225,20 @@ fn disk_info(path: &Path) -> (u64, u64) {
     let mut cached = DISKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let volumes = match &mut *cached {
-        Some(volumes) if volumes.listed.elapsed() < LIST_TTL && volumes.for_path == path => {
-            // A freshly built list carries its first reading already; a
-            // standing one needs the chosen mount measured again.
-            if let Some(index) = volumes.chosen {
-                volumes.disks[index].refresh_specifics(storage);
-            }
-            volumes
-        }
-        _ => {
-            let Ok(disks) = Disks::new_with_refreshed_list_specifics(storage) else {
-                return (0, 0);
-            };
+    chosen(
+        &mut cached,
+        path.to_path_buf(),
+        || {
+            let disks = Disks::new_with_refreshed_list_specifics(storage).ok()?;
             let chosen = choose_mount(&disks, path);
-            cached.insert(Volumes {
-                disks,
-                chosen,
-                for_path: path.to_path_buf(),
-                listed: Instant::now(),
-            })
-        }
-    };
-    let Some(index) = volumes.chosen else {
-        return (0, 0);
-    };
-    let disk = &volumes.disks[index];
-    (disk.total_space(), disk.available_space())
+            Some((disks, chosen))
+        },
+        |disks, index| {
+            disks[index].refresh_specifics(storage);
+        },
+    )
+    .map(|(disks, index)| (disks[index].total_space(), disks[index].available_space()))
+    .unwrap_or((0, 0))
 }
 
 /// Which of the host's mounts holds `path`: the one closest to it, since
@@ -220,25 +252,8 @@ fn choose_mount(disks: &Disks, path: &Path) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-/// The host's sensors, and which of them the page is shown, kept across
-/// calls. Process wide like `CPU`: every open event stream asks for a
-/// temperature on its own tick, and both halves of the work are wasted on
-/// repeat. Listing the sensors walks `/sys/class/hwmon` and reads every
-/// one's name, label, and thresholds, and reading them all out costs a file
-/// read each — some of them, an NVMe drive's among them, served by the
-/// device rather than the kernel and slow in proportion.
-static SENSORS: Mutex<Option<Sensors>> = Mutex::new(None);
-
-struct Sensors {
-    components: Components,
-    /// Where in `components` the sensor that speaks for the CPU sits,
-    /// settled when the list was built; None when the host exposes no
-    /// readable sensor at all. Only this one is ever read again, so a host
-    /// with a dozen drive sensors costs no more than one with none.
-    chosen: Option<usize>,
-    /// When the list itself was built, as opposed to re-read.
-    listed: Instant,
-}
+/// The host's sensors, and which of them speaks for the CPU.
+static SENSORS: Mutex<Option<Listed<Components, ()>>> = Mutex::new(None);
 
 /// The CPU's temperature in degrees Celsius; None when the host exposes no
 /// sensor to read it from.
@@ -246,27 +261,17 @@ fn cpu_temp() -> Option<f32> {
     let mut cached = SENSORS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let sensors = match &mut *cached {
-        Some(sensors) if sensors.listed.elapsed() < LIST_TTL => {
-            // A freshly built list carries its first reading already; a
-            // standing one needs the chosen sensor read out again.
-            if let Some(index) = sensors.chosen {
-                sensors.components[index].refresh();
-            }
-            sensors
-        }
-        _ => {
+    let (components, index) = chosen(
+        &mut cached,
+        (),
+        || {
             let components = Components::new_with_refreshed_list().ok()?;
             let chosen = choose_sensor(&components);
-            cached.insert(Sensors {
-                components,
-                chosen,
-                listed: Instant::now(),
-            })
-        }
-    };
-    let index = sensors.chosen?;
-    sensors.components[index].temperature()
+            Some((components, chosen))
+        },
+        |components, index| components[index].refresh(),
+    )?;
+    components[index].temperature()
 }
 
 /// Label fragments that mark a sensor as the CPU's, best first: a
@@ -327,7 +332,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let remembered = cached
             .as_ref()
-            .and_then(|sensors| sensors.chosen.map(|at| &sensors.components[at]));
+            .and_then(|sensors| sensors.chosen.map(|at| &sensors.list[at]));
         assert_eq!(
             scanned.map(Component::label),
             remembered.map(Component::label),
