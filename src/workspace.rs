@@ -39,12 +39,12 @@ pub fn git_credentials(workspace: &Path) -> PathBuf {
 /// A `git` the runner runs itself, in `cwd`, with the clone's own `.git`
 /// metadata disarmed.
 ///
-/// The assigned clone is the one place the Landlock ruleset lets the agent
-/// write, so by the time the next turn comes to update it, everything under
-/// its `.git` is whatever the last turn left behind — and the runner, unlike
-/// the agent, is not inside the sandbox. git treats a repository's hooks and
-/// local config as code, which makes a plain `git` of the runner's own in
-/// that directory the shortest way out of the confinement:
+/// The assigned clone is the agent's to write, so by the time the next turn
+/// comes to update it, everything under its `.git` is whatever the last turn
+/// left behind. git treats a repository's hooks and local config as code,
+/// which makes a plain `git` of the runner's own in that directory the
+/// shortest way for the agent to run something as the runner, outside any
+/// turn:
 ///
 /// * `.git/hooks/post-checkout` runs on the `checkout` below, and
 ///   `.git/hooks/reference-transaction` on every ref the `fetch` moves.
@@ -417,8 +417,8 @@ fn quote(value: &str) -> String {
 /// left alone rather than silently thrown away.
 ///
 /// Branch names are the agent's, so none of them is spelled out to git as a
-/// bare word. `refs/heads` sits inside the assigned clone — the one place
-/// the Landlock ruleset lets the agent write — and git reads a ref written
+/// bare word. `refs/heads` sits inside the assigned clone — the agent's to
+/// write — and git reads a ref written
 /// straight into it whatever it is called, including names no `git branch`
 /// would create: `git update-ref refs/heads/-x HEAD` makes a branch called
 /// `-x`. Passed positionally that name was an option rather than a branch
@@ -939,8 +939,8 @@ mod tests {
     /// work pushed since, which makes one branch stopping it the worst thing
     /// that can happen to it. A ref named like an option used to: no `git
     /// branch` will create `-x`, but git reads one written straight into
-    /// `refs/heads` — and `refs/heads` is inside the clone, the one place
-    /// the sandbox lets the agent write. Passed positionally the name was a
+    /// `refs/heads` — and `refs/heads` is inside the clone, which is the
+    /// agent's to write. Passed positionally the name was a
     /// flag rather than a branch, and since `-` sorts ahead of the
     /// characters branches normally start with, the command failed before a
     /// single real branch had been brought forward.
@@ -994,8 +994,8 @@ mod tests {
     }
 
     /// The clone is the agent's to write, so its `.git` is whatever the last
-    /// turn left there — and the runner updating it next turn is outside the
-    /// sandbox. None of the three things git would otherwise run out of a
+    /// turn left there — and the runner updating it next turn runs as itself,
+    /// outside any turn. None of the three things git would otherwise run out of a
     /// repository may run: the hooks `update`'s own commands fire, the
     /// `core.fsmonitor` command every index read consults, and a
     /// `credential.helper` that would be handed the forge token.

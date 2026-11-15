@@ -15,7 +15,6 @@ cilki = { version = "0.2", features = [
   "terminal-graphics",
 ] }
 fastrand = "2"
-landlock = "0.4"
 libc = "0.2"
 # Only the blocking client, and rustls without its default provider: the
 # default pulls aws-lc-rs, whose build wants cmake, while `ring` builds with

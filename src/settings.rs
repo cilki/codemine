@@ -321,7 +321,6 @@ impl Settings {
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             schedule: self.schedule,
             workspace: cli.workspace.clone(),
-            sandbox: cli.sandbox,
         })
     }
 

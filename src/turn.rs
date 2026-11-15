@@ -75,8 +75,7 @@ struct Turn<'a> {
     task: &'a str,
     forge: &'a Forge,
     repo: &'a str,
-    /// The repository's persistent clone: the agent's working directory, and
-    /// the only place the write sandbox opens up.
+    /// The repository's persistent clone: the agent's working directory.
     dir: PathBuf,
     /// The turn's log under `<workspace>/logs`, which the page tails while
     /// the turn runs and serves in full once it is over.
@@ -349,22 +348,18 @@ fn answered_state(cfg: &Config, turn: &Turn, probe: &cache::Probe) -> Option<Str
     }
 }
 
-/// Start the agent on the turn. With `--sandbox` it runs inside the Landlock
-/// write sandbox so it cannot work from any checkout other than the assigned
-/// clone; otherwise whatever runs codemine (a container) is the boundary.
+/// Start the agent on the turn. codemine confines nothing itself: whatever
+/// runs it (a container, a VM, a dedicated user) is the boundary, and it is
+/// up to the deployment to draw one.
 fn spawn_agent(
     cfg: &Config,
     opencode: &crate::opencode::Version,
     turn: &Turn,
     log: &File,
 ) -> Result<Child> {
-    let mut argv = match cfg.sandbox {
-        true => crate::sandbox::wrap(&turn.dir, &turn.log_path),
-        false => Vec::new(),
-    };
-    argv.extend(["opencode", "run"].map(String::from));
-    // Which flags keep the session inside the sandbox and pre-approved
-    // depends on the opencode: see `Version::run_flags`.
+    let mut argv: Vec<String> = ["opencode", "run"].map(String::from).into();
+    // Which flags keep the session private and pre-approved depends on the
+    // opencode: see `Version::run_flags`.
     argv.extend(opencode.run_flags().iter().map(|flag| flag.to_string()));
     argv.extend(["--model", &cfg.model].map(String::from));
     // One argument, so a clone path with spaces in it stays whole.
@@ -390,8 +385,7 @@ fn spawn_agent(
         .env("RTK_TELEMETRY_DISABLED", "1")
         // Headless runs auto-reject permission prompts, so every tool the
         // agent needs has to be pre-approved (on 2.x `--auto` is the
-        // fallback). The sandbox (Landlock with `--sandbox`, else the
-        // container) is the real boundary, and
+        // fallback). Whatever runs codemine is the real boundary, and
         // legitimate work (cargo's registry, tool caches) lives outside the
         // clone, so opencode's own external-directory gate stays open too.
         .env(
@@ -583,9 +577,9 @@ fn listed_repo(row: &serde_json::Value, field: &str) -> Option<(String, bool)> {
 }
 
 /// Whether a forge-reported name is safe to use as the path it is treated as
-/// everywhere downstream: a directory under the workspace root (which the
-/// Landlock ruleset then opens for writing, and which a reclone wipes first),
-/// a segment of a forge API URL, and a segment of the clone URL. The name
+/// everywhere downstream: a directory under the workspace root (which a
+/// reclone wipes first), a segment of a forge API URL, and a segment of the
+/// clone URL. The name
 /// comes from whatever the forge's listing says, so it is remote input; a
 /// `..` in it would put all three outside where they belong.
 ///
@@ -919,9 +913,9 @@ mod tests {
         assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
     }
 
-    /// A repository name is a path component, a URL segment, and a Landlock
-    /// write root, so anything that could escape the workspace has to be
-    /// rejected before it gets that far.
+    /// A repository name is a path component and a URL segment, so anything
+    /// that could escape the workspace has to be rejected before it gets
+    /// that far.
     #[test]
     fn unsafe_repo_names_are_rejected() {
         for repo in [

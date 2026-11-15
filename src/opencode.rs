@@ -9,8 +9,9 @@
 //!
 //! An opencode that can't say its version is an incomplete install: the
 //! runner can't know which flags would work, and guessing wrong either fails
-//! every turn or — on 2.x without `--standalone` — runs the agent outside the
-//! sandbox. So no turn runs until it can.
+//! every turn or — on 2.x without `--standalone` — hands the agent to a
+//! shared service that sees none of the turn's setup. So no turn runs until
+//! it can.
 
 use std::process::Command;
 use std::sync::OnceLock;
@@ -34,9 +35,9 @@ impl Version {
     /// The flags `opencode run` takes, ahead of `--model` and the prompt.
     ///
     /// 2.x hands a session to a shared background service unless told
-    /// otherwise, and that service's tools run outside the Landlock ruleset
-    /// and see none of the forge auth or git identity the turn sets up, so
-    /// `--standalone` asks for a private server started inside the sandbox.
+    /// otherwise, and that service's tools see none of the forge auth or git
+    /// identity the turn sets up, so `--standalone` asks for a private
+    /// server started by this run.
     /// `--auto` backs up `OPENCODE_PERMISSION`: approve whatever it doesn't
     /// explicitly deny, should this opencode ignore the variable.
     ///

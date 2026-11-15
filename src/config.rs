@@ -260,16 +260,13 @@ pub struct Config {
     /// Root of the persistent workspace where repositories stay cloned across
     /// turns.
     pub workspace: PathBuf,
-    /// Whether the agent runs inside the Landlock write sandbox.
-    pub sandbox: bool,
 }
 
-pub const USAGE: &str = "usage: codemine [--listen ADDR] [--workspace DIR] [--once] [--sandbox]
+pub const USAGE: &str = "usage: codemine [--listen ADDR] [--workspace DIR] [--once]
 
   --listen ADDR     bind address for the web UI (default 0.0.0.0:8080)
   --workspace DIR   persistent workspace root (default ~/.codemine)
   --once            run a single turn and exit
-  --sandbox         confine the agent's writes with Landlock (which also forbids every mount)
   --help            show this help";
 
 /// Command-line options; everything else is configured through the web UI
@@ -278,11 +275,6 @@ pub struct Cli {
     pub listen: SocketAddr,
     pub workspace: PathBuf,
     pub once: bool,
-    /// Run the agent inside the Landlock write sandbox (see `sandbox`). Off
-    /// by default: in a container the container is already the boundary, and
-    /// Landlock forbids mount(2) outright, which breaks any build that mounts
-    /// (an overlayfs, a loop device) however privileged the container is.
-    pub sandbox: bool,
 }
 
 impl Cli {
@@ -293,7 +285,6 @@ impl Cli {
             listen: SocketAddr::from(([0, 0, 0, 0], 8080)),
             workspace: default_workspace(),
             once: false,
-            sandbox: false,
         };
         let mut args = args.skip(1);
         while let Some(arg) = args.next() {
@@ -313,7 +304,6 @@ impl Cli {
                     cli.workspace = PathBuf::from(value);
                 }
                 "--once" => cli.once = true,
-                "--sandbox" => cli.sandbox = true,
                 "--help" | "-h" => return Ok(None),
                 other => bail!("unknown argument: {other}\n{USAGE}"),
             }
@@ -332,8 +322,7 @@ pub fn home() -> PathBuf {
 /// `home()`'s decision, taken apart from the environment so it can be tested
 /// without mutating it. An empty value counts as no value: taken literally it
 /// yields a relative path, and every path the runner derives from home —
-/// opencode's config directory, the sandbox's write allowlist, the default
-/// workspace — would then mean whatever directory the runner happens to be
+/// opencode's config directory, the default workspace — would then mean whatever directory the runner happens to be
 /// in rather than a fixed place on disk.
 fn home_of(var: Option<std::ffi::OsString>) -> PathBuf {
     var.filter(|home| !home.is_empty())
@@ -368,7 +357,6 @@ mod tests {
         assert_eq!(cli.listen, "0.0.0.0:8080".parse().unwrap());
         assert!(cli.workspace.ends_with(".codemine"));
         assert!(!cli.once);
-        assert!(!cli.sandbox);
     }
 
     #[test]
@@ -379,14 +367,12 @@ mod tests {
             "--workspace",
             "/tmp/ws",
             "--once",
-            "--sandbox",
         ])
         .unwrap()
         .unwrap();
         assert_eq!(cli.listen, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(cli.workspace, PathBuf::from("/tmp/ws"));
         assert!(cli.once);
-        assert!(cli.sandbox);
     }
 
     #[test]

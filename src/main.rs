@@ -17,7 +17,6 @@ mod opencode;
 mod precheck;
 mod prompts;
 mod proxy;
-mod sandbox;
 mod savings;
 mod scan;
 mod schedule;
@@ -46,13 +45,6 @@ use crate::status::{Activity, Shared, Status};
 use crate::turn::{Draw, Idle, Report};
 
 fn main() -> Result<()> {
-    // The hidden sandbox wrapper mode the turn runner spawns opencode
-    // through; on success it execs the wrapped command and never returns.
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some(sandbox::MARKER) {
-        return sandbox::exec(&args[2..]);
-    }
-
     let Some(mut cli) = Cli::parse(std::env::args())? else {
         // The emblem above the usage text, in block letters in the project
         // color. Nothing is drawn when the output is a pipe or a file, or when
@@ -565,10 +557,9 @@ fn setup(cli: &mut Cli) -> Result<File> {
     // do not all agree with `config::home()` when `$HOME` is unset — which is
     // how a systemd unit without `User=` runs. `tea` then keeps the forge
     // login in `/.config/tea`, at the filesystem root, while opencode's
-    // config directory, the agent's caches and the sandbox's write allowlist
-    // are all built from `/root`: the agent can read that login but Landlock
-    // denies writing it, and it sits outside the workspace that is supposed
-    // to hold everything durable.
+    // config directory and the agent's caches are all built from `/root`:
+    // the login then sits outside the workspace that is supposed to hold
+    // everything durable.
     // SAFETY: setup() runs before the web UI and agent threads exist, so no
     // other thread can be touching the environment.
     unsafe { std::env::set_var("HOME", config::home()) };
