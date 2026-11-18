@@ -210,7 +210,13 @@ pub fn run(
         });
     }
 
-    let state = answered_state(cfg, &turn, &probe);
+    // Whatever this task's answer depends on, read before the agent runs and
+    // can move it: the default-branch commit, the notification stamp before
+    // any of the feed is marked read, the conflicting PRs or review requests
+    // before a force-push or a submitted review. It is the same reading the
+    // draw compares a remembered skip against, memoized if the draw already
+    // took it. Best-effort: without it the task is simply drawn again.
+    let state = probe.state(task, repo);
     let mut child = spawn_agent(cfg, opencode, &turn, &log)?;
     // Now that the group exists, let the web UI pause and resume it.
     Status::update(status, |s| {
@@ -319,33 +325,6 @@ fn open_log(logs_dir: &Path, started: u64) -> Result<(PathBuf, File)> {
         .open(&path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     Ok((path, log))
-}
-
-/// Whatever this task's answer depends on, read before the agent runs: the
-/// commit it is about to read, taken while the clone is still on a clean
-/// default branch — after the turn it could be sitting on whatever branch the
-/// agent left behind — the notification stamp it is about to read, taken
-/// before the agent marks any of the feed read, or the conflicting PRs or
-/// review requests it is about to look at, taken before any force-push or
-/// submitted review of its own moves them (the probe memoized them when it
-/// answered the draw). A task that skips is remembered against it.
-/// Best-effort: without it the task is simply drawn again next time.
-fn answered_state(cfg: &Config, turn: &Turn, probe: &cache::Probe) -> Option<String> {
-    match cache::basis(turn.task)? {
-        cache::Basis::Head => match workspace::head_sha(&cfg.workspace, &turn.dir) {
-            Ok(head) => Some(head),
-            Err(err) => {
-                warn!(
-                    "failed to read {}'s head commit: {err:#}",
-                    turn.dir.display()
-                );
-                None
-            }
-        },
-        cache::Basis::Feed | cache::Basis::Prs | cache::Basis::Reviews => {
-            probe.state(turn.task, turn.repo)
-        }
-    }
 }
 
 /// Start the agent on the turn. codemine confines nothing itself: whatever

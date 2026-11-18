@@ -496,14 +496,6 @@ pub fn clear_clones(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The commit the clone is checked out at, which the skip cache remembers an
-/// empty turn against for the tasks that read the tree.
-pub fn head_sha(workspace: &Path, dir: &Path) -> Result<String> {
-    Ok(git_stdout(workspace, dir, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_owned())
-}
-
 /// Stdout of a git command that is run for its answer rather than its
 /// effect; anything but a clean exit is an error, carrying what git said
 /// about it — `reset_local_config` and `update` both fail the turn through
