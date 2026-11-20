@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use tracing::warn;
 use wait_timeout::ChildExt;
 
-use crate::config::{Config, Forge, ForgeKind};
+use crate::config::{Forge, ForgeKind};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(600);
 const CODEGRAPH_SYNC_TIMEOUT: Duration = Duration::from_secs(600);
@@ -175,22 +175,21 @@ pub fn hold(workspace: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// Make the repository's clone exist, current, and indexed, and return its
-/// directory. A broken clone is thrown away and recloned; codegraph is
+/// Make the repository's clone at `dir` (its [`repo_dir`]) exist, current,
+/// and indexed. A broken clone is thrown away and recloned; codegraph is
 /// best-effort and never fails the turn.
-pub fn prepare(cfg: &Config, forge: &Forge, repo: &str, log: &File) -> Result<PathBuf> {
-    let dir = repo_dir(&cfg.workspace, forge.kind.name(), repo);
+pub fn prepare(workspace: &Path, forge: &Forge, repo: &str, dir: &Path, log: &File) -> Result<()> {
     let url = clone_url(forge, repo);
     if dir.join(".git").exists() {
-        if let Err(err) = update(&cfg.workspace, &url, &dir, log) {
+        if let Err(err) = update(workspace, &url, dir, log) {
             warn!("update of {} failed ({err:#}); recloning", dir.display());
-            reclone(&cfg.workspace, &url, &dir, log)?;
+            reclone(workspace, &url, dir, log)?;
         }
     } else {
-        reclone(&cfg.workspace, &url, &dir, log)?;
+        reclone(workspace, &url, dir, log)?;
     }
-    codegraph(&dir, log);
-    Ok(dir)
+    codegraph(dir, log);
+    Ok(())
 }
 
 /// Where a repository is cloned from. The runner builds it from the forge's

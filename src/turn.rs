@@ -196,7 +196,7 @@ pub fn run(
 
     // A failed preparation (deleted repository, network blip, ...) fails the
     // turn, not the runner.
-    if let Err(err) = workspace::prepare(cfg, forge, repo, &log) {
+    if let Err(err) = workspace::prepare(&cfg.workspace, forge, repo, &turn.dir, &log) {
         let elapsed = turn.elapsed();
         let tail = read_tail(&mut log, 64 * 1024)?;
         warn!(
@@ -236,12 +236,11 @@ pub fn run(
     // completed turn changed something and a turn that failed, timed out, or
     // was cancelled never got to answer. A turn that died preparing returned
     // above without touching the memory: it never read `state`, so it has
-    // nothing to say about whether the old mark still stands.
-    if cache::basis(task).is_some() {
-        match (outcome, &state) {
-            (Outcome::Skipped, Some(state)) => cache.remember(task, forge.kind, repo, state),
-            _ => cache.forget(task, forge.kind, repo),
-        }
+    // nothing to say about whether the old mark still stands. A task that
+    // keeps no memory has no `state` and nothing remembered to forget.
+    match (outcome, &state) {
+        (Outcome::Skipped, Some(state)) => cache.remember(task, forge.kind, repo, state),
+        _ => cache.forget(task, forge.kind, repo),
     }
 
     turn.finish(status, &tail, outcome, elapsed, spent);

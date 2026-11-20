@@ -74,6 +74,11 @@ fn main() -> Result<()> {
     // drawn again until that moves.
     let cache = cache::Cache::load(cli.workspace.join("skips.json"));
     let status = Shared::new();
+    // The stored limit, from here on kept current by the web UI's settings
+    // edits, which are the only way the settings change.
+    Status::update(&status, |s| {
+        s.allowance.set_limit(store.snapshot().0.rate_limit)
+    });
     let addr = webui::spawn(
         cli.listen,
         status.clone(),
@@ -200,14 +205,11 @@ fn main() -> Result<()> {
         };
 
         // Ask the rate limit whether its window has room for another
-        // completed task. The window is the one in the shared status, which
-        // the web UI sets the limit of too — see `status::Window` — so an
+        // completed task. The window is the one in the shared status, whose
+        // limit the web UI sets on every edit — see `status::Window` — so an
         // edit applies to the completions on record at once.
         let now = status::epoch_now();
-        let hold = Status::update(&status, |s| {
-            s.allowance.set_limit(cfg.rate_limit);
-            s.allowance.hold(now)
-        });
+        let hold = status.lock().allowance.hold(now);
         if let Some(left) = hold {
             Status::update(&status, |s| {
                 s.activity = Activity::RateLimited { until: now + left }
