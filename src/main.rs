@@ -134,6 +134,9 @@ fn main() -> Result<()> {
             }
         };
         let (settings, generation) = store.snapshot();
+        // Whether the settings were edited since this pass read them, which
+        // cuts every wait below short so the edit applies at once.
+        let edited = || store.generation() != generation;
         let mut problems = settings.problems();
         // Set after a turn died on proxy auth: a short flat pause, since
         // refreshing is CLIProxyAPI's continuous job and anything it can't fix
@@ -197,9 +200,7 @@ fn main() -> Result<()> {
                 // so a widened window applies at once instead of at the end
                 // of the hold — and by forge activity, which may run off
                 // hours.
-                wait(closed.min(60), 1, || {
-                    store.generation() != generation || !pending.is_empty()
-                });
+                wait(closed.min(60), 1, || edited() || !pending.is_empty());
                 continue;
             }
         };
@@ -218,7 +219,7 @@ fn main() -> Result<()> {
             // Sleep in slices and fall back into the loop, cut short by an
             // edit, so a limit raised in the web UI applies at once instead
             // of at the end of the wait.
-            wait(left.min(60), 1, || store.generation() != generation);
+            wait(left.min(60), 1, edited);
             continue;
         }
 
@@ -247,7 +248,7 @@ fn main() -> Result<()> {
                     // re-reading the settings costs nothing. Sliced and
                     // cut short by an edit, so a corrected enabled set
                     // applies at once.
-                    wait(POOL_RETRY, 5, || store.generation() != generation);
+                    wait(POOL_RETRY, 5, edited);
                 }
                 None => {
                     // Said once, not once per pass: this answer stands until
@@ -256,9 +257,7 @@ fn main() -> Result<()> {
                         info!("{NOTHING_TO_DO}");
                     }
                     idle_draws = idle_draws.saturating_add(1);
-                    sleep(&cli, None, &status, &pending, Some(idle_draws), || {
-                        store.generation() != generation
-                    });
+                    sleep(&cli, None, &status, &pending, Some(idle_draws), edited);
                 }
             },
             Ok(Report::Ran { verdict, canceled }) => {
@@ -298,9 +297,7 @@ fn main() -> Result<()> {
                 // holds, since retrying early just burns the next turn on the
                 // same limit.
                 if !canceled || verdict.usage_limit.is_some() {
-                    sleep(&cli, verdict.usage_limit, &status, &pending, None, || {
-                        store.generation() != generation
-                    });
+                    sleep(&cli, verdict.usage_limit, &status, &pending, None, edited);
                 }
             }
             // A failing turn (bad token, unreachable forge, ...) must not
@@ -309,9 +306,7 @@ fn main() -> Result<()> {
                 idle_draws = 0;
                 error!("turn failed: {err:#}");
                 Status::update(&status, |s| s.log_tail = format!("turn failed: {err:#}"));
-                sleep(&cli, None, &status, &pending, None, || {
-                    store.generation() != generation
-                });
+                sleep(&cli, None, &status, &pending, None, edited);
             }
         }
         if cli.once {
