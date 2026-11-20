@@ -120,9 +120,10 @@ pub struct TurnRecord {
 /// search or filter it.
 const HISTORY: usize = 200;
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Activity {
+    #[default]
     Starting,
     /// The settings aren't runnable yet; the web UI marks the fields that
     /// need filling in.
@@ -190,6 +191,10 @@ pub enum Activity {
 /// has to land there and then, not at the next turn boundary. Since the
 /// window only ever reads the completion times against whatever limit is
 /// current, an edit is nothing more than swapping the limit.
+///
+/// The default is no completions and no limit; a restart starts there, so
+/// nothing that ran before it counts.
+#[derive(Default)]
 pub struct Window {
     /// Completion epochs, oldest first, kept as far back as the widest
     /// window a limit may span — recorded under no limit too, so a limit set
@@ -228,15 +233,6 @@ impl Serialize for Window {
 }
 
 impl Window {
-    /// No completions yet and no limit; a restart starts here, so nothing
-    /// that ran before it counts.
-    pub fn new() -> Window {
-        Window {
-            completions: VecDeque::new(),
-            limit: None,
-        }
-    }
-
     /// Check against `limit` from now on. Nothing is carried over or handed
     /// out: a raised limit or a narrowed window lets turns through as soon
     /// as the completions on record allow it, a lowered one holds them.
@@ -303,7 +299,7 @@ pub struct Totals {
     pub rtk: Savings,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct Status {
     pub activity: Activity,
     /// Whether the running turn's process tree is currently SIGSTOPped
@@ -351,17 +347,7 @@ impl Shared {
     /// A fresh status, with no subscribers yet.
     pub fn new() -> Shared {
         Shared {
-            status: Arc::new(Mutex::new(Status {
-                activity: Activity::Starting,
-                paused: false,
-                cancel_requested: false,
-                allowance: Window::new(),
-                totals: Totals::default(),
-                turns: VecDeque::new(),
-                turns_revision: 0,
-                log_tail: String::new(),
-                oauth_gated_until: None,
-            })),
+            status: Arc::default(),
             changes: watch::channel(0).0,
         }
     }
@@ -518,7 +504,7 @@ mod tests {
     const HOUR: u64 = 3600;
 
     fn limited(tasks: u32, hours: u32) -> Window {
-        let mut window = Window::new();
+        let mut window = Window::default();
         window.set_limit(Some(RateLimit { tasks, hours }));
         window
     }
@@ -580,7 +566,7 @@ mod tests {
     /// unlimited stretch holds for what actually ran inside its window.
     #[test]
     fn completions_without_a_limit_still_count_once_one_is_set() {
-        let mut window = Window::new();
+        let mut window = Window::default();
         for at in [0, 60, 120] {
             window.record(at);
         }
@@ -595,7 +581,7 @@ mod tests {
     /// alone for weeks doesn't grow the list without end.
     #[test]
     fn completions_older_than_any_window_are_forgotten() {
-        let mut window = Window::new();
+        let mut window = Window::default();
         let horizon = u64::from(MAX_WINDOW_HOURS) * HOUR;
         for at in 0..100 {
             window.record(at * HOUR);

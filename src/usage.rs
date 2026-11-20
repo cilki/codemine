@@ -142,11 +142,10 @@ impl Sampler {
         ) else {
             return;
         };
-        let mut sum = self.sum.clone().unwrap_or_default();
-        if let Some(added) = added {
+        // A cursor is only ever set alongside a sum, so there is one to add to.
+        if let (Some(sum), Some(added)) = (&mut self.sum, added) {
             sum.add(&added);
         }
-        self.sum = Some(sum);
         self.cursor = Some((path.to_owned(), reached));
     }
 

@@ -6,8 +6,6 @@
 //! quiet hours with `TZ` (or the container's `/etc/localtime`) and thinks in
 //! wall-clock time.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -76,10 +74,7 @@ impl Schedule {
 
 /// Seconds past midnight in the process's timezone.
 pub fn local_second_of_day() -> u32 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::status::epoch_now();
     let time = now as libc::time_t;
     // The zone comes from $TZ (or /etc/localtime), which libc loads on the
     // first conversion and keeps; a deployment sets it once at startup.
