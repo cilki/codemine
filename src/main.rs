@@ -28,9 +28,7 @@ mod usage;
 mod webui;
 mod workspace;
 
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::File;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -486,7 +484,7 @@ fn runnable(
         .map_err(|err| vec![Problem::new("f-token", format!("{err:#}"))])?;
 
     if *applied_generation != Some(generation) {
-        apply_forge_auth(cli, &cfg).map_err(|err| {
+        apply_forge_auth(cli, &cfg.forge).map_err(|err| {
             vec![Problem::new(
                 "",
                 format!("failed to apply forge auth: {err:#}"),
@@ -657,18 +655,11 @@ fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
 /// Let git and tea authenticate to the configured forge; re-run whenever
 /// the settings change so a new token, URL, or forge takes effect on the
 /// next turn.
-fn apply_forge_auth(cli: &Cli, cfg: &Config) -> Result<()> {
-    let forge = &cfg.forge;
-    let credentials = credential_line(forge);
-    let path = workspace::git_credentials(&cli.workspace);
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("failed to write {}", path.display()))?
-        .write_all(credentials.as_bytes())?;
+fn apply_forge_auth(cli: &Cli, forge: &Forge) -> Result<()> {
+    workspace::write_private(
+        &workspace::git_credentials(&cli.workspace),
+        credential_line(forge).as_bytes(),
+    )?;
 
     // Log tea in so its commands work without further setup; gh and glab need
     // no login because the runner passes GITHUB_TOKEN and GITLAB_TOKEN to
@@ -889,6 +880,7 @@ fn iso8601(epoch: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     /// The config the runner hands every git it spawns, `opencode`'s
@@ -999,6 +991,40 @@ mod tests {
         );
         assert!(answer.contains("username=bot\n"), "{answer}");
         assert!(answer.contains("password=s3cret\n"), "{answer}");
+    }
+
+    /// The credential store holds the forge token, so it ends up owner-only
+    /// however it was left: a store some other hand made world-readable is
+    /// narrowed on the next write, not rewritten in place at its old mode.
+    #[test]
+    fn the_credential_store_is_rewritten_owner_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cli = Cli::parse(
+            [
+                "codemine",
+                "--workspace",
+                &workspace.path().display().to_string(),
+            ]
+            .map(String::from)
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        let store = workspace::git_credentials(&cli.workspace);
+        std::fs::write(&store, "stale\n").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // GitHub, so no `tea login` is attempted.
+        let mut forge = Forge::test(ForgeKind::Github, "https://github.com");
+        forge.token = "s3cret".to_owned();
+        apply_forge_auth(&cli, &forge).unwrap();
+
+        let mode = std::fs::metadata(&store).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        assert_eq!(
+            std::fs::read_to_string(&store).unwrap(),
+            credential_line(&forge)
+        );
     }
 
     /// A Gitea forge, whose credential user is the account login, so `user`

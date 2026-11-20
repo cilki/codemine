@@ -80,23 +80,33 @@ fn git_in(workspace: &Path, cwd: &Path) -> Command {
     command
 }
 
-/// Atomically write `value` as pretty JSON: the state the runner keeps at the
-/// workspace root (the settings and the skip cache) and the opencode config it
-/// maintains all go through here. The temp file is created next to the target
-/// so the rename can't cross filesystems, and it carries `tempfile`'s
-/// owner-only mode — which is what keeps the forge tokens in `config.json`
-/// and the proxy key in `opencode.json` out of reach of other local users.
-pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+/// Atomically replace `path` with `contents`, owner-only: every file the
+/// runner writes that holds a secret or that git reads as code goes through
+/// here — the settings, the skip cache, the opencode config, the credential
+/// store, and a clone's rebuilt `.git/config`. The temp file is created next
+/// to the target so the rename can't cross filesystems, and it carries
+/// `tempfile`'s owner-only mode whatever the file it replaces had — which is
+/// what keeps the forge tokens and the proxy key out of reach of other local
+/// users. Replaced whole, a crash mid-write leaves the old file, never half
+/// of the new one.
+pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     private_dir(parent)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.write_all(b"\n")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to write under {}", parent.display()))?;
+    file.write_all(contents)?;
     file.persist(path)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// Atomically write `value` as pretty JSON, owner-only; see [`write_private`].
+pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let mut json = serde_json::to_vec_pretty(value)?;
+    json.push(b'\n');
+    write_private(path, &json)
 }
 
 /// Create a directory of the workspace, owner-only, narrowing an existing one
@@ -346,14 +356,7 @@ fn reset_local_config(workspace: &Path, dir: &Path, url: &str) -> Result<()> {
         .collect();
     // Replaced whole, so a crash mid-rebuild can't leave a clone describing
     // itself as something it isn't.
-    let git_dir = dir.join(".git");
-    let mut file = tempfile::NamedTempFile::new_in(&git_dir)
-        .with_context(|| format!("failed to write under {}", git_dir.display()))?;
-    file.write_all(config_text(url, &kept).as_bytes())?;
-    let path = git_dir.join("config");
-    file.persist(&path)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
+    write_private(&dir.join(".git/config"), config_text(url, &kept).as_bytes())
 }
 
 /// The rebuilt config as git config text: the runner's own keys plus the
