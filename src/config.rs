@@ -273,9 +273,6 @@ impl Forge {
 pub struct Config {
     pub forge: Forge,
     pub model: String,
-    /// At most this many completed (not skipped) tasks in any rolling
-    /// window; None is unlimited.
-    pub rate_limit: Option<crate::settings::RateLimit>,
     pub author_name: String,
     pub turn_timeout: Duration,
     /// The daily window automatic turns may start in.

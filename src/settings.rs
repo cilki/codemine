@@ -314,7 +314,6 @@ impl Settings {
                 .runtime_forge()
                 .expect("a forge without problems is active"),
             model: self.model.clone(),
-            rate_limit: self.rate_limit,
             // Commits are attributed to the model that authored them; the
             // email comes from each forge's account via identity::resolve.
             author_name: model_author_name(&self.model),
