@@ -248,7 +248,7 @@ const API_TIMEOUT_SECS: u64 = 30;
 /// One GET against the Gitea API; `tea` has no generic api subcommand, so it
 /// goes over HTTP directly like the proxy's management calls do.
 pub fn gitea_json(forge: &Forge, path: &str) -> Result<serde_json::Value> {
-    let url = format!("{}/api/v1/{path}", forge.url.trim_end_matches('/'));
+    let url = format!("{}/api/v1/{path}", forge.url);
     let auth = format!("token {}", forge.token);
     let (status, body) = crate::http::get(
         &url,

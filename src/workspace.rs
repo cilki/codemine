@@ -197,7 +197,7 @@ pub fn prepare(workspace: &Path, forge: &Forge, repo: &str, dir: &Path, log: &Fi
 /// it back out of the clone, which is also what lets the clone's `origin`
 /// be rebuilt from nothing — see [`reset_local_config`].
 fn clone_url(forge: &Forge, repo: &str) -> String {
-    format!("{}/{repo}", forge.url.trim_end_matches('/'))
+    format!("{}/{repo}", forge.url)
 }
 
 /// Clone into `dir`, first clearing any half-created or broken leftovers.

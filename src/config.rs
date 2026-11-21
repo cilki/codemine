@@ -217,17 +217,14 @@ impl Forge {
                         .url
                         .split_once("://")
                         .map_or(self.url.as_str(), |(_, rest)| rest);
-                    env.push(("GH_HOST".to_owned(), host.trim_end_matches('/').to_owned()));
+                    env.push(("GH_HOST".to_owned(), host.to_owned()));
                 }
                 env
             }
             ForgeKind::Gitlab => {
                 let mut env = vec![("GITLAB_TOKEN".to_owned(), self.token.clone())];
                 if self.url != "https://gitlab.com" {
-                    env.push((
-                        "GITLAB_HOST".to_owned(),
-                        self.url.trim_end_matches('/').to_owned(),
-                    ));
+                    env.push(("GITLAB_HOST".to_owned(), self.url.clone()));
                 }
                 env
             }
@@ -473,7 +470,7 @@ mod tests {
             [("GITHUB_TOKEN".to_owned(), "tok".to_owned())]
         );
         assert_eq!(
-            forge(ForgeKind::Github, "https://github.example.com/").env(),
+            forge(ForgeKind::Github, "https://github.example.com").env(),
             [
                 ("GITHUB_TOKEN".to_owned(), "tok".to_owned()),
                 ("GH_HOST".to_owned(), "github.example.com".to_owned()),

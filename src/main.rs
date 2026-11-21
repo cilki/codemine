@@ -477,9 +477,7 @@ fn runnable(
             format!("failed to point opencode at the proxy: {err:#}"),
         )]
     })?;
-    let mut cfg = settings
-        .to_config(cli)
-        .expect("settings without problems are runnable");
+    let mut cfg = settings.to_config(cli);
 
     // Cached, so resolving is a map lookup on every pass but the first.
     // Errors are returned rather than logged here: the caller logs whatever

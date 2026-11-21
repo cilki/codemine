@@ -153,9 +153,11 @@ impl ForgeSettings {
         !self.token.is_empty() && (self.kind != ForgeKind::Gitea || !self.url.is_empty())
     }
 
+    /// The stored URL, normalized again since a hand-edited config.json
+    /// skips `apply_update`, else the forge's default instance.
     fn url(&self) -> String {
         if !self.url.is_empty() {
-            return self.url.clone();
+            return normalize_url(&self.url);
         }
         match self.kind {
             ForgeKind::Gitea => String::new(),
@@ -304,12 +306,11 @@ impl Settings {
         problems
     }
 
-    /// The runnable snapshot for a turn; None while `problems` is nonempty.
-    pub fn to_config(&self, cli: &Cli) -> Option<Config> {
-        if !self.problems().is_empty() {
-            return None;
-        }
-        Some(Config {
+    /// The runnable snapshot for a turn. Only for settings whose `problems`
+    /// came back empty, which the main loop has already asked by the time it
+    /// gets here.
+    pub fn to_config(&self, cli: &Cli) -> Config {
+        Config {
             forge: self
                 .runtime_forge()
                 .expect("a forge without problems is active"),
@@ -320,7 +321,7 @@ impl Settings {
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             schedule: self.schedule,
             workspace: cli.workspace.clone(),
-        })
+        }
     }
 
     /// The settings as JSON for the UI, with each secret replaced by a
@@ -516,20 +517,19 @@ mod tests {
         assert!(settings.forge.repos.is_empty());
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
         assert_eq!(fields, ["f-token", "s-model"]);
-        assert!(settings.to_config(&cli()).is_none());
     }
 
     #[test]
     fn the_schedule_is_off_until_it_is_turned_on() {
         let settings = configured();
         assert!(!settings.schedule.enabled);
-        assert_eq!(settings.to_config(&cli()).unwrap().schedule.hold(0), None);
+        assert_eq!(settings.to_config(&cli()).schedule.hold(0), None);
 
         let mut scheduled = configured();
         scheduled.schedule.enabled = true;
         scheduled.schedule.start_minute = 22 * 60;
         scheduled.schedule.end_minute = 6 * 60;
-        let config = scheduled.to_config(&cli()).unwrap();
+        let config = scheduled.to_config(&cli());
         assert_eq!(config.schedule.hold(23 * 3600), None);
         assert_eq!(config.schedule.hold(12 * 3600), Some(10 * 3600));
     }
@@ -538,7 +538,7 @@ mod tests {
     fn configured_settings_build_a_config() {
         let settings = configured();
         assert!(settings.problems().is_empty());
-        let config = settings.to_config(&cli()).unwrap();
+        let config = settings.to_config(&cli());
         assert_eq!(config.forge.kind, ForgeKind::Github);
         assert_eq!(config.forge.url, "https://github.com");
         assert_eq!(config.forge.credential_user(), "x-access-token");
@@ -566,7 +566,7 @@ mod tests {
             .repos
             .insert("owner/repo".into(), repo(true, &["lint", "docs"]));
         assert!(settings.problems().is_empty());
-        let config = settings.to_config(&cli()).unwrap();
+        let config = settings.to_config(&cli());
         assert_eq!(config.forge.repos["owner/repo"], ["docs".to_owned()].into());
         // The stored picks are left alone, so a hand-edited config.json isn't
         // rewritten behind the user's back.
@@ -581,7 +581,6 @@ mod tests {
             .insert("owner/repo".into(), repo(true, &["lint"]));
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
         assert_eq!(fields, ["repos"]);
-        assert!(settings.to_config(&cli()).is_none());
     }
 
     /// A disabled repository is out of the sweep whatever tasks it has
@@ -593,7 +592,7 @@ mod tests {
             .forge
             .repos
             .insert("owner/other".into(), repo(false, &["docs"]));
-        let config = settings.to_config(&cli()).unwrap();
+        let config = settings.to_config(&cli());
         assert!(!config.forge.repos.contains_key("owner/other"));
         assert!(!config.forge.runs("docs", "owner/other"));
 
@@ -626,7 +625,6 @@ mod tests {
         settings.proxy.management_key = String::new();
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
         assert!(fields.is_empty(), "{fields:?}");
-        assert!(settings.to_config(&cli()).is_some());
     }
 
     #[test]
@@ -669,11 +667,10 @@ mod tests {
         settings.forge.kind = ForgeKind::Gitea;
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
         assert_eq!(fields, ["f-url"]);
-        assert!(settings.to_config(&cli()).is_none());
 
         settings.forge.url = "https://git.example.com".into();
         assert!(settings.problems().is_empty());
-        let config = settings.to_config(&cli()).unwrap();
+        let config = settings.to_config(&cli());
         assert_eq!(config.forge.url, "https://git.example.com");
         // Gitea's credential user is the login, read off the forge later.
         assert_eq!(config.forge.credential_user(), "");
@@ -687,7 +684,6 @@ mod tests {
         settings.forge.repos.clear();
         let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
         assert_eq!(fields, ["repos"], "{fields:?}");
-        assert!(settings.to_config(&cli()).is_none());
 
         // The problem is the forge's, not the repositories', while there is
         // no token: nothing can be listed to enable yet.
@@ -709,6 +705,12 @@ mod tests {
         settings.apply_update(incoming).unwrap();
         assert_eq!(settings.forge.url, "https://github.example.com");
         assert_eq!(settings.proxy.base_url, "http://box:9000");
+
+        // A hand-edited config.json never went through `apply_update`, so
+        // the runtime forge every consumer appends to is normalized too.
+        settings.forge.url = "https://github.example.com/".into();
+        let forge = settings.runtime_forge().unwrap();
+        assert_eq!(forge.url, "https://github.example.com");
 
         // The scheme is required of both too, and the message names which
         // one is wrong.
