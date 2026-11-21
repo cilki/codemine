@@ -42,12 +42,12 @@ pub struct Host {
 /// `workspace` picks the filesystem the disk figures describe; everything
 /// else is the host as a whole.
 pub fn snapshot(workspace: &Path) -> Host {
-    let (mem_total, mem_available) = memory();
+    let (cpu_usage, mem_total, mem_available) = cpu_and_memory();
     let (disk_total, disk_available) = disk_info(workspace);
     Host {
         hostname: System::host_name().unwrap_or_default(),
         ip: local_ip(),
-        cpu_usage: cpu_usage(),
+        cpu_usage,
         mem_total,
         mem_available,
         temp_c: cpu_temp(),
@@ -61,30 +61,6 @@ pub fn snapshot(workspace: &Path) -> Host {
 /// so a mount or a sensor that appears or disappears is still noticed.
 const LIST_TTL: Duration = Duration::from_secs(60);
 
-/// The System the memory figures are read through, kept across calls:
-/// constructing one is itself a reading, so a fresh one per snapshot pays
-/// for sysinfo's setup on top of the `/proc/meminfo` parse it is actually
-/// after.
-static MEMORY: Mutex<Option<System>> = Mutex::new(None);
-
-/// Total and available RAM in bytes.
-fn memory() -> (u64, u64) {
-    let ram = MemoryRefreshKind::nothing().with_ram();
-    let mut cached = crate::sync::lock(&MEMORY);
-    let system = match &mut *cached {
-        // A freshly built System carries its first reading already.
-        Some(system) => {
-            system.refresh_memory_specifics(ram);
-            system
-        }
-        none => match System::new_with_specifics(RefreshKind::nothing().with_memory(ram)) {
-            Ok(system) => none.insert(system),
-            Err(_) => return (0, 0),
-        },
-    };
-    (system.total_memory(), system.available_memory())
-}
-
 /// The source address of a would-be packet to a public host; connecting a
 /// UDP socket sends nothing but resolves the route.
 fn local_ip() -> String {
@@ -97,13 +73,15 @@ fn local_ip() -> String {
         .unwrap_or_default()
 }
 
-/// The System the usage is diffed through and the figure it last produced.
-/// Kept process wide so every open event stream shares one measurement
-/// window instead of racing the others for ever shorter, ever noisier deltas.
-static CPU: Mutex<Option<CpuSample>> = Mutex::new(None);
+/// The System memory and CPU are read through, and the CPU figure it last
+/// produced. Kept process wide rather than built per snapshot: constructing
+/// one is itself a reading, and the usage figure is a diff against the
+/// previous one, so every open event stream shares one measurement window
+/// instead of racing the others for ever shorter, ever noisier deltas.
+static SYSTEM: Mutex<Option<Sampled>> = Mutex::new(None);
 
-struct CpuSample {
-    /// Carries the previous reading sysinfo diffs the next refresh against.
+struct Sampled {
+    /// Carries the previous CPU reading sysinfo diffs the next refresh against.
     sys: System,
     at: Instant,
     usage: f32,
@@ -113,9 +91,11 @@ struct CpuSample {
 /// mostly quantization noise.
 const CPU_WINDOW: Duration = Duration::from_millis(500);
 
-/// Busy time as a percentage of all CPU time since the previous reading.
-fn cpu_usage() -> f32 {
-    let mut cached = crate::sync::lock(&CPU);
+/// Busy time as a percentage of all CPU time since the previous reading, and
+/// total and available RAM in bytes.
+fn cpu_and_memory() -> (f32, u64, u64) {
+    let ram = MemoryRefreshKind::nothing().with_ram();
+    let mut cached = crate::sync::lock(&SYSTEM);
     // The first call has no previous reading to diff against, so the figure
     // it gets is busy time since boot — the host's average rather than this
     // moment's, but a figure, and the next snapshot two seconds later
@@ -124,6 +104,7 @@ fn cpu_usage() -> f32 {
     // runtime half a second of the first page load.
     let sample = match &mut *cached {
         Some(sample) => {
+            sample.sys.refresh_memory_specifics(ram);
             // Asked again within the window, the answer hasn't had time to
             // change, and re-diffing would only add noise.
             if sample.at.elapsed() >= CPU_WINDOW {
@@ -133,24 +114,31 @@ fn cpu_usage() -> f32 {
             }
             sample
         }
+        // A freshly built System carries its first reading already.
         none => {
             let Ok(sys) = System::new_with_specifics(
-                RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing().with_usage()),
+                RefreshKind::nothing()
+                    .with_memory(ram)
+                    .with_cpu(CpuRefreshKind::nothing().with_usage()),
             ) else {
-                return 0.0;
+                return (0.0, 0, 0);
             };
-            none.insert(CpuSample {
+            none.insert(Sampled {
                 usage: sys.global_cpu_usage(),
                 at: Instant::now(),
                 sys,
             })
         }
     };
-    sample.usage
+    (
+        sample.usage,
+        sample.sys.total_memory(),
+        sample.sys.available_memory(),
+    )
 }
 
 /// A sysinfo listing kept across calls, and which one entry of it the page
-/// is shown. Process wide like `CPU`, and for the same reason: every open
+/// is shown. Process wide like `SYSTEM`, and for the same reason: every open
 /// event stream asks for the same one figure on its own tick, and both
 /// halves of the work are wasted on repeat. Listing the mounts walks
 /// `/proc/mounts` and `statvfs`es every entry on it; listing the sensors
