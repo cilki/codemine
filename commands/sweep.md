@@ -241,6 +241,13 @@ Prefer `cargo check` over `cargo build` when you only need to know whether
 something compiles; always check the compilation succeeds except for trivial
 changes.
 
+Whenever you report a test run — in a PR description, a review, a comment, an
+issue or your final message — give the passed count against the total, and say
+what the rest did: `212 of 214 passed, 2 ignored`, not `212 passed`. A passed
+count on its own hides failures, skips and tests that never ran. If you ran only
+part of the suite (one module, one filter), say which part, and give the counts
+for what you ran.
+
 When you run the project itself (a server, a daemon, a CLI that keeps state),
 give it a scratch home —
 `env HOME=/tmp/opencode/home XDG_CONFIG_HOME=/tmp/opencode/home/.config XDG_DATA_HOME=/tmp/opencode/home/.local/share`
