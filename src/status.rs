@@ -97,9 +97,6 @@ pub struct TurnRecord {
     pub outcome: Outcome,
     /// None when opencode's session storage couldn't be read.
     pub tokens: Option<TokenUsage>,
-    /// None when rtk's history couldn't be read, which includes rtk not
-    /// being installed at all.
-    pub rtk: Option<Savings>,
     /// The turn's full log on disk, kept until the record ages out.
     #[serde(skip)]
     pub log_path: PathBuf,
@@ -213,7 +210,6 @@ pub struct Window {
 struct WindowView<'a> {
     tasks: u32,
     hours: u32,
-    window_secs: u64,
     completions: Vec<&'a u64>,
 }
 
@@ -225,7 +221,6 @@ impl Serialize for Window {
             .map(|limit| WindowView {
                 tasks: limit.tasks,
                 hours: limit.hours,
-                window_secs: limit.window_secs(),
                 completions: self.deciding(limit, epoch_now()).collect(),
             })
             .serialize(serializer)
@@ -287,14 +282,15 @@ impl Window {
 
 /// What the page's counters add up, across every turn including the ones
 /// that have aged out of `Status::turns`. A cancelled turn counts in none of
-/// them: the page shows completed, skipped, and failed (with timeouts), and
-/// a turn somebody stopped by hand is none of those.
+/// them: the page shows completed, skipped, and failed, and a turn somebody
+/// stopped by hand is none of those.
 #[derive(Serialize, Clone, Default)]
 pub struct Totals {
     pub completed: u64,
     pub skipped: u64,
+    /// A turn that timed out counts as failed: the page has one tally for
+    /// both.
     pub failed: u64,
-    pub timeout: u64,
     pub tokens: TokenUsage,
     pub rtk: Savings,
 }
@@ -365,18 +361,20 @@ impl Status {
         value
     }
 
-    pub fn record_turn(&mut self, record: TurnRecord) {
+    /// Add a finished turn to the list and the totals. What rtk saved it goes
+    /// into the totals alone: the page shows savings as one running sum,
+    /// never per turn.
+    pub fn record_turn(&mut self, record: TurnRecord, rtk: Option<&Savings>) {
         match record.outcome {
             Outcome::Completed => self.totals.completed += 1,
             Outcome::Skipped => self.totals.skipped += 1,
-            Outcome::Failed => self.totals.failed += 1,
-            Outcome::Timeout => self.totals.timeout += 1,
+            Outcome::Failed | Outcome::Timeout => self.totals.failed += 1,
             Outcome::Canceled => {}
         }
         if let Some(tokens) = &record.tokens {
             self.totals.tokens.add(tokens);
         }
-        if let Some(rtk) = &record.rtk {
+        if let Some(rtk) = rtk {
             self.totals.rtk.add(rtk);
         }
         self.turns.push_front(record);
@@ -422,11 +420,6 @@ mod tests {
                 output: 5,
                 ..Default::default()
             }),
-            rtk: Some(Savings {
-                commands: 1,
-                input: 100,
-                output: 20,
-            }),
             log_path: PathBuf::new(),
         }
     }
@@ -436,20 +429,38 @@ mod tests {
         let shared = Shared::new();
         Status::update(&shared, |status| {
             for _ in 0..60 {
-                status.record_turn(record(Outcome::Completed));
+                status.record_turn(record(Outcome::Completed), None);
             }
-            status.record_turn(record(Outcome::Skipped));
+            status.record_turn(record(Outcome::Failed), None);
+            let saved = Savings {
+                commands: 1,
+                input: 100,
+                output: 20,
+            };
+            status.record_turn(record(Outcome::Timeout), Some(&saved));
+            status.record_turn(record(Outcome::Skipped), Some(&saved));
         });
 
         let status = shared.lock();
-        assert_eq!(status.turns.len(), 61);
+        assert_eq!(status.turns.len(), 63);
         // The revision is how the event stream notices the list moved — it
         // compares nothing else — so every record has to move it.
-        assert_eq!(status.turns_revision, 61);
+        assert_eq!(status.turns_revision, 63);
         assert_eq!(status.turns[0].outcome, Outcome::Skipped);
         assert_eq!(status.totals.completed, 60);
         assert_eq!(status.totals.skipped, 1);
-        assert_eq!(status.totals.tokens.input, 61 * 10);
+        // The page has one tally for a turn that failed and one that ran out
+        // of time.
+        assert_eq!(status.totals.failed, 2);
+        assert_eq!(status.totals.tokens.input, 63 * 10);
+        assert_eq!(
+            status.totals.rtk,
+            Savings {
+                commands: 2,
+                input: 200,
+                output: 40,
+            }
+        );
     }
 
     /// The history is bounded, and the log files behind it with it: every
@@ -469,7 +480,7 @@ mod tests {
                 let mut record = record(Outcome::Completed);
                 record.started = started;
                 record.log_path = log(started);
-                status.record_turn(record);
+                status.record_turn(record, None);
             }
         });
 
@@ -495,7 +506,7 @@ mod tests {
         let shared = Shared::new();
         Status::update(&shared, |status| {
             for _ in 0..HISTORY + 5 {
-                status.record_turn(record(Outcome::Failed));
+                status.record_turn(record(Outcome::Failed), None);
             }
         });
         assert_eq!(shared.lock().turns.len(), HISTORY);
@@ -612,7 +623,6 @@ mod tests {
         let limited = serde_json::to_value(&*shared.lock()).unwrap();
         assert_eq!(limited["allowance"]["tasks"], 2);
         assert_eq!(limited["allowance"]["hours"], 1);
-        assert_eq!(limited["allowance"]["window_secs"], HOUR);
         assert_eq!(
             limited["allowance"]["completions"],
             serde_json::json!([now - 200, now - 100])

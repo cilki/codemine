@@ -127,13 +127,12 @@ impl Turn<'_> {
             duration_secs: elapsed,
             outcome,
             tokens: spent.tokens,
-            rtk: spent.rtk,
             log_path: self.log_path.clone(),
         };
         Status::update(status, |s| {
             s.paused = false;
             s.log_tail = last_lines(tail, 100).to_owned();
-            s.record_turn(record);
+            s.record_turn(record, spent.rtk.as_ref());
         });
     }
 }

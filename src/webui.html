@@ -523,7 +523,8 @@
       return;
     }
     const now = serverNow();
-    const inside = w.completions.filter(t => t + w.window_secs > now);
+    const span = w.hours * 3600;
+    const inside = w.completions.filter(t => t + span > now);
     const per = w.hours === 1 ? "hour" : w.hours + " hours";
     label.textContent = "Tasks per " + (w.hours === 1 ? "hour" : w.hours + "h");
     let text = inside.length + " / " + w.tasks;
@@ -532,7 +533,7 @@
     if (inside.length >= w.tasks) {
       // The server sends the newest `tasks` completions, so the first one
       // still inside is the one whose ageing out frees the next slot.
-      const next = inside[inside.length - w.tasks] + w.window_secs - now;
+      const next = inside[inside.length - w.tasks] + span - now;
       text += " · " + fmtCoarse(next);
       note += "; the next slot opens in " + fmtDuration(next);
     }
@@ -571,12 +572,12 @@
 
     $("stat-completed").textContent = state.totals.completed;
     $("stat-skipped").textContent = state.totals.skipped;
-    $("stat-failed").textContent = state.totals.failed + state.totals.timeout;
+    $("stat-failed").textContent = state.totals.failed;
     // The in-flight turn's tally is not in the totals yet, so it is added
     // here; the stat then climbs during a turn instead of jumping at its end.
     // Only a running activity carries these, so any other reads as none.
     const running = a.tokens;
-    const spent = (state.totals.tokens ? tokenTotal(state.totals.tokens) : 0)
+    const spent = tokenTotal(state.totals.tokens)
       + (running ? tokenTotal(running) : 0);
     $("stat-tokens").textContent = spent ? fmtTokens(spent) : "–";
     const rtk = { commands: 0, input: 0, output: 0 };

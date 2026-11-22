@@ -696,7 +696,6 @@ mod tests {
         let status = body_json(&request(addr, "GET", "/api/status", ""));
         assert_eq!(status["allowance"]["tasks"], 1);
         assert_eq!(status["allowance"]["hours"], 2);
-        assert_eq!(status["allowance"]["window_secs"], 7200);
         assert_eq!(status["allowance"]["completions"], json!([]));
         let value = body_json(&response);
         assert_eq!(value["forge"]["kind"], "gitlab");
@@ -714,7 +713,7 @@ mod tests {
         );
         let status = body_json(&request(addr, "GET", "/api/status", ""));
         assert_eq!(status["allowance"]["tasks"], 4);
-        assert_eq!(status["allowance"]["window_secs"], 3600);
+        assert_eq!(status["allowance"]["hours"], 1);
         let mut cleared = update.clone();
         cleared["rate_limit"] = json!(null);
         assert!(
@@ -886,7 +885,6 @@ mod tests {
                 cache_read: 9_876_543,
                 cache_write: 123_456,
             }),
-            rtk: None,
             log_path: std::path::PathBuf::from("/nonexistent"),
         }
     }
@@ -916,7 +914,7 @@ mod tests {
             s.activity = running(&dir.path().join("turn.log"), 0);
             // A full history, which is what the stream used to re-send.
             for n in 0..200 {
-                s.record_turn(record(1_760_000_000 - n * 1200));
+                s.record_turn(record(1_760_000_000 - n * 1200), None);
             }
         });
         sample(1);
@@ -949,7 +947,7 @@ mod tests {
         // A turn finishing is what moves the list, and that does go out.
         Status::update(&status, |s| {
             s.activity = Activity::Sleeping { until: 0 };
-            s.record_turn(record(1_760_009_999));
+            s.record_turn(record(1_760_009_999), None);
         });
         let finished = read_until(&mut stream, "event: turns");
         assert!(finished.contains(r#""started":1760009999"#), "{finished}");
@@ -961,7 +959,7 @@ mod tests {
     fn the_status_endpoint_still_carries_the_history() {
         let status = Shared::new();
         let (addr, _dir) = serve_in_tempdir(&status);
-        Status::update(&status, |s| s.record_turn(record(1_760_000_000)));
+        Status::update(&status, |s| s.record_turn(record(1_760_000_000), None));
         let value = body_json(&request(addr, "GET", "/api/status", ""));
         assert!(value["now"].as_u64().unwrap() > 1_700_000_000);
         assert_eq!(value["turns"][0]["started"], 1_760_000_000);
@@ -978,7 +976,7 @@ mod tests {
         Status::update(&status, |s| {
             let mut turn = record(100);
             turn.log_path = path.clone();
-            s.record_turn(turn);
+            s.record_turn(turn, None);
         });
 
         // The full log comes back raw, ANSI escapes included.
