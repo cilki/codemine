@@ -522,7 +522,11 @@ async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paus
     }
     match crate::workspace::pause_group(pgid, incoming.paused) {
         Ok(()) => {
-            Status::update(&state.status, |s| s.paused = incoming.paused);
+            Status::update(&state.status, |s| {
+                if let Activity::Running { paused, .. } = &mut s.activity {
+                    *paused = incoming.paused;
+                }
+            });
             Json(json!({ "paused": incoming.paused })).into_response()
         }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
@@ -535,10 +539,13 @@ async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paus
 /// sleep. A paused tree is killable too — the kill SIGCONTs it on the way.
 async fn api_post_cancel(State(state): State<AppState>) -> Response {
     let mut status = state.status.lock();
-    if !matches!(status.activity, Activity::Running { .. }) {
+    let Activity::Running {
+        cancel_requested, ..
+    } = &mut status.activity
+    else {
         return error(StatusCode::CONFLICT, "no turn is running");
-    }
-    status.cancel_requested = true;
+    };
+    *cancel_requested = true;
     Json(json!({ "canceled": true })).into_response()
 }
 
@@ -640,6 +647,8 @@ mod tests {
             forge: "github".into(),
             log_path: log_path.to_path_buf(),
             pgid,
+            paused: false,
+            cancel_requested: false,
             started: 0,
             tokens: None,
             rtk: None,
@@ -787,7 +796,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(await_state(child.id(), "T"), "T");
         assert_eq!(
-            body_json(&request(addr, "GET", "/api/status", ""))["paused"],
+            body_json(&request(addr, "GET", "/api/status", ""))["activity"]["paused"],
             true
         );
 
@@ -795,7 +804,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(await_state(child.id(), "S"), "S");
         assert_eq!(
-            body_json(&request(addr, "GET", "/api/status", ""))["paused"],
+            body_json(&request(addr, "GET", "/api/status", ""))["activity"]["paused"],
             false
         );
 
@@ -811,14 +820,19 @@ mod tests {
         // Nothing running: nothing to cancel.
         let response = request(addr, "POST", "/api/cancel", "");
         assert!(response.starts_with("HTTP/1.1 409"), "{response}");
-        assert!(!status.lock().cancel_requested);
 
         Status::update(&status, |s| {
             s.activity = running(&dir.path().join("log"), 1)
         });
         let response = request(addr, "POST", "/api/cancel", "");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(status.lock().cancel_requested);
+        assert!(matches!(
+            status.lock().activity,
+            Activity::Running {
+                cancel_requested: true,
+                ..
+            }
+        ));
     }
 
     #[test]

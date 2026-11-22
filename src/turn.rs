@@ -108,6 +108,8 @@ impl Turn<'_> {
             // 0 until the agent's process group exists; `run` fills it in the
             // moment it does, which is what arms the pause button.
             pgid: 0,
+            paused: false,
+            cancel_requested: false,
             started: self.started,
             tokens: None,
             rtk: None,
@@ -130,7 +132,6 @@ impl Turn<'_> {
             log_path: self.log_path.clone(),
         };
         Status::update(status, |s| {
-            s.paused = false;
             s.log_tail = last_lines(tail, 100).to_owned();
             s.record_turn(record, spent.rtk.as_ref());
         });
@@ -186,12 +187,7 @@ pub fn run(
         turn.dir.display(),
         turn.forge_name()
     );
-    Status::update(status, |s| {
-        s.paused = false;
-        // A leftover request from between turns must not fell this one.
-        s.cancel_requested = false;
-        s.activity = turn.activity();
-    });
+    Status::update(status, |s| s.activity = turn.activity());
 
     // A failed preparation (deleted repository, network blip, ...) fails the
     // turn, not the runner.
@@ -422,7 +418,13 @@ fn supervise(
     let mut canceled = false;
     let exit = loop {
         // Checked first so a cancel clicked during preparation lands too.
-        if status.lock().cancel_requested {
+        if matches!(
+            status.lock().activity,
+            Activity::Running {
+                cancel_requested: true,
+                ..
+            }
+        ) {
             canceled = true;
             break None;
         }

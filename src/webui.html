@@ -490,13 +490,12 @@
   function renderRunnerState() {
     const a = state.activity;
     // A pause holds the running turn's tree, so it outranks "running".
-    const paused = state.paused && a.state === "running";
     const value = $("stat-state");
-    $("stat-state-label").textContent = paused ? "paused" : STATES[a.state] || a.state;
-    value.className = "stat-value " + (paused ? "paused" : a.state);
+    $("stat-state-label").textContent = a.paused ? "paused" : STATES[a.state] || a.state;
+    value.className = "stat-value " + (a.paused ? "paused" : a.state);
     // An incomplete install's note is what went wrong asking opencode, since
     // that is the one thing the person fixing the host needs to know.
-    value.title = paused ? ""
+    value.title = a.paused ? ""
       : a.state === "incomplete_install"
         ? "opencode --version failed, so turns can't start: " + a.reason
         : STATE_NOTES[a.state] || "";
@@ -565,7 +564,7 @@
     // The pause and cancel buttons live with the log because they act on the
     // running turn's process tree; without a turn there is nothing to signal.
     $("pause").hidden = a.state !== "running";
-    $("pause").textContent = state.paused ? "resume" : "pause";
+    $("pause").textContent = a.paused ? "resume" : "pause";
     $("cancel").hidden = a.state !== "running";
     $("cancel").disabled = a.state === "running" && a.started === canceling;
     renderClock();
@@ -603,7 +602,7 @@
     // The in-flight turn leads the list; its log is the live tail, so
     // clicking it goes there. The elapsed time ticks from renderClock.
     if (a.state === "running") {
-      const row = turnRow(a.task, a.repo, a.forge, state.paused ? "paused" : "running",
+      const row = turnRow(a.task, a.repo, a.forge, a.paused ? "paused" : "running",
         new Date(a.started * 1000).toLocaleString(), "");
       // The live log is this turn's log, so the row reads as selected while
       // nothing older is being viewed.
@@ -1387,7 +1386,7 @@
   $("pause").onclick = () => fetch("/api/paused", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ paused: !state.paused }),
+    body: JSON.stringify({ paused: !state.activity.paused }),
   }).catch(() => {});
   // The turn's end comes back over the event stream; the button only asks.
   // It goes dead for this turn on the click, and a failed request revives it.
@@ -1412,7 +1411,7 @@
   const glow = $("glow");
   const dimmed = matchMedia("(prefers-reduced-motion: reduce)");
   // A pause freezes the turn's process tree, so nothing is running to show.
-  const working = () => state && state.activity.state === "running" && !state.paused;
+  const working = () => state && state.activity.state === "running" && !state.activity.paused;
   setInterval(() => {
     if (!working() || document.hidden || dimmed.matches) return;
     if (glow.childElementCount >= LIT_CAP) return;

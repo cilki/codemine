@@ -143,6 +143,13 @@ pub enum Activity {
         /// signals; 0 until the process is actually spawned.
         #[serde(skip)]
         pgid: i32,
+        /// The process group is SIGSTOPped through the web UI. Both flags
+        /// live and die with this turn's activity, so neither needs a reset.
+        paused: bool,
+        /// The web UI asked for the turn to be cancelled; the turn runner
+        /// notices at its next wait hop and kills the agent's tree.
+        #[serde(skip)]
+        cancel_requested: bool,
         started: u64,
         /// What the turn has spent so far, resampled while it runs; None
         /// until opencode has recorded its first message.
@@ -298,14 +305,6 @@ pub struct Totals {
 #[derive(Serialize, Default)]
 pub struct Status {
     pub activity: Activity,
-    /// Whether the running turn's process tree is currently SIGSTOPped
-    /// through the web UI.
-    pub paused: bool,
-    /// The web UI asked for the running turn to be cancelled; the turn
-    /// runner notices at its next wait hop, kills the agent's tree, and
-    /// clears the flag when the next turn starts.
-    #[serde(skip)]
-    pub cancel_requested: bool,
     /// The rate limit's window, which the main loop records completions in
     /// and the web UI sets the limit of; serialized as what the page shows,
     /// or null when no limit is configured and turns run back to back.
