@@ -22,6 +22,7 @@
 use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
@@ -30,6 +31,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::config::{Forge, ForgeKind};
+use crate::precheck::{conflicting_prs, review_requests};
 
 /// What a skipped turn on this task is remembered against, or `None` when the
 /// skip isn't worth remembering at all.
@@ -195,8 +197,9 @@ fn digest(task: &str) -> String {
 /// `precheck::review_requests` spell them.
 type PrKeys = Vec<String>;
 
-/// One page of a repository's open PRs, as `precheck::open_prs` fetched it.
-type OpenPrs = Vec<serde_json::Value>;
+/// One page of a repository's open PRs, as `precheck::open_prs` fetched it,
+/// shared rather than copied out to each set of keys read off it.
+type OpenPrs = Rc<Vec<serde_json::Value>>;
 
 /// The draw's precondition check with the skip memory folded in, plus the
 /// forge state read along the way: default-branch commits per repository,
@@ -247,15 +250,15 @@ impl<'a> Probe<'a> {
             // skips again.
             Some(Basis::Feed) => self.feed().is_none_or(|feed| feed.contains_key(repo)),
             // `rebase` has work only when the bot has an open conflicting PR
-            // here. Fail-closed, unlike the feed: an unreadable listing
-            // leaves nothing to remember a skip against, so drawing on it
-            // doesn't risk one wasted turn but one per draw until the probe
-            // heals — the task is held back instead, logged by the getter.
-            Some(Basis::Prs) => self.conflicting(repo).is_some_and(|prs| !prs.is_empty()),
-            // `review` likewise: work only when someone has asked the bot
-            // for a review it hasn't given yet, and held back on an
-            // unreadable listing.
-            Some(Basis::Reviews) => self.requested(repo).is_some_and(|prs| !prs.is_empty()),
+            // here, and `review` only when someone has asked the bot for a
+            // review it hasn't given yet. Fail-closed, unlike the feed: an
+            // unreadable listing leaves nothing to remember a skip against,
+            // so drawing on it doesn't risk one wasted turn but one per draw
+            // until the probe heals — the task is held back instead, logged
+            // by the getter.
+            Some(basis @ (Basis::Prs | Basis::Reviews)) => {
+                self.pr_keys(basis, repo).is_some_and(|prs| !prs.is_empty())
+            }
             // Every other task is always worth a turn; only the memory above
             // holds one back.
             _ => true,
@@ -269,8 +272,9 @@ impl<'a> Probe<'a> {
         match basis(task)? {
             Basis::Head => self.head(repo),
             Basis::Feed => self.feed()?.get(repo).cloned(),
-            Basis::Prs => self.conflicting(repo).map(|prs| prs.join(" ")),
-            Basis::Reviews => self.requested(repo).map(|prs| prs.join(" ")),
+            basis @ (Basis::Prs | Basis::Reviews) => {
+                self.pr_keys(basis, repo).map(|prs| prs.join(" "))
+            }
         }
     }
 
@@ -318,40 +322,31 @@ impl<'a> Probe<'a> {
         })
     }
 
-    /// The bot's open conflicting PRs on the repository, answered once per
-    /// repository and remembered for the rest of the draw. `None` when the
-    /// listing couldn't be read.
-    fn conflicting(&self, repo: &str) -> Option<PrKeys> {
-        once(&self.conflicts, repo, || {
-            let open = self.open_prs(repo)?;
-            crate::precheck::conflicting_prs(self.forge, repo, &open)
-                .with_context(|| format!("failed to read {repo}'s conflicting PRs"))
-        })
-    }
-
-    /// The open PRs the bot is asked to review on the repository, answered
-    /// once per repository and remembered for the rest of the draw. `None`
-    /// when the listing couldn't be read.
-    fn requested(&self, repo: &str) -> Option<PrKeys> {
-        once(&self.reviews, repo, || {
-            let open = self.open_prs(repo)?;
-            crate::precheck::review_requests(self.forge, repo, &open)
-                .with_context(|| format!("failed to read {repo}'s review requests"))
-        })
-    }
-
-    /// The repository's open PRs as its forge lists them, read once per
-    /// repository and shared by both answers above: `rebase` wants the bot's
-    /// own conflicting ones out of that page and `review` the ones it has
-    /// been asked about, and the gated pass probes both. Each used to fetch
-    /// the page for itself, which on Gitea and GitHub is the identical
-    /// request made twice per repository per draw.
-    fn open_prs(&self, repo: &str) -> Result<OpenPrs> {
-        once(&self.listings, repo, || {
+    /// The PR keys a `Prs` or `Reviews` basis reads off the repository's
+    /// open-PR page — the bot's own conflicting PRs, or the ones it is asked
+    /// to review — answered once per repository and remembered for the rest
+    /// of the draw. `None` when either the page or the keys couldn't be read.
+    ///
+    /// The page is read once per repository too, and shared by both sets,
+    /// since the gated pass probes both. An unreadable page is logged where
+    /// it is fetched, and only there.
+    fn pr_keys(&self, basis: Basis, repo: &str) -> Option<PrKeys> {
+        let (memo, what, read): (_, _, fn(&Forge, &str, &_) -> _) = match basis {
+            Basis::Prs => (&self.conflicts, "conflicting PRs", conflicting_prs),
+            Basis::Reviews => (&self.reviews, "review requests", review_requests),
+            Basis::Head | Basis::Feed => unreachable!("{basis:?} is not read off the PR page"),
+        };
+        if let Some(keys) = memo.borrow().get(repo) {
+            return keys.clone();
+        }
+        let open = once(&self.listings, repo, || {
             crate::precheck::open_prs(self.forge, repo)
+                .map(Rc::new)
                 .with_context(|| format!("failed to list {repo}'s open PRs"))
+        })?;
+        once(memo, repo, || {
+            read(self.forge, repo, &open).with_context(|| format!("failed to read {repo}'s {what}"))
         })
-        .context("the open PR listing is unreadable")
     }
 
     /// The forge's unread notifications as repository → newest stamp, read

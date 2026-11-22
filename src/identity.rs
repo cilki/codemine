@@ -194,35 +194,28 @@ fn reading(forge: Forge) -> ForgeHealth {
 /// account when it named a usable one.
 fn probe(forge: &Forge) -> (ForgeHealth, Option<Identity>) {
     // Every forge spells its whoami endpoint the same way.
-    let answer = match forge_json(forge, "user", "user", "user") {
-        Ok(answer) => answer,
-        Err(err) => {
-            let error = format!("{err:#}");
-            let health = ForgeHealth {
-                state: classify(&error),
-                account: None,
-                error: Some(error),
-            };
-            return (health, None);
-        }
-    };
-    match parse_identity(forge.kind, &answer) {
+    let answer = forge_json(forge, "user", "user", "user")
+        .map_err(|err| format!("{err:#}"))
+        .map_err(|error| (classify(&error), error))
+        .and_then(|answer| {
+            parse_identity(forge.kind, &answer)
+                .map_err(|err| (Reach::Incomplete, format!("{err:#}")))
+        });
+    match answer {
         Ok(identity) => {
             let health = ForgeHealth {
-                state: Reach::Ok,
                 account: Some(format!("{} <{}>", identity.login, identity.email)),
-                error: None,
+                ..ForgeHealth::bare(Reach::Ok)
             };
             (health, Some(identity))
         }
-        Err(err) => (
-            ForgeHealth {
-                state: Reach::Incomplete,
-                account: None,
-                error: Some(format!("{err:#}")),
-            },
-            None,
-        ),
+        Err((state, error)) => {
+            let health = ForgeHealth {
+                error: Some(error),
+                ..ForgeHealth::bare(state)
+            };
+            (health, None)
+        }
     }
 }
 

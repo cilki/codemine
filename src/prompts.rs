@@ -10,14 +10,23 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::cache::Basis;
+use crate::config::ForgeKind;
 
 /// The prompt every turn runs, rendered by `sweep_prompt`. It is written as
 /// an opencode command (front matter, `$1`–`$4`) but no longer installed as
 /// one: `opencode run` dropped `--command`, so the runner fills it in itself.
 pub const SWEEP: &[u8] = include_bytes!("../commands/sweep.md");
-pub const GITEA_SKILL: &[u8] = include_bytes!("../skills/gitea/SKILL.md");
-pub const GITHUB_SKILL: &[u8] = include_bytes!("../skills/github/SKILL.md");
-pub const GITLAB_SKILL: &[u8] = include_bytes!("../skills/gitlab/SKILL.md");
+
+/// The forge's skill, installed under the forge's slug: the sweep prompt
+/// names the skill to load by that slug, so the two can't drift apart, and a
+/// new forge without one is a compile error rather than a missing file.
+fn skill(kind: ForgeKind) -> &'static [u8] {
+    match kind {
+        ForgeKind::Gitea => include_bytes!("../skills/gitea/SKILL.md"),
+        ForgeKind::Github => include_bytes!("../skills/github/SKILL.md"),
+        ForgeKind::Gitlab => include_bytes!("../skills/gitlab/SKILL.md"),
+    }
+}
 
 /// Where opencode looks for commands and skills: `$XDG_CONFIG_HOME/opencode`,
 /// else `~/.config/opencode`.
@@ -157,19 +166,18 @@ fn strip_front_matter(source: &str) -> &str {
 /// Write the embedded skills under `dir`, overwriting whatever is there; the
 /// binary is the source of truth.
 pub fn install(dir: &Path) -> Result<()> {
-    for (path, bytes) in [
-        ("skills/gitea/SKILL.md", GITEA_SKILL),
-        ("skills/github/SKILL.md", GITHUB_SKILL),
-        ("skills/gitlab/SKILL.md", GITLAB_SKILL),
-    ] {
-        let path = dir.join(path);
-        let parent = path.parent().expect("prompt paths have parents");
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-        std::fs::write(&path, bytes)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+    for kind in ForgeKind::ALL {
+        let path = dir.join("skills").join(kind.name()).join("SKILL.md");
+        write_creating_parent(&path, skill(kind))?;
     }
     Ok(())
+}
+
+fn write_creating_parent(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().expect("installed paths have parents");
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    std::fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Merge the codegraph MCP server into opencode's config, giving the agent
@@ -250,10 +258,7 @@ fn install_rtk_config(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    let parent = path.parent().expect("the config path has a parent");
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
-    std::fs::write(path, RTK_CONFIG).with_context(|| format!("failed to write {}", path.display()))
+    write_creating_parent(path, RTK_CONFIG.as_bytes())
 }
 
 /// Stands in for the client key when none is configured. A CLIProxyAPI with
@@ -666,18 +671,18 @@ mod tests {
     fn install_writes_and_overwrites() {
         let dir = tempfile::tempdir().unwrap();
         install(dir.path()).unwrap();
-        for (path, bytes) in [
-            ("skills/gitea/SKILL.md", GITEA_SKILL),
-            ("skills/github/SKILL.md", GITHUB_SKILL),
-            ("skills/gitlab/SKILL.md", GITLAB_SKILL),
+        for (path, kind) in [
+            ("skills/gitea/SKILL.md", ForgeKind::Gitea),
+            ("skills/github/SKILL.md", ForgeKind::Github),
+            ("skills/gitlab/SKILL.md", ForgeKind::Gitlab),
         ] {
-            assert_eq!(std::fs::read(dir.path().join(path)).unwrap(), bytes);
+            assert_eq!(std::fs::read(dir.path().join(path)).unwrap(), skill(kind));
         }
 
-        let skill = dir.path().join("skills/github/SKILL.md");
-        std::fs::write(&skill, "stale").unwrap();
+        let stale = dir.path().join("skills/github/SKILL.md");
+        std::fs::write(&stale, "stale").unwrap();
         install(dir.path()).unwrap();
-        assert_eq!(std::fs::read(&skill).unwrap(), GITHUB_SKILL);
+        assert_eq!(std::fs::read(&stale).unwrap(), skill(ForgeKind::Github));
         // The sweep prompt is sent with each turn, not installed as a command.
         assert!(!dir.path().join("commands").exists());
     }
@@ -689,7 +694,7 @@ mod tests {
     /// with no line anchors.
     #[test]
     fn gitlab_skill_commands_are_ones_glab_runs() {
-        let skill = std::str::from_utf8(GITLAB_SKILL).unwrap();
+        let skill = std::str::from_utf8(skill(ForgeKind::Gitlab)).unwrap();
         let commands = skill
             .lines()
             .filter(|line| line.trim_start().starts_with("glab "));
