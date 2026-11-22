@@ -409,7 +409,7 @@ fn supervise(
     child: &mut Child,
 ) -> Result<(Option<ExitStatus>, bool, Spent)> {
     let run_start = Instant::now();
-    let mut usage = crate::usage::Sampler::new(turn.wall);
+    let mut usage = crate::usage::Sampler::new(turn.wall, &turn.dir);
     let savings = crate::savings::Sampler::new(turn.wall, &turn.dir);
     // Each figure resampled over the last good one, so a failed read
     // (opencode mid-write, say) leaves that up rather than blinking the

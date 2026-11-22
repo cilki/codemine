@@ -1,10 +1,15 @@
 //! Best-effort token accounting. opencode doesn't reliably print token counts
 //! in its run output, but it persists each message (with a `tokens` object)
-//! in the `message` table of `opencode*.db` under its data directory. Each
-//! turn runs in a fresh session, so summing the token objects recorded since
-//! the turn started attributes usage to the turn. Anything unexpected
-//! degrades to None rather than failing the turn.
+//! in the `message` table of `opencode*.db` under its data directory. A
+//! turn's cost is the token objects recorded since the turn started by the
+//! sessions opened in its clone: the `session` table records the directory
+//! each session runs in, and the subagent sessions a turn spawns inherit it.
+//! The time window alone isn't enough, because the database is shared by
+//! every opencode under the same `$HOME` — a person driving opencode by hand
+//! on the runner's host, or another turn running beside this one. Anything
+//! unexpected degrades to None rather than failing the turn.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -48,14 +53,18 @@ pub struct Sampler {
     /// complete up to. None until one holding this turn's messages is
     /// found — see [`read`](Self::read).
     cursor: Option<(PathBuf, i64)>,
+    /// Which sessions the turn's messages may come from.
+    sessions: Sessions,
 }
 
 impl Sampler {
-    pub fn new(since: SystemTime) -> Sampler {
+    /// A sampler for the turn started at `since` in the clone at `dir`.
+    pub fn new(since: SystemTime, dir: &Path) -> Sampler {
         Sampler {
             since,
             sum: None,
             cursor: None,
+            sessions: Sessions::new(dir),
         }
     }
 
@@ -103,11 +112,12 @@ impl Sampler {
         // walk can be abandoned as soon as it reads past the window.
         let Some((Some(sum), reached)) = tally(
             &db,
-            "SELECT rowid, time_created, data FROM message ORDER BY rowid DESC",
+            "SELECT rowid, time_created, session_id, data FROM message ORDER BY rowid DESC",
             [],
             since_ms,
             Some(stop_ms),
             0,
+            &mut self.sessions,
         ) else {
             return false;
         };
@@ -134,11 +144,12 @@ impl Sampler {
         };
         let Some((added, reached)) = tally(
             &db,
-            "SELECT rowid, time_created, data FROM message WHERE rowid > ?1 ORDER BY rowid",
+            "SELECT rowid, time_created, session_id, data FROM message WHERE rowid > ?1 ORDER BY rowid",
             [from],
             since_ms,
             None,
             from,
+            &mut self.sessions,
         ) else {
             return;
         };
@@ -162,9 +173,10 @@ impl Sampler {
 }
 
 /// Sum the token counts of the turn's messages among the rows `sql` selects
-/// (`rowid, time_created, data`), and say the newest rowid read, starting
-/// from `reached`. The sum is None when no row carried a `tokens` object.
-/// A row stamped before `since_ms` doesn't count; one before `stop_ms` ends
+/// (`rowid, time_created, session_id, data`), and say the newest rowid read,
+/// starting from `reached`. The sum is None when no row carried a `tokens`
+/// object. A row stamped before `since_ms`, or recorded by a session that
+/// isn't one of the turn's, doesn't count; one stamped before `stop_ms` ends
 /// the walk, which only a backwards walk can ask for. None when the query
 /// can't run at all.
 ///
@@ -177,6 +189,7 @@ fn tally(
     since_ms: i64,
     stop_ms: Option<i64>,
     mut reached: i64,
+    sessions: &mut Sessions,
 ) -> Option<(Option<TokenUsage>, i64)> {
     let mut query = db.prepare(sql).ok()?;
     let mut rows = query.query(params).ok()?;
@@ -194,13 +207,67 @@ fn tally(
         if created < since_ms {
             continue;
         }
-        if let Ok(rusqlite::types::ValueRef::Text(data)) = row.get_ref(2)
+        // Checked before the record is parsed, so another session's
+        // messages cost a lookup the first time and nothing after.
+        let Ok(rusqlite::types::ValueRef::Text(session)) = row.get_ref(2) else {
+            continue;
+        };
+        let Ok(session) = std::str::from_utf8(session) else {
+            continue;
+        };
+        if !sessions.ours(db, session) {
+            continue;
+        }
+        if let Ok(rusqlite::types::ValueRef::Text(data)) = row.get_ref(3)
             && let Some(tokens) = tokens_in(data)
         {
             sum.get_or_insert_default().add(&tokens);
         }
     }
     Some((sum, reached))
+}
+
+/// Which of opencode's sessions belong to the turn: those whose `directory`
+/// is the turn's clone. That covers the subagent sessions it spawns too,
+/// which opencode opens in their parent's directory.
+///
+/// A session's directory is fixed when it is created, so each answer is
+/// memoized for the rest of the turn: a sample asks once per session it
+/// meets rather than once per message.
+struct Sessions {
+    /// The clone as opencode records it: the working directory it was started
+    /// in, which the kernel reports resolved, so the comparison is against
+    /// the canonical form.
+    dir: String,
+    known: HashMap<String, bool>,
+}
+
+impl Sessions {
+    fn new(dir: &Path) -> Sessions {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
+        Sessions {
+            dir: dir.to_string_lossy().into_owned(),
+            known: HashMap::new(),
+        }
+    }
+
+    /// Whether `id` is one of the turn's sessions. A lookup that fails says
+    /// no without being remembered, so the next sample asks again.
+    fn ours(&mut self, db: &rusqlite::Connection, id: &str) -> bool {
+        if let Some(&ours) = self.known.get(id) {
+            return ours;
+        }
+        let Ok(directory) =
+            db.query_row("SELECT directory FROM session WHERE id = ?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+        else {
+            return false;
+        };
+        let ours = directory == self.dir;
+        self.known.insert(id.to_owned(), ours);
+        ours
+    }
 }
 
 /// The database files opencode may be writing: `opencode.db` historically,
@@ -316,29 +383,54 @@ mod tests {
 
     const SINCE_MS: i64 = 1_700_000_000_000;
 
+    /// The turn's clone. It doesn't exist, so it is compared as written.
+    const CLONE: &str = "/workspace/gitea/owner/repo";
+
     fn at(ms: i64) -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(ms as u64)
     }
 
-    /// An empty database with the `message` table opencode's sqlite
-    /// migration produces, plus a hand for appending rows to it.
+    /// A sampler for the turn started at `ms` in [`CLONE`].
+    fn turn(ms: i64) -> Sampler {
+        Sampler::new(at(ms), Path::new(CLONE))
+    }
+
+    /// An empty database with the `session` and `message` tables opencode's
+    /// sqlite migration produces (down to the columns read here), holding
+    /// the turn's own session, `ses`, plus a hand for appending rows to it.
     fn message_table(path: &Path) -> rusqlite::Connection {
         let db = rusqlite::Connection::open(path).unwrap();
         db.execute_batch(
-            "CREATE TABLE message (
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL
+            );
+            CREATE TABLE message (
                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
                 time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
                 data TEXT NOT NULL
             );",
         )
         .unwrap();
+        session(&db, "ses", None, CLONE);
         db
     }
 
-    fn record(db: &rusqlite::Connection, id: &str, at: i64, data: &str) {
+    fn session(db: &rusqlite::Connection, id: &str, parent: Option<&str>, dir: &str) {
         db.execute(
-            "INSERT INTO message VALUES (?1, 'ses', ?2, ?2, ?3)",
-            rusqlite::params![id, at, data],
+            "INSERT INTO session VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, parent, dir],
+        )
+        .unwrap();
+    }
+
+    fn record(db: &rusqlite::Connection, id: &str, at: i64, data: &str) {
+        record_in(db, "ses", id, at, data);
+    }
+
+    fn record_in(db: &rusqlite::Connection, session: &str, id: &str, at: i64, data: &str) {
+        db.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)",
+            rusqlite::params![id, session, at, data],
         )
         .unwrap();
     }
@@ -372,7 +464,7 @@ mod tests {
         );
         drop(db);
 
-        let sum = Sampler::new(at(SINCE_MS)).read(dir.path()).unwrap();
+        let sum = turn(SINCE_MS).read(dir.path()).unwrap();
         assert_eq!(sum.input, 110);
         assert_eq!(sum.output, 25);
         assert_eq!(sum.reasoning, 7);
@@ -383,13 +475,43 @@ mod tests {
         // None and not a cost of zero: the page shows a turn opencode hasn't
         // accounted for yet as unknown, and "unknown" is also what a turn
         // that died before its first message is recorded with.
-        assert!(
-            Sampler::new(at(SINCE_MS + 60_000))
-                .read(dir.path())
-                .is_none()
-        );
+        assert!(turn(SINCE_MS + 60_000).read(dir.path()).is_none());
         let empty = tempfile::tempdir().unwrap();
-        assert!(Sampler::new(at(SINCE_MS)).read(empty.path()).is_none());
+        assert!(turn(SINCE_MS).read(empty.path()).is_none());
+    }
+
+    /// The database is shared by every opencode under the same `$HOME`, so
+    /// the window alone would bill the turn for whatever else ran in it: a
+    /// session someone opened by hand, or another turn in another clone.
+    /// Only the sessions opened in the turn's clone count — its subagents
+    /// among them — on the first sample's backwards walk and on every
+    /// resample's forward one alike.
+    #[test]
+    fn only_the_sessions_opened_in_the_clone_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = message_table(&dir.path().join("opencode.db"));
+        session(&db, "sub", Some("ses"), CLONE);
+        session(&db, "other", None, "/workspace/gitea/owner/elsewhere");
+        // A clone nested under this one's path is still not this clone.
+        session(&db, "nested", None, &format!("{CLONE}/sub"));
+        record(&db, "mine", SINCE_MS + 1_000, &answer(100));
+        record_in(&db, "sub", "sub1", SINCE_MS + 2_000, &answer(20));
+        record_in(&db, "other", "theirs", SINCE_MS + 3_000, &answer(999));
+        record_in(&db, "nested", "nest", SINCE_MS + 3_500, &answer(999));
+        // A message whose session can't be found isn't anyone's to bill.
+        record_in(&db, "gone", "orphan", SINCE_MS + 4_000, &answer(999));
+
+        let mut live = turn(SINCE_MS);
+        assert_eq!(live.read(dir.path()).map(|t| t.input), Some(120));
+
+        record_in(&db, "other", "theirs2", SINCE_MS + 5_000, &answer(999));
+        record_in(&db, "sub", "sub2", SINCE_MS + 6_000, &answer(3));
+        assert_eq!(live.read(dir.path()).map(|t| t.input), Some(123));
+
+        // A turn whose clone has no sessions in the window has nothing
+        // recorded for it, however busy the database is.
+        let mut idle = Sampler::new(at(SINCE_MS), Path::new("/workspace/gitea/owner/idle"));
+        assert!(idle.read(dir.path()).is_none());
     }
 
     /// The first sample walks the table backwards and ends on the first row
@@ -403,7 +525,7 @@ mod tests {
         let path = dir.path().join("opencode.db");
         let db = message_table(&path);
         let slack_ms = CLOCK_SLACK.as_millis() as i64;
-        let fresh = || Sampler::new(at(SINCE_MS)).read(dir.path()).unwrap().input;
+        let fresh = || turn(SINCE_MS).read(dir.path()).unwrap().input;
 
         // Recorded in order, but the clock stepped back between the first
         // message and the second, putting a pre-turn stamp on a mid-turn row.
@@ -432,9 +554,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opencode.db");
         let db = message_table(&path);
-        let fresh = || Sampler::new(at(SINCE_MS)).read(dir.path()).map(|t| t.input);
+        let fresh = || turn(SINCE_MS).read(dir.path()).map(|t| t.input);
 
-        let mut live = Sampler::new(at(SINCE_MS));
+        let mut live = turn(SINCE_MS);
         // Sampled before opencode has recorded anything: nothing to report,
         // and nothing remembered either, so the next sample still looks.
         assert!(live.read(dir.path()).is_none());
@@ -487,7 +609,7 @@ mod tests {
         record(&live_db, "first", SINCE_MS + 1_000, &answer(100));
 
         // `databases` sorts, so the stale `-dev` file is the one tried first.
-        let mut sampler = Sampler::new(at(SINCE_MS));
+        let mut sampler = turn(SINCE_MS);
         assert_eq!(sampler.read(dir.path()).map(|t| t.input), Some(100));
         assert_eq!(sampler.cursor.as_ref().map(|(path, _)| path), Some(&live));
 
