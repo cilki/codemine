@@ -5,6 +5,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -80,7 +81,10 @@ struct Turn<'a> {
     /// The turn's log under `<workspace>/logs`, which the page tails while
     /// the turn runs and serves in full once it is over.
     log_path: PathBuf,
-    /// Epoch seconds; doubles as the turn's identifier in the web UI.
+    /// The turn's identifier: what its log is named after and what the page
+    /// asks for it by. See `next_id`.
+    id: u64,
+    /// Epoch seconds, for the page to show.
     started: u64,
     /// The same moment by the wall clock, which the token scan needs: it asks
     /// opencode for the messages recorded since.
@@ -110,6 +114,7 @@ impl Turn<'_> {
             pgid: 0,
             paused: false,
             cancel_requested: false,
+            id: self.id,
             started: self.started,
             tokens: None,
             rtk: None,
@@ -125,6 +130,7 @@ impl Turn<'_> {
             task: self.task.to_owned(),
             repo: self.repo.to_owned(),
             forge: self.forge_name().into(),
+            id: self.id,
             started: self.started,
             duration_secs: elapsed,
             outcome,
@@ -170,15 +176,16 @@ pub fn run(
         return Ok(Report::Idle(Idle::NothingToDo));
     };
 
-    let started = epoch_now();
-    let (log_path, mut log) = open_log(&cfg.workspace.join("logs"), started)?;
+    let id = next_id();
+    let (log_path, mut log) = open_log(&cfg.workspace.join("logs"), id)?;
     let turn = Turn {
         task,
         forge,
         repo,
         dir: workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo),
         log_path,
-        started,
+        id,
+        started: epoch_now(),
         wall: SystemTime::now(),
         clock: Instant::now(),
     };
@@ -296,6 +303,16 @@ fn pick<'a>(
     }
 }
 
+/// A fresh turn id: 1 for the process's first turn, one more for each after.
+/// The start second used to double as the id, which only held while turns
+/// never start within the same second of each other; a counter keeps holding
+/// once they can. Nothing outlives the process — the history and the logs
+/// behind it are both gone on restart — so the count need not either.
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Create the turn's log and the directory it lives in. Opened for reading as
 /// well as writing: the runner tails the same handle for the page while the
 /// agent appends to it.
@@ -306,10 +323,11 @@ fn pick<'a>(
 /// print — and the runner's own secrets are already kept out of reach of
 /// other local users, so this must not be the way back in. The mode applies
 /// only on creation, which is every log: `setup` clears the directory at
-/// startup, so a name can never be reused.
-fn open_log(logs_dir: &Path, started: u64) -> Result<(PathBuf, File)> {
+/// startup and `next_id` never hands out the same id twice in a process, so
+/// a name can never be reused.
+fn open_log(logs_dir: &Path, id: u64) -> Result<(PathBuf, File)> {
     workspace::private_dir(logs_dir)?;
-    let path = logs_dir.join(format!("{started}.log"));
+    let path = logs_dir.join(format!("{id}.log"));
     let log = File::options()
         .create(true)
         .truncate(true)

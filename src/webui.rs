@@ -90,7 +90,7 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/emblem.svg", get(emblem))
         .route("/favicon.svg", get(favicon))
         .route("/api/status", get(api_status))
-        .route("/api/turns/{started}/log", get(api_turn_log))
+        .route("/api/turns/{id}/log", get(api_turn_log))
         .route("/api/events", get(api_events))
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/paused", axum::routing::put(api_put_paused))
@@ -138,15 +138,15 @@ async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-/// One finished turn's full log, identified by its start epoch. Served raw,
+/// One finished turn's full log, identified by the turn's id. Served raw,
 /// ANSI escapes and all; the page renders them.
-async fn api_turn_log(State(state): State<AppState>, Path(started): Path<u64>) -> Response {
+async fn api_turn_log(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
     let path = state
         .status
         .lock()
         .turns
         .iter()
-        .find(|record| record.started == started)
+        .find(|record| record.id == id)
         .map(|record| record.log_path.clone());
     let Some(path) = path else {
         return (StatusCode::NOT_FOUND, "no such turn").into_response();
@@ -649,6 +649,7 @@ mod tests {
             pgid,
             paused: false,
             cancel_requested: false,
+            id: 1,
             started: 0,
             tokens: None,
             rtk: None,
@@ -889,6 +890,7 @@ mod tests {
             task: "benchmark".into(),
             repo: "cilki/codemine".into(),
             forge: "gitea".into(),
+            id: started,
             started,
             duration_secs: 987,
             outcome: crate::status::Outcome::Completed,
@@ -981,26 +983,37 @@ mod tests {
         assert_eq!(value["activity"]["state"], "starting");
     }
 
+    /// A turn's log is asked for by the turn's id, not when it started: two
+    /// turns that began in the same second are still two logs.
     #[test]
-    fn turn_log_serves_full_file_by_start_epoch() {
+    fn turn_log_serves_full_file_by_turn_id() {
         let status = Shared::new();
         let (addr, dir) = serve_in_tempdir(&status);
-        let path = dir.path().join("100.log");
-        std::fs::write(&path, "\x1b[32mall good\x1b[0m\n").unwrap();
+        let first = dir.path().join("1.log");
+        let second = dir.path().join("2.log");
+        std::fs::write(&first, "\x1b[32mall good\x1b[0m\n").unwrap();
+        std::fs::write(&second, "the other turn\n").unwrap();
         Status::update(&status, |s| {
-            let mut turn = record(100);
-            turn.log_path = path.clone();
-            s.record_turn(turn, None);
+            for (id, path) in [(1, &first), (2, &second)] {
+                let mut turn = record(1_760_000_000);
+                turn.id = id;
+                turn.log_path = path.clone();
+                s.record_turn(turn, None);
+            }
         });
 
         // The full log comes back raw, ANSI escapes included.
-        let response = request(addr, "GET", "/api/turns/100/log", "");
+        let response = request(addr, "GET", "/api/turns/1/log", "");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("\x1b[32mall good\x1b[0m"), "{response:?}");
+        assert!(!response.contains("the other turn"), "{response:?}");
+        let response = request(addr, "GET", "/api/turns/2/log", "");
+        assert!(response.contains("the other turn"), "{response:?}");
 
-        assert!(request(addr, "GET", "/api/turns/999/log", "").starts_with("HTTP/1.1 404"));
-        std::fs::remove_file(&path).unwrap();
-        assert!(request(addr, "GET", "/api/turns/100/log", "").starts_with("HTTP/1.1 404"));
+        // The start second is no longer an id.
+        assert!(request(addr, "GET", "/api/turns/1760000000/log", "").starts_with("HTTP/1.1 404"));
+        std::fs::remove_file(&first).unwrap();
+        assert!(request(addr, "GET", "/api/turns/1/log", "").starts_with("HTTP/1.1 404"));
     }
 
     #[test]

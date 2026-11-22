@@ -376,7 +376,7 @@
   // for the history rather than `turns`, which is already the id of the
   // container the rows go in.
   let turnHistory = [];
-  // The turn (by its start epoch) a cancel was sent for, so the button stays
+  // The turn (by its id) a cancel was sent for, so the button stays
   // dead until that turn is gone and can't fire twice or hit its successor.
   let canceling = null;
 
@@ -566,7 +566,7 @@
     $("pause").hidden = a.state !== "running";
     $("pause").textContent = a.paused ? "resume" : "pause";
     $("cancel").hidden = a.state !== "running";
-    $("cancel").disabled = a.state === "running" && a.started === canceling;
+    $("cancel").disabled = a.state === "running" && a.id === canceling;
     renderClock();
 
     $("stat-completed").textContent = state.totals.completed;
@@ -593,9 +593,9 @@
         new Date(turn.started * 1000).toLocaleString(),
         fmtDuration(turn.duration_secs) +
           (turn.tokens ? " · " + fmtTokens(tokenTotal(turn.tokens)) + " tokens" : ""));
-      row.className = "turn" + (viewing === turn.started ? " selected" : "");
+      row.className = "turn" + (viewing === turn.id ? " selected" : "");
       // Clicking a turn shows its full log; clicking again goes back to live.
-      row.onclick = () => viewing === turn.started ? viewLive() : viewTurn(turn);
+      row.onclick = () => viewing === turn.id ? viewLive() : viewTurn(turn);
       if (turn.tokens) row.title = tokenBreakdown(turn.tokens);
       return row;
     });
@@ -764,7 +764,7 @@
   }
 
   // The live tail, or a finished turn's full log when one is selected;
-  // `viewing` holds the selected turn's start epoch, which is its identifier.
+  // `viewing` holds the selected turn's id.
   let liveLog = "";
   let viewing = null;
 
@@ -787,20 +787,20 @@
   }
 
   async function viewTurn(turn) {
-    viewing = turn.started;
+    viewing = turn.id;
     $("log-title").replaceChildren("Log — ", badge(turn.task), " on " + turn.repo);
     $("log-live").hidden = false;
     render();
     let text;
     try {
-      const res = await fetch(`/api/turns/${turn.started}/log`);
+      const res = await fetch(`/api/turns/${turn.id}/log`);
       text = await res.text();
       if (!res.ok) throw new Error(text || res.status);
     } catch (err) {
       text = String(err.message || err);
     }
     // Ignore a fetch that finished after the reader moved on.
-    if (viewing !== turn.started) return;
+    if (viewing !== turn.id) return;
     renderLog($("log"), text);
     $("log").scrollTop = 0;
   }
@@ -1391,7 +1391,7 @@
   // The turn's end comes back over the event stream; the button only asks.
   // It goes dead for this turn on the click, and a failed request revives it.
   $("cancel").onclick = () => {
-    canceling = state.activity.started;
+    canceling = state.activity.id;
     render();
     fetch("/api/cancel", { method: "POST" }).then(response => {
       if (!response.ok) throw response;

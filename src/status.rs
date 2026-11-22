@@ -90,8 +90,10 @@ pub struct TurnRecord {
     pub task: String,
     pub repo: String,
     pub forge: String,
-    /// Epoch seconds; doubles as the turn's identifier in the web UI, which
-    /// is unambiguous because the runner sleeps between turns.
+    /// The turn's identifier, unique within the process: what the page asks
+    /// for the turn's log by.
+    pub id: u64,
+    /// Epoch seconds.
     pub started: u64,
     pub duration_secs: u64,
     pub outcome: Outcome,
@@ -150,6 +152,8 @@ pub enum Activity {
         /// notices at its next wait hop and kills the agent's tree.
         #[serde(skip)]
         cancel_requested: bool,
+        /// The id the turn's record will carry once it is over.
+        id: u64,
         started: u64,
         /// What the turn has spent so far, resampled while it runs; None
         /// until opencode has recorded its first message.
@@ -379,7 +383,7 @@ impl Status {
         self.turns.push_front(record);
         self.turns_revision += 1;
         // A record is the only way to reach a turn's log — the web UI asks
-        // for one by the start epoch this list is keyed on — so the file
+        // for one by the turn id this list is keyed on — so the file
         // behind an aged-out record is unreachable bytes from here on, and
         // goes with it. Already gone is the ordinary case for a log the
         // runner never got to write, so a failed unlink is not worth a line
@@ -411,6 +415,7 @@ mod tests {
             task: "todo".into(),
             repo: "owner/repo".into(),
             forge: "gitea".into(),
+            id: 1,
             started: 1,
             duration_secs: 2,
             outcome,
