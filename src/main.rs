@@ -29,7 +29,7 @@ mod webui;
 mod workspace;
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -163,7 +163,7 @@ fn main() -> Result<()> {
             }
         }
         let cfg = match runnable(
-            &cli,
+            &cli.workspace,
             &settings,
             problems,
             generation,
@@ -448,7 +448,7 @@ impl Blocked {
 /// what the web UI shows as blocking turns, each problem tied to the field
 /// that fixes it.
 fn runnable(
-    cli: &Cli,
+    workspace: &Path,
     settings: &Settings,
     blocking: Vec<Problem>,
     generation: u64,
@@ -475,7 +475,7 @@ fn runnable(
             format!("failed to point opencode at the proxy: {err:#}"),
         )]
     })?;
-    let mut cfg = settings.to_config(cli);
+    let mut cfg = settings.to_config(workspace);
 
     // Cached, so resolving is a map lookup on every pass but the first.
     // Errors are returned rather than logged here: the caller logs whatever
@@ -484,7 +484,7 @@ fn runnable(
         .map_err(|err| vec![Problem::new("f-token", format!("{err:#}"))])?;
 
     if *applied_generation != Some(generation) {
-        apply_forge_auth(cli, &cfg.forge).map_err(|err| {
+        apply_forge_auth(workspace, &cfg.forge).map_err(|err| {
             vec![Problem::new(
                 "",
                 format!("failed to apply forge auth: {err:#}"),
@@ -610,7 +610,7 @@ fn setup(cli: &mut Cli) -> Result<File> {
     // no longer enabled. Nothing is running in them yet.
     workspace::clear_clones(&cli.workspace)?;
 
-    let gitconfig = install_git_config(cli, &config::home())?;
+    let gitconfig = install_git_config(&cli.workspace, &config::home())?;
     // SAFETY: setup() runs before the web UI and agent threads exist, so no
     // other thread can be touching the environment.
     unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &gitconfig) };
@@ -624,8 +624,8 @@ fn setup(cli: &mut Cli) -> Result<File> {
 /// inherits the variable. The real global config is chained in with
 /// `include.path`, so the user's identity and everything else they set still
 /// applies; git ignores the include when the file isn't there.
-fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
-    let path = cli.workspace.join("gitconfig");
+fn install_git_config(workspace: &Path, home: &Path) -> Result<PathBuf> {
+    let path = workspace.join("gitconfig");
     // The home directory is passed in, resolved by `config::home()`, rather
     // than read straight out of the environment here: that dropped the
     // include altogether whenever `$HOME` was unset — silently losing the
@@ -646,7 +646,7 @@ fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
     // git was meant to send, was never consulted at all.
     config.push_str(&format!(
         "[credential]\n\thelper =\n\thelper = store --file={}\n",
-        workspace::git_credentials(&cli.workspace).display()
+        workspace::git_credentials(workspace).display()
     ));
     std::fs::write(&path, config).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
@@ -655,9 +655,9 @@ fn install_git_config(cli: &Cli, home: &std::path::Path) -> Result<PathBuf> {
 /// Let git and tea authenticate to the configured forge; re-run whenever
 /// the settings change so a new token, URL, or forge takes effect on the
 /// next turn.
-fn apply_forge_auth(cli: &Cli, forge: &Forge) -> Result<()> {
+fn apply_forge_auth(workspace: &Path, forge: &Forge) -> Result<()> {
     workspace::write_private(
-        &workspace::git_credentials(&cli.workspace),
+        &workspace::git_credentials(workspace),
         credential_line(forge).as_bytes(),
     )?;
 
@@ -893,26 +893,15 @@ mod tests {
     #[test]
     fn the_git_config_chains_the_users_own() {
         let workspace = tempfile::tempdir().unwrap();
-        let cli = Cli::parse(
-            [
-                "codemine",
-                "--workspace",
-                &workspace.path().display().to_string(),
-            ]
-            .map(String::from)
-            .into_iter(),
-        )
-        .unwrap()
-        .unwrap();
 
-        let path = install_git_config(&cli, std::path::Path::new("/home/bot")).unwrap();
+        let path = install_git_config(workspace.path(), Path::new("/home/bot")).unwrap();
         assert_eq!(path, workspace.path().join("gitconfig"));
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("path = /home/bot/.gitconfig"), "{written}");
         assert!(
             written.contains(&format!(
                 "helper = store --file={}",
-                workspace::git_credentials(&cli.workspace).display()
+                workspace::git_credentials(workspace.path()).display()
             )),
             "{written}"
         );
@@ -948,47 +937,14 @@ mod tests {
         )
         .unwrap();
 
-        let cli = Cli::parse(
-            [
-                "codemine",
-                "--workspace",
-                &workspace.path().display().to_string(),
-            ]
-            .map(String::from)
-            .into_iter(),
-        )
-        .unwrap()
-        .unwrap();
-        let config = install_git_config(&cli, home.path()).unwrap();
+        let config = install_git_config(workspace.path(), home.path()).unwrap();
         std::fs::write(
-            workspace::git_credentials(&cli.workspace),
+            workspace::git_credentials(workspace.path()),
             credential_line(&forge("bot", "s3cret")),
         )
         .unwrap();
 
-        let mut child = Command::new("git")
-            .args(["credential", "fill"])
-            .env("GIT_CONFIG_GLOBAL", &config)
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"protocol=https\nhost=forge.example.com\n\n")
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        let answer = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let answer = credential_fill(&config);
         assert!(answer.contains("username=bot\n"), "{answer}");
         assert!(answer.contains("password=s3cret\n"), "{answer}");
     }
@@ -999,25 +955,14 @@ mod tests {
     #[test]
     fn the_credential_store_is_rewritten_owner_only() {
         let workspace = tempfile::tempdir().unwrap();
-        let cli = Cli::parse(
-            [
-                "codemine",
-                "--workspace",
-                &workspace.path().display().to_string(),
-            ]
-            .map(String::from)
-            .into_iter(),
-        )
-        .unwrap()
-        .unwrap();
-        let store = workspace::git_credentials(&cli.workspace);
+        let store = workspace::git_credentials(workspace.path());
         std::fs::write(&store, "stale\n").unwrap();
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         // GitHub, so no `tea login` is attempted.
         let mut forge = Forge::test(ForgeKind::Github, "https://github.com");
         forge.token = "s3cret".to_owned();
-        apply_forge_auth(&cli, &forge).unwrap();
+        apply_forge_auth(workspace.path(), &forge).unwrap();
 
         let mode = std::fs::metadata(&store).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
@@ -1045,14 +990,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("credentials");
         std::fs::write(&store, line).unwrap();
+        let config = dir.path().join("gitconfig");
+        std::fs::write(
+            &config,
+            format!(
+                "[credential]\n\thelper = store --file={}\n",
+                store.display()
+            ),
+        )
+        .unwrap();
+        credential_fill(&config)
+    }
+
+    /// What `git credential fill` answers for `forge.example.com` with
+    /// `config` as its only configuration.
+    fn credential_fill(config: &Path) -> String {
         let mut child = Command::new("git")
-            .args([
-                "-c",
-                &format!("credential.helper=store --file={}", store.display()),
-                "credential",
-                "fill",
-            ])
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["credential", "fill"])
+            .env("GIT_CONFIG_GLOBAL", config)
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::piped())
@@ -1069,7 +1024,8 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
-            "git could not read {line:?}: {}",
+            "git could not answer from {}: {}",
+            config.display(),
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).into_owned()

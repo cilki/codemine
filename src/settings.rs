@@ -3,14 +3,14 @@
 //! changes apply at the next turn boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Cli, Config, Forge, ForgeKind};
+use crate::config::{Config, Forge, ForgeKind};
 use crate::schedule::Schedule;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -309,7 +309,7 @@ impl Settings {
     /// The runnable snapshot for a turn. Only for settings whose `problems`
     /// came back empty, which the main loop has already asked by the time it
     /// gets here.
-    pub fn to_config(&self, cli: &Cli) -> Config {
+    pub fn to_config(&self, workspace: &Path) -> Config {
         Config {
             forge: self
                 .runtime_forge()
@@ -320,7 +320,7 @@ impl Settings {
             author_name: model_author_name(&self.model),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             schedule: self.schedule,
-            workspace: cli.workspace.clone(),
+            workspace: workspace.to_owned(),
         }
     }
 
@@ -499,16 +499,6 @@ mod tests {
         }
     }
 
-    fn cli() -> Cli {
-        Cli::parse(
-            ["codemine", "--workspace", "/tmp/ws"]
-                .map(String::from)
-                .into_iter(),
-        )
-        .unwrap()
-        .unwrap()
-    }
-
     #[test]
     fn defaults_are_unconfigured() {
         let settings = Settings::default();
@@ -523,13 +513,16 @@ mod tests {
     fn the_schedule_is_off_until_it_is_turned_on() {
         let settings = configured();
         assert!(!settings.schedule.enabled);
-        assert_eq!(settings.to_config(&cli()).schedule.hold(0), None);
+        assert_eq!(
+            settings.to_config(Path::new("/tmp/ws")).schedule.hold(0),
+            None
+        );
 
         let mut scheduled = configured();
         scheduled.schedule.enabled = true;
         scheduled.schedule.start_minute = 22 * 60;
         scheduled.schedule.end_minute = 6 * 60;
-        let config = scheduled.to_config(&cli());
+        let config = scheduled.to_config(Path::new("/tmp/ws"));
         assert_eq!(config.schedule.hold(23 * 3600), None);
         assert_eq!(config.schedule.hold(12 * 3600), Some(10 * 3600));
     }
@@ -538,7 +531,7 @@ mod tests {
     fn configured_settings_build_a_config() {
         let settings = configured();
         assert!(settings.problems().is_empty());
-        let config = settings.to_config(&cli());
+        let config = settings.to_config(Path::new("/tmp/ws"));
         assert_eq!(config.forge.kind, ForgeKind::Github);
         assert_eq!(config.forge.url, "https://github.com");
         assert_eq!(config.forge.credential_user(), "x-access-token");
@@ -566,7 +559,7 @@ mod tests {
             .repos
             .insert("owner/repo".into(), repo(true, &["lint", "docs"]));
         assert!(settings.problems().is_empty());
-        let config = settings.to_config(&cli());
+        let config = settings.to_config(Path::new("/tmp/ws"));
         assert_eq!(config.forge.repos["owner/repo"], ["docs".to_owned()].into());
         // The stored picks are left alone, so a hand-edited config.json isn't
         // rewritten behind the user's back.
@@ -592,7 +585,7 @@ mod tests {
             .forge
             .repos
             .insert("owner/other".into(), repo(false, &["docs"]));
-        let config = settings.to_config(&cli());
+        let config = settings.to_config(Path::new("/tmp/ws"));
         assert!(!config.forge.repos.contains_key("owner/other"));
         assert!(!config.forge.runs("docs", "owner/other"));
 
@@ -670,7 +663,7 @@ mod tests {
 
         settings.forge.url = "https://git.example.com".into();
         assert!(settings.problems().is_empty());
-        let config = settings.to_config(&cli());
+        let config = settings.to_config(Path::new("/tmp/ws"));
         assert_eq!(config.forge.url, "https://git.example.com");
         // Gitea's credential user is the login, read off the forge later.
         assert_eq!(config.forge.credential_user(), "");
