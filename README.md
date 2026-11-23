@@ -197,6 +197,17 @@ heading in `commands/sweep.md` — `head`, `feed`, `prs`, or `reviews`, as above
 — and a task without one is never cached. The line is read by **codemine** and
 dropped from the prompt the agent sees.
 
+#### Turn notes
+
+Each turn gets a notes file for its task on its repository,
+`notes/<forge>/<owner>/<repo>/<task>.md` in the workspace. The agent reads what
+earlier turns left there before it starts, and rewrites it before it signs off
+with what the next turn should know: what it covered, what it ruled out, the
+tools or quirks it ran into. That spares the next turn from rediscovering them.
+The notes survive restarts, the way `skips.json` does. **codemine** cuts a file
+to its first 8 KiB of whole lines after each turn, so a runaway file can't cost
+every later turn the tokens to read it. Delete a file to make the agent forget what it says.
+
 #### Custom tasks
 
 Put your own tasks in `tasks.md` in the workspace, written the way

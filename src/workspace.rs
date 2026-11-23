@@ -29,6 +29,69 @@ pub fn repo_dir(root: &Path, forge_slug: &str, repo: &str) -> PathBuf {
     root.join(forge_slug).join(repo)
 }
 
+/// The most a notes file keeps once its turn is over. Every later turn of
+/// the task on the repository reads the whole file, so a runaway one would
+/// tax them all; 8 KiB is several times the 60 lines the prompt asks for.
+pub const NOTES_CAP: usize = 8 * 1024;
+
+/// Where the agent keeps notes for the next turn of `task` on `repo`. Under
+/// `notes/` rather than in the clone, so they outlive the restarts that clear
+/// the clones (`clear_clones` only takes the forge directories), and per task
+/// so that each one reads only what its own predecessors learned.
+pub fn notes_path(root: &Path, forge_slug: &str, repo: &str, task: &str) -> PathBuf {
+    root.join("notes")
+        .join(forge_slug)
+        .join(repo)
+        .join(format!("{task}.md"))
+}
+
+/// Make the directory a notes file goes in, owner-only like the turn logs:
+/// notes are written by the agent and can quote a private repository. The
+/// file itself is left to the agent, so its absence tells a turn it is the
+/// first.
+pub fn prepare_notes(path: &Path) -> Result<()> {
+    match path.parent() {
+        Some(dir) => private_dir(dir),
+        None => Ok(()),
+    }
+}
+
+/// Hold a notes file to `cap` bytes once the agent is done with it: what
+/// fits is kept up to the last whole line, followed by a line saying the
+/// rest was cut, so the next turn knows to write less. Anything there that
+/// isn't a plain file (a symlink, a directory) is removed instead — it would
+/// have the runner read, or cut, something that isn't the agent's notes.
+pub fn cap_notes(path: &Path, cap: usize) -> Result<()> {
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    };
+    if !meta.is_file() {
+        warn!("{} is not a plain file; removing it", path.display());
+        let removed = match meta.is_dir() {
+            true => std::fs::remove_dir_all(path),
+            false => std::fs::remove_file(path),
+        };
+        return removed.with_context(|| format!("failed to remove {}", path.display()));
+    }
+    if meta.len() <= cap as u64 {
+        return Ok(());
+    }
+    let text = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let marker = format!("[cut by codemine at {cap} bytes: keep these notes shorter]\n");
+    let budget = cap.saturating_sub(marker.len()).min(text.len());
+    // Up to and including the last newline that fits; a first line longer
+    // than the budget leaves only the marker.
+    let keep = text[..budget]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |at| at + 1);
+    let mut capped = text[..keep].to_vec();
+    capped.extend_from_slice(marker.as_bytes());
+    std::fs::write(path, capped).with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// Where the credential helper keeps forge logins. It lives in the workspace
 /// rather than at the helper's default `~/.git-credentials`, because the home
 /// directory isn't necessarily writable.
@@ -1088,18 +1151,88 @@ mod tests {
         for file in ["config.json", "skips.json"] {
             std::fs::write(ws.join(file), "{}").unwrap();
         }
+        // The notes are what earlier turns learned, and are kept precisely so
+        // that a restart doesn't lose it.
+        let notes = notes_path(ws, ForgeKind::ALL[0].name(), "owner/repo", "simplify");
+        prepare_notes(&notes).unwrap();
+        std::fs::write(&notes, "src/cache.rs: nothing to simplify\n").unwrap();
 
         clear_clones(ws).unwrap();
 
         for kind in ForgeKind::ALL {
             assert!(!ws.join(kind.name()).exists(), "{} survived", kind.name());
         }
+        assert!(notes.exists(), "the notes were removed");
         for kept in ["logs", "cliproxyapi/auth", "config.json", "skips.json"] {
             assert!(ws.join(kept).exists(), "{kept} was removed");
         }
 
         // Nothing to clear is not an error.
         clear_clones(ws).unwrap();
+    }
+
+    /// A notes file over the cap keeps its whole lines that fit, then a line
+    /// saying the rest was cut; one within it, or none at all, is untouched.
+    #[test]
+    fn notes_are_capped_at_a_line_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let notes = notes_path(root.path(), "gitea", "me/repo", "mutation");
+        assert_eq!(
+            notes,
+            root.path().join("notes/gitea/me/repo/mutation.md"),
+            "notes are kept per forge, repository and task"
+        );
+        prepare_notes(&notes).unwrap();
+        assert_eq!(mode_of(&root.path().join("notes")), 0o700);
+        assert_eq!(mode_of(notes.parent().unwrap()), 0o700);
+
+        // No notes yet: the first turn didn't leave any, which is fine.
+        cap_notes(&notes, 100).unwrap();
+        assert!(!notes.exists());
+
+        let short = "cache.rs: every mutant killed\n";
+        std::fs::write(&notes, short).unwrap();
+        cap_notes(&notes, 100).unwrap();
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), short);
+
+        let long: String = (0..40).map(|n| format!("line {n:02}\n")).collect();
+        std::fs::write(&notes, &long).unwrap();
+        cap_notes(&notes, 100).unwrap();
+        let capped = std::fs::read_to_string(&notes).unwrap();
+        assert!(capped.len() <= 100, "{} bytes: {capped:?}", capped.len());
+        let (kept, marker) = capped.trim_end().rsplit_once('\n').unwrap();
+        assert!(long.starts_with(&format!("{kept}\n")), "{capped:?}");
+        // Whole lines only, and as many as fit beside the marker.
+        assert!(kept.lines().all(|l| l.len() == "line 00".len()), "{capped:?}");
+        assert!(capped.len() + "line 00\n".len() > 100, "{capped:?}");
+        assert!(marker.starts_with("[cut by codemine at 100 bytes"), "{capped:?}");
+
+        // A first line longer than the cap leaves only the marker.
+        std::fs::write(&notes, "x".repeat(500)).unwrap();
+        cap_notes(&notes, 100).unwrap();
+        assert!(
+            std::fs::read_to_string(&notes)
+                .unwrap()
+                .starts_with("[cut by codemine")
+        );
+    }
+
+    /// A notes "file" that is really a link points the runner at something
+    /// else to read and cut; the link goes, and what it pointed at stays.
+    #[test]
+    fn a_linked_notes_file_is_removed_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("config.json");
+        let big = "x\n".repeat(1000);
+        std::fs::write(&target, &big).unwrap();
+        let notes = notes_path(root.path(), "gitea", "me/repo", "docs");
+        prepare_notes(&notes).unwrap();
+        std::os::unix::fs::symlink(&target, &notes).unwrap();
+
+        cap_notes(&notes, 100).unwrap();
+
+        assert!(notes.symlink_metadata().is_err(), "the link survived");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), big);
     }
 
     /// What the agent started in the background dies with the turn, even

@@ -85,19 +85,28 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<(
 
 /// The sweep prompt for one turn: `SWEEP`, with the user's own tasks merged
 /// into its task sections and its cache lines dropped, without its front matter, with
-/// `$1`–`$4` replaced by the task, the repository, the forge, and the clone
-/// the agent must work in, and the paragraph between the `codegraph` markers
-/// kept only when the tool it recommends is there to use — `install_mcp`
-/// wires `codegraph_explore` in on the same condition, and a prompt that
-/// prefers a tool the session doesn't have is a prompt the agent has to
-/// read past.
+/// `$1`–`$5` replaced by the task, the repository, the forge, the clone the
+/// agent must work in, and the notes file earlier turns of this task on this
+/// repository left (see `workspace::notes_path`), and the paragraph between
+/// the `codegraph` markers kept only when the tool it recommends is there to
+/// use — `install_mcp` wires `codegraph_explore` in on the same condition,
+/// and a prompt that prefers a tool the session doesn't have is a prompt the
+/// agent has to read past.
 ///
 /// Replaced in a single pass, so a value that itself contains `$2` and the
 /// like is inserted as it is rather than expanded again.
-pub fn sweep_prompt(task: &str, repo: &str, forge: &str, dir: &Path, codegraph: bool) -> String {
+pub fn sweep_prompt(
+    task: &str,
+    repo: &str,
+    forge: &str,
+    dir: &Path,
+    notes: &Path,
+    codegraph: bool,
+) -> String {
     let source = sweep().rendered.as_str();
     let dir = dir.display().to_string();
-    let args = [task, repo, forge, dir.as_str()];
+    let notes = notes.display().to_string();
+    let args = [task, repo, forge, dir.as_str(), notes.as_str()];
     let mut prompt = String::with_capacity(source.len());
     let source = without_codegraph_markers(strip_front_matter(source), codegraph);
     let mut rest = source.as_str();
@@ -738,6 +747,7 @@ mod tests {
             "cilki/$2-repo",
             "gitea",
             Path::new("/work/some dir/repo"),
+            Path::new("/work/notes/gitea/cilki/$2-repo/rebase.md"),
             true,
         );
         // No front matter: opencode would take it as part of the message.
@@ -754,7 +764,10 @@ mod tests {
         assert!(prompt.contains("checked out on its\ndefault branch at `/work/some dir/repo`"));
         assert!(prompt.contains("Load the `gitea` skill"));
         assert!(prompt.contains("as the\n  `gitea` skill describes"));
-        for placeholder in ["$1", "$3", "$4"] {
+        assert!(prompt.contains(
+            "leave notes for the next one at\n`/work/notes/gitea/cilki/$2-repo/rebase.md`"
+        ));
+        for placeholder in ["$1", "$3", "$4", "$5"] {
             assert!(
                 !prompt.contains(placeholder),
                 "{placeholder} left in the prompt"
@@ -772,8 +785,9 @@ mod tests {
     /// line behind.
     #[test]
     fn sweep_prompt_recommends_codegraph_only_when_it_is_there() {
-        let with = sweep_prompt("docs", "me/repo", "gitea", Path::new("/r"), true);
-        let without = sweep_prompt("docs", "me/repo", "gitea", Path::new("/r"), false);
+        let notes = Path::new("/n/docs.md");
+        let with = sweep_prompt("docs", "me/repo", "gitea", Path::new("/r"), notes, true);
+        let without = sweep_prompt("docs", "me/repo", "gitea", Path::new("/r"), notes, false);
         assert!(with.contains("Prefer the `codegraph_explore` tool"), "{with}");
         assert!(!without.contains("codegraph"), "{without}");
         for prompt in [&with, &without] {

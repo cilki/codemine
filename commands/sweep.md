@@ -34,6 +34,15 @@ deliver — a push the forge refused, say. Resume it rather than redo it: if the
 change still applies, check it out, rebase it onto the current base, and carry
 on from the delivery step; if the base has absorbed it, delete the branch.
 
+Earlier turns of this task on this repository leave notes for the next one at
+`$5`, which outlives the clone (it is absent on the first turn). Read it before
+you start, and treat it as leads rather than facts: verify anything you act on.
+Before your final message, rewrite it with what the next turn of this task here
+should know — what you covered, what you ruled out and why, tools or
+environment quirks you hit — whether or not you changed anything on the forge.
+Keep it under 60 lines and drop what has gone stale rather than appending to
+it. Never put a secret in it.
+
 <!-- codegraph -->
 Prefer the `codegraph_explore` tool over grep/find/broad file reads when
 exploring the codebase — it answers structural questions in a single call and is
@@ -225,7 +234,8 @@ the user decide what to do.
 What is on the PATH depends on the image this runner was started in. Check
 with `command -v <tool>` before building a plan on a tool, and when one you
 needed is missing (a test runner, a benchmark harness, a docs builder), say so
-in your report so it can be added — don't go looking for it again next turn.
+in your report so it can be added, and in your notes so the next turn doesn't
+go looking for it again.
 Two things are known not to be here: a Docker daemon and cloud credentials, so
 a test plan that needs either can only be run with stubs. If a project has a
 `shell.nix` or `flake.nix`, it's usually worthwhile to run `nix develop` or
