@@ -221,6 +221,7 @@ the user decide what to do.
 - Skip the turn if no mutation survives — a clean run is not worth a PR
 
 ## "feature"
+<!-- delivers: issue -->
 
 - Come up with a brand new feature that fits the project's purpose and would
   genuinely help its users

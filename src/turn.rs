@@ -194,7 +194,7 @@ pub fn run(
     }
     // The precondition probes plus the skip cache, sharing one set of forge
     // lookups across everything this draw asks about.
-    let probe = cache::Probe::new(cache, forge);
+    let probe = cache::Probe::new(cache, forge).with_pr_budget(cfg.max_open_prs);
     let picked = pick(
         forge,
         &pool,

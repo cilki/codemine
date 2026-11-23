@@ -331,6 +331,10 @@
           <span class="muted">h</span>
         </div>
       </div>
+      <div class="field" title="While the bot has this many open PRs of its own on a repository, the tasks that would open another aren't drawn there. feedback, rebase and review still run on it, and so does feature, which only files issues.">
+        <label for="s-max-open-prs">Open PRs per repository before holding back</label>
+        <input id="s-max-open-prs" type="number" min="1" max="20" step="1" placeholder="unlimited">
+      </div>
       <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
       <div class="field">
         <label class="check" for="s-schedule-enabled"><input type="checkbox" id="s-schedule-enabled">
@@ -1251,6 +1255,7 @@
     }
     $("s-rate-tasks").value = s.rate_limit?.tasks ?? "";
     $("s-rate-hours").value = s.rate_limit?.hours ?? "";
+    $("s-max-open-prs").value = s.max_open_prs ?? "";
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     renderSchedule(s.schedule);
     const f = s.forge;
@@ -1298,6 +1303,9 @@
     for (const n of [tasks, hours])
       if (n !== null && !Number.isInteger(n))
         throw new Error("the rate limit takes whole numbers of tasks and hours");
+    const maxOpenPrs = num($("s-max-open-prs").value);
+    if (maxOpenPrs !== null && !Number.isInteger(maxOpenPrs))
+      throw new Error("the open-PR budget takes a whole number of PRs");
     const body = {
       proxy: {
         base_url: $("proxy-base-url").value,
@@ -1307,6 +1315,7 @@
       },
       model: $("s-model").value,
       rate_limit: tasks === null ? null : { tasks, hours: hours ?? 1 },
+      max_open_prs: maxOpenPrs,
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
       schedule: {
         enabled: $("s-schedule-enabled").checked,

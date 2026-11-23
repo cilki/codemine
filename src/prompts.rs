@@ -308,10 +308,32 @@ pub struct Task {
     /// `<!-- cache: … -->` line declares it; `None` when it declares nothing.
     #[serde(skip)]
     pub basis: Option<Basis>,
+    /// Whether the section's `<!-- delivers: issue -->` line says the task
+    /// files issues rather than opening PRs; `None` when it declares nothing,
+    /// which reads as a task that opens PRs.
+    #[serde(skip)]
+    delivers: Option<Delivers>,
     /// The section's markdown as the prompt carries it: no heading, no cache
     /// line, no surrounding blank lines.
     #[serde(skip)]
     body: String,
+}
+
+/// What a task leaves on the forge when it finds work, as its
+/// `<!-- delivers: … -->` line names it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Delivers {
+    Prs,
+    Issues,
+}
+
+impl Task {
+    /// Whether a turn on this task can open a PR of the bot's, which is what
+    /// the open-PR budget holds back. Every task does unless its section says
+    /// it only files issues.
+    pub fn opens_prs(&self) -> bool {
+        self.delivers != Some(Delivers::Issues)
+    }
 }
 
 /// The sweep command taken apart into the prose before its task sections,
@@ -417,22 +439,32 @@ fn section_slug(line: &str) -> Option<&str> {
         .and_then(|s| s.strip_suffix('"'))
 }
 
-/// One task section's lines as a task: its `<!-- cache: … -->` line read off
-/// and dropped, the rest kept as the body.
+/// One task section's lines as a task: its `<!-- cache: … -->` and
+/// `<!-- delivers: … -->` lines read off and dropped, the rest kept as the
+/// body.
 fn section(slug: &str, lines: &[&str]) -> Result<Task> {
     let mut basis = None;
+    let mut delivers = None;
     let mut body = Vec::new();
     for line in lines {
-        match cache_directive(line) {
-            Some(name) => {
-                basis = Some(Basis::from_name(name).with_context(|| {
-                    format!(
-                        "task \"{slug}\" declares an unknown cache basis \"{name}\" \
-                         (expected one of head, feed, prs, reviews)"
-                    )
-                })?);
-            }
-            None => body.push(line.trim_end_matches(['\n', '\r'])),
+        if let Some(name) = directive(line, "cache") {
+            basis = Some(Basis::from_name(name).with_context(|| {
+                format!(
+                    "task \"{slug}\" declares an unknown cache basis \"{name}\" \
+                     (expected one of head, feed, prs, reviews)"
+                )
+            })?);
+        } else if let Some(name) = directive(line, "delivers") {
+            delivers = Some(match name {
+                "pr" => Delivers::Prs,
+                "issue" => Delivers::Issues,
+                _ => anyhow::bail!(
+                    "task \"{slug}\" declares an unknown delivery \"{name}\" \
+                     (expected pr or issue)"
+                ),
+            });
+        } else {
+            body.push(line.trim_end_matches(['\n', '\r']));
         }
     }
     let body = body.join("\n").trim_matches('\n').to_owned();
@@ -440,24 +472,26 @@ fn section(slug: &str, lines: &[&str]) -> Result<Task> {
         slug: slug.to_owned(),
         description: describe(&body),
         basis,
+        delivers,
         body,
     })
 }
 
-/// The basis a `<!-- cache: name -->` line names.
-fn cache_directive(line: &str) -> Option<&str> {
+/// The value a `<!-- key: value -->` line gives `key`.
+fn directive<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.trim()
         .strip_prefix("<!--")?
         .strip_suffix("-->")?
         .trim()
-        .strip_prefix("cache:")
+        .strip_prefix(key)?
+        .strip_prefix(':')
         .map(str::trim)
 }
 
 /// The built-in command with the user's task file merged in, and rendered
 /// back out for the prompt. A custom section for a slug the command defines
-/// appends to its instructions, and replaces its cache basis when it declares
-/// one of its own; a section for any other slug is a new task, after the
+/// appends to its instructions, and replaces its cache basis or delivery when
+/// it declares one of its own; a section for any other slug is a new task, after the
 /// built-in ones. Anything in the file outside a task section is ignored.
 fn merge(mut sweep: Sweep, custom: &str) -> Result<Sweep> {
     for task in parse_sweep(custom)?.tasks {
@@ -471,6 +505,9 @@ fn merge(mut sweep: Sweep, custom: &str) -> Result<Sweep> {
             }
             if task.basis.is_some() {
                 existing.basis = task.basis;
+            }
+            if task.delivers.is_some() {
+                existing.delivers = task.delivers;
             }
         } else {
             validate_slug(&task.slug)?;
@@ -576,13 +613,15 @@ mod tests {
     }
 
     /// Taking the command apart and putting it back together changes nothing
-    /// but the cache lines, which are for the runner and not the agent.
+    /// but the cache and delivery lines, which are for the runner and not the
+    /// agent.
     #[test]
-    fn the_builtin_command_renders_as_written_less_its_cache_lines() {
+    fn the_builtin_command_renders_as_written_less_its_directive_lines() {
         let source = str::from_utf8(SWEEP).unwrap();
         let expected: String = source
             .split_inclusive('\n')
-            .filter(|line| cache_directive(line).is_none())
+            .filter(|line| directive(line, "cache").is_none())
+            .filter(|line| directive(line, "delivers").is_none())
             .collect();
         assert_ne!(expected, source, "sweep.md declares no cache basis");
         assert_eq!(sweep().rendered, expected);
@@ -624,6 +663,26 @@ mod tests {
         assert_eq!(todo.description, task("todo").unwrap().description);
     }
 
+    /// Only `feature` among the built-in tasks files issues instead of PRs.
+    /// A custom section can say the same of its own task, or take it back for
+    /// a built-in one, and a task that declares nothing opens PRs.
+    #[test]
+    fn a_task_opens_prs_unless_it_says_it_files_issues() {
+        for task in tasks() {
+            assert_eq!(task.opens_prs(), task.slug != "feature", "{}", task.slug);
+        }
+        let pool = merged(
+            "## \"feature\"\n<!-- delivers: pr -->\n\n## \"triage\"\n<!-- delivers: issue -->\n\
+             - Label new issues\n\n## \"changelog\"\n- Keep CHANGELOG.md\n",
+        )
+        .unwrap();
+        let by_slug = |slug| pool.tasks.iter().find(|t| t.slug == slug).unwrap();
+        assert!(by_slug("feature").opens_prs());
+        assert!(!by_slug("triage").opens_prs());
+        assert!(by_slug("changelog").opens_prs());
+        assert!(!pool.rendered.contains("delivers"), "{}", pool.rendered);
+    }
+
     #[test]
     fn a_custom_section_for_a_new_slug_is_a_new_task() {
         let pool = merged(
@@ -657,6 +716,10 @@ mod tests {
             panic!("an unknown basis was accepted");
         };
         assert!(format!("{err:#}").contains("unknown cache basis \"tree\""), "{err:#}");
+        let Err(err) = merged("## \"x\"\n<!-- delivers: comment -->\n- y\n") else {
+            panic!("an unknown delivery was accepted");
+        };
+        assert!(format!("{err:#}").contains("unknown delivery \"comment\""), "{err:#}");
         for slug in ["a:b", "two words", ""] {
             assert!(merged(&format!("## \"{slug}\"\n- y\n")).is_err(), "{slug}");
         }

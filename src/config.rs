@@ -271,6 +271,8 @@ pub struct Config {
     pub forge: Forge,
     pub model: String,
     pub turn_timeout: Duration,
+    /// The open-PR budget per repository; see `Settings::max_open_prs`.
+    pub max_open_prs: Option<usize>,
     /// The daily window automatic turns may start in.
     pub schedule: crate::schedule::Schedule,
     /// Root of the persistent workspace where repositories stay cloned across

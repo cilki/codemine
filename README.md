@@ -134,6 +134,14 @@ waits until the oldest of them is _W_ hours old. Only turns that make real
 changes count; skipped, failed, timed-out and cancelled turns don't. For a
 slow rate, widen the window: one task every two hours is 1 per 2h.
 
+A rate limit can't tell whether you've been merging what the bot opens. For
+that, set an open-PR budget (1 to 20): while the bot has that many open PRs of
+its own on a repository, the tasks that would open another aren't drawn there.
+`feedback`, `rebase` and `review` keep running, since they work on the PRs
+already open, and so does `feature`, which only files issues. Merge or close a
+PR and the held-back tasks are drawn again. A custom task that only files
+issues can say so with a `<!-- delivers: issue -->` line under its heading.
+
 #### Run now
 
 To take a specific turn rather than wait for the draw, pick a task and an
@@ -141,8 +149,8 @@ enabled repository beside the Turns list and press **run now** (or
 `POST /api/run` with `{"task": "docs", "repo": "owner/name"}`). The request is
 the next turn the runner takes: after the running turn, if any, and once the
 rate limit has room, but regardless of the schedule's window. The task doesn't
-need to be ticked for the repository, and a remembered skip doesn't hold it
-back, so this is also how to try a new custom task or have a skipped one look
+need to be ticked for the repository, and neither a remembered skip nor the
+open-PR budget holds it back, so this is also how to try a new custom task or have a skipped one look
 again. A gated task still needs work to act on: `rebase` with no conflicting
 PR, say, is dropped with a warning in the log instead of run.
 
