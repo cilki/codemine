@@ -237,9 +237,13 @@ impl<'a> Probe<'a> {
     /// exactly this state. The memory is checked first, so a task held back
     /// by it never reaches the precondition probe.
     pub fn actionable(&self, task: &str, repo: &str) -> bool {
-        if self.remembered(task, repo) {
-            return false;
-        }
+        !self.remembered(task, repo) && self.has_work(task, repo)
+    }
+
+    /// Whether the task has anything to act on here, whatever the memory
+    /// says: the precondition alone, which is all a turn the user asked for
+    /// by name is held to.
+    pub fn has_work(&self, task: &str, repo: &str) -> bool {
         match basis(task) {
             // A task that answers out of the feed has nothing to answer when
             // the repository has nothing unread, so its basis doubles as its

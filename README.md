@@ -134,6 +134,22 @@ waits until the oldest of them is _W_ hours old. Only turns that make real
 changes count; skipped, failed, timed-out and cancelled turns don't. For a
 slow rate, widen the window: one task every two hours is 1 per 2h.
 
+#### Run now
+
+To take a specific turn rather than wait for the draw, pick a task and an
+enabled repository beside the Turns list and press **run now** (or
+`POST /api/run` with `{"task": "docs", "repo": "owner/name"}`). The request is
+the next turn the runner takes: after the running turn, if any, and once the
+rate limit has room, but regardless of the schedule's window. The task doesn't
+need to be ticked for the repository, and a remembered skip doesn't hold it
+back, so this is also how to try a new custom task or have a skipped one look
+again. A gated task still needs work to act on: `rebase` with no conflicting
+PR, say, is dropped with a warning in the log instead of run.
+
+From the command line, `codemine --once --task docs --repo owner/name` runs
+exactly that turn and exits, which makes a change to a prompt or a skill easy
+to reproduce.
+
 #### Forge support
 
 **codemine** works with Gitea, GitHub, or GitLab — one at a time. Pick the forge,

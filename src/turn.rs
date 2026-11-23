@@ -170,9 +170,17 @@ pub fn run(
     // The precondition probes plus the skip cache, sharing one set of forge
     // lookups across everything this draw asks about.
     let probe = cache::Probe::new(cache, forge);
-    let Some((task, repo)) = pick(forge, &pool, pending, draw, |task, repo| {
-        probe.actionable(task, repo)
-    }) else {
+    let picked = pick(
+        forge,
+        &pool,
+        pending,
+        draw,
+        |task, repo| probe.has_work(task, repo),
+        |task, repo| probe.actionable(task, repo),
+    );
+    // Whatever the pick took off the run-now queue is off the page's too.
+    Status::update(status, |s| s.requested = pending.requests());
+    let Some((task, repo)) = picked else {
         return Ok(Report::Idle(Idle::NothingToDo));
     };
 
@@ -265,7 +273,14 @@ fn pool(forge: &Forge) -> Result<Vec<String>> {
 /// The (task, repository) pair this turn runs on, or None when nothing in
 /// the pool is worth one.
 ///
-/// Fresh forge activity jumps the queue: the watcher saw a comment or a
+/// A run-now request goes first of all: the user named the pair, so the
+/// skip memory doesn't hold it back and the task needn't be ticked for the
+/// repository — only `ready`, the task's precondition, has to hold, so a
+/// `rebase` with no conflicting PR still isn't spent on. A request for a
+/// task the runner doesn't define or a repository outside the pool is
+/// dropped with a warning, as is one whose precondition fails.
+///
+/// Fresh forge activity comes next: the watcher saw a comment or a
 /// review request land, so that repository gets a feedback or review turn
 /// ahead of the random draw. Entries that no longer check out (repository
 /// disabled or gone, the forge since switched, the activity already handled,
@@ -281,8 +296,32 @@ fn pick<'a>(
     pool: &'a [String],
     pending: &crate::events::Pending,
     draw: Draw,
+    ready: impl Fn(&str, &str) -> bool,
     check: impl Fn(&str, &str) -> bool,
 ) -> Option<(&'a str, &'a str)> {
+    while let Some(request) = pending.pop_request() {
+        if request.kind != forge.kind {
+            continue;
+        }
+        let (task, repo) = (&request.task, &request.repo);
+        let Some(task) = crate::prompts::task(task).map(|task| task.slug.as_str()) else {
+            warn!("run now: no task is called {task}; dropping the request");
+            continue;
+        };
+        let Some(repo) = pool.iter().find(|name| *name == repo) else {
+            warn!(
+                "run now: {repo} is not an enabled repository {} lists; dropping {task} on it",
+                forge.kind.name()
+            );
+            continue;
+        };
+        if !ready(task, repo) {
+            warn!("run now: {task} has nothing to act on in {repo}; dropping the request");
+            continue;
+        }
+        info!("run now: {task} on {repo}, as asked");
+        return Some((task, repo));
+    }
     while let Some((kind, repo)) = pending.pop() {
         if kind != forge.kind {
             continue;
@@ -675,7 +714,7 @@ mod tests {
                 Forge::sweep(&["me/one", "me/two"], &["review", "feedback", "rebase"]);
             let pending = Pending::new();
             pending.push(ForgeKind::Github, "me/two".into());
-            let picked = pick(&forge, &pool, &pending, draw, |_, _| true);
+            let picked = pick(&forge, &pool, &pending, draw, |_, _| true, |_, _| true);
             assert_eq!(picked, Some(("review", "me/two")), "{draw:?}");
             assert!(pending.is_empty());
         }
@@ -688,10 +727,17 @@ mod tests {
         let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback", "rebase"]);
         let pending = Pending::new();
         let probed = std::cell::Cell::new(0);
-        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| {
-            probed.set(probed.get() + 1);
-            true
-        });
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::QueuedOnly,
+            |_, _| true,
+            |_, _| {
+                probed.set(probed.get() + 1);
+                true
+            },
+        );
         assert_eq!(picked, None);
         assert_eq!(probed.get(), 0);
     }
@@ -706,17 +752,31 @@ mod tests {
 
         let pending = Pending::new();
         pending.push(ForgeKind::Github, "me/repo".into());
-        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| false);
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::QueuedOnly,
+            |_, _| true,
+            |_, _| false,
+        );
         assert_eq!(picked, None);
         assert!(pending.is_empty());
 
         let pending = Pending::new();
         pending.push(ForgeKind::Github, "me/repo".into());
         let seen = std::cell::RefCell::new(Vec::new());
-        let picked = pick(&forge, &pool, &pending, Draw::Any, |task, repo| {
-            seen.borrow_mut().push(task.to_owned());
-            !queued_only(task, repo)
-        });
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::Any,
+            |_, _| true,
+            |task, repo| {
+                seen.borrow_mut().push(task.to_owned());
+                !queued_only(task, repo)
+            },
+        );
         assert_eq!(picked, Some(("rebase", "me/repo")));
         assert!(seen.borrow().iter().any(|task| task == "rebase"));
     }
@@ -729,8 +789,64 @@ mod tests {
         let pending = Pending::new();
         pending.push(ForgeKind::Gitea, "me/repo".into());
         pending.push(ForgeKind::Github, "me/gone".into());
-        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, |_, _| true);
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::QueuedOnly,
+            |_, _| true,
+            |_, _| true,
+        );
         assert_eq!(picked, None);
+        assert!(pending.is_empty());
+    }
+
+    fn request(repo: &str, task: &str) -> crate::events::Request {
+        crate::events::Request {
+            kind: ForgeKind::Github,
+            repo: repo.into(),
+            task: task.into(),
+        }
+    }
+
+    /// A run-now request is taken ahead of queued activity and the draw, off
+    /// hours too, with the skip memory ignored and the task not even ticked
+    /// for the repository.
+    #[test]
+    fn a_requested_pair_goes_first_whatever_the_memory_says() {
+        for draw in [Draw::Any, Draw::QueuedOnly] {
+            let (forge, pool) = Forge::sweep(&["me/one", "me/two"], &["review", "feedback"]);
+            let pending = Pending::new();
+            pending.push(ForgeKind::Github, "me/one".into());
+            pending.request(request("me/two", "docs"));
+            let picked = pick(&forge, &pool, &pending, draw, |_, _| true, |_, _| false);
+            assert_eq!(picked, Some(("docs", "me/two")), "{draw:?}");
+            // The activity is still queued for the turn after.
+            assert!(!pending.is_empty());
+            assert_eq!(pending.pop(), Some((ForgeKind::Github, "me/one".into())));
+        }
+    }
+
+    /// A request is still held to its task's precondition, and one that
+    /// can't be honoured — no such task, another forge's, a repository
+    /// outside the pool — is dropped, leaving the rest of the pick to go on.
+    #[test]
+    fn a_request_that_cannot_run_is_dropped() {
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback"]);
+        let pending = Pending::new();
+        pending.request(request("me/repo", "rebase"));
+        pending.request(request("me/repo", "no-such-task"));
+        pending.request(request("me/gone", "docs"));
+        pending.request(crate::events::Request {
+            kind: ForgeKind::Gitea,
+            ..request("me/repo", "docs")
+        });
+        pending.push(ForgeKind::Github, "me/repo".into());
+        let ready = |task: &str, _: &str| task != "rebase";
+        let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, ready, |_, _| {
+            true
+        });
+        assert_eq!(picked, Some(("review", "me/repo")));
         assert!(pending.is_empty());
     }
 

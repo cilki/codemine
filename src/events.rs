@@ -36,14 +36,30 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// and would claim a review request only to skip on it.
 pub const QUEUED_TASKS: [&str; 2] = ["review", "feedback"];
 
-/// Repositories with fresh forge activity, queued to jump the next draw.
-/// The watcher pushes, the turn runner pops, and the between-turn sleep
-/// checks `is_empty` so activity ends it early. Each entry names its forge:
-/// the settings can switch forge between the push and the pop, and a
-/// repository queued under the old one must not be drawn on the new one
-/// just because the name is the same.
+/// Work queued to jump the next draw: repositories with fresh forge
+/// activity, and the (task, repository) pairs the user asked to run now.
+/// The watcher and the web UI push, the turn runner pops, and the
+/// between-turn sleep checks `is_empty` so either ends it early. Each entry
+/// names its forge: the settings can switch forge between the push and the
+/// pop, and a repository queued under the old one must not be drawn on the
+/// new one just because the name is the same.
 pub struct Pending {
-    inner: Mutex<VecDeque<(ForgeKind, String)>>,
+    inner: Mutex<Queues>,
+}
+
+#[derive(Default)]
+struct Queues {
+    activity: VecDeque<(ForgeKind, String)>,
+    requested: VecDeque<Request>,
+}
+
+/// A turn the user asked for by name: this task on this repository, next.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Request {
+    #[serde(skip)]
+    pub kind: ForgeKind,
+    pub repo: String,
+    pub task: String,
 }
 
 pub type SharedPending = Arc<Pending>;
@@ -51,28 +67,47 @@ pub type SharedPending = Arc<Pending>;
 impl Pending {
     pub fn new() -> SharedPending {
         Arc::new(Pending {
-            inner: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(Queues::default()),
         })
     }
 
     /// Queue a repository, once: a second comment on a repository already
     /// waiting changes nothing.
     pub fn push(&self, kind: ForgeKind, repo: String) {
-        let mut queue = self.lock();
+        let queue = &mut self.lock().activity;
         if !queue.iter().any(|(k, r)| *k == kind && *r == repo) {
             queue.push_back((kind, repo));
         }
     }
 
     pub fn pop(&self) -> Option<(ForgeKind, String)> {
-        self.lock().pop_front()
+        self.lock().activity.pop_front()
+    }
+
+    /// Queue a run-now request, once: asking twice for the same pair while
+    /// it waits changes nothing.
+    pub fn request(&self, request: Request) {
+        let queue = &mut self.lock().requested;
+        if !queue.contains(&request) {
+            queue.push_back(request);
+        }
+    }
+
+    pub fn pop_request(&self) -> Option<Request> {
+        self.lock().requested.pop_front()
+    }
+
+    /// The run-now requests still waiting, oldest first, for the page.
+    pub fn requests(&self) -> Vec<Request> {
+        self.lock().requested.iter().cloned().collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        let queues = self.lock();
+        queues.activity.is_empty() && queues.requested.is_empty()
     }
 
-    fn lock(&self) -> MutexGuard<'_, VecDeque<(ForgeKind, String)>> {
+    fn lock(&self) -> MutexGuard<'_, Queues> {
         crate::sync::lock(&self.inner)
     }
 }
@@ -208,6 +243,27 @@ mod tests {
         assert_eq!(pending.pop(), Some((ForgeKind::Github, "me/a".into())));
         assert_eq!(pending.pop(), Some((ForgeKind::Gitea, "me/a".into())));
         assert_eq!(pending.pop(), None);
+    }
+
+    /// Requests queue apart from activity, deduplicated per pair, and wake
+    /// the sleep the same way.
+    #[test]
+    fn requests_dedup_and_count_as_pending() {
+        let pending = Pending::new();
+        let request = |task: &str| Request {
+            kind: ForgeKind::Github,
+            repo: "me/a".into(),
+            task: task.into(),
+        };
+        pending.request(request("docs"));
+        pending.request(request("docs"));
+        pending.request(request("bump"));
+        assert!(!pending.is_empty());
+        assert_eq!(pending.pop(), None);
+        assert_eq!(pending.requests(), [request("docs"), request("bump")]);
+        assert_eq!(pending.pop_request(), Some(request("docs")));
+        assert_eq!(pending.pop_request(), Some(request("bump")));
+        assert!(pending.is_empty());
     }
 
     #[test]

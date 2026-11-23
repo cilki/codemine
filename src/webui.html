@@ -68,6 +68,7 @@
   #host-name { text-transform: none; }
   .host-value { font-family: "Courier New", monospace; font-size: 0.95em; word-break: break-word; }
   .log-buttons { display: flex; gap: 8px; }
+  .log-buttons select { font-size: 0.85em; max-width: 12em; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
   .stat { background: rgb(24, 26, 27); border: 1px solid rgb(62, 68, 70); border-radius: 8px; padding: 12px 16px; }
   .stat-label { text-transform: uppercase; letter-spacing: 1px; font-size: 0.7em; color: var(--label); }
@@ -282,7 +283,13 @@
 
   <div class="columns">
     <div class="panel">
-      <div class="panel-title">Turns</div>
+      <div class="panel-title log-head"><span>Turns</span>
+        <span class="log-buttons" title="Run this task on this repository as the next turn, even if the task isn't ticked for it or has skipped there before. Waits for the running turn and the rate limit, not the schedule.">
+          <select id="run-task" aria-label="task to run"></select>
+          <select id="run-repo" aria-label="repository to run it on"></select>
+          <button type="button" class="small" id="run-now" disabled>run now</button>
+        </span></div>
+      <div class="muted run-note"><span id="run-queued"></span> <span id="run-error"></span></div>
       <div id="turns"><span class="muted">No turns yet.</span></div>
     </div>
     <div class="panel">
@@ -567,6 +574,14 @@
     $("pause").textContent = a.paused ? "resume" : "pause";
     $("cancel").hidden = a.state !== "running";
     $("cancel").disabled = a.state === "running" && a.id === canceling;
+    // Run-now requests wait for the running turn and the rate limit; say
+    // which, so a queued request doesn't look ignored.
+    const queued = state.requested || [];
+    $("run-queued").textContent = queued.length
+      ? "queued: " + queued.map(r => r.task + " on " + r.repo).join(", ")
+        + (a.state === "rate_limited" ? ", waiting on the rate limit"
+          : a.state === "running" ? ", after this turn" : "")
+      : "";
     renderClock();
 
     $("stat-completed").textContent = state.totals.completed;
@@ -1021,7 +1036,21 @@
   // its own toggles. Rebuilt whole on every toggle — it is a few hundred
   // cells at most, and repainting is simpler than keeping each header's
   // partial state in step by hand.
+  // The run-now pickers: every task the runner defines, and every enabled
+  // repository. Refilled with the settings, keeping what was picked.
+  function renderRunNow() {
+    const fill = (select, values) => {
+      const keep = select.value;
+      select.replaceChildren(...values.map(value => new Option(value, value)));
+      if (values.includes(keep)) select.value = keep;
+    };
+    fill($("run-task"), options.tasks.map(task => task.slug));
+    fill($("run-repo"), [...repos].filter(([, repo]) => repo.enabled).map(([name]) => name).sort());
+    $("run-now").disabled = !$("run-task").value || !$("run-repo").value;
+  }
+
   function renderRepos(names) {
+    renderRunNow();
     const box = $("repos");
     if (!names.length) {
       box.replaceChildren(Object.assign(document.createElement("span"), {
@@ -1179,6 +1208,7 @@
       // offers are handed theirs on sight, after the pool's.
       taskHues.clear();
       for (const task of options.tasks) taskHues.set(task.slug, taskHues.size);
+      renderRunNow();
       if (state) render();
     }
     const settings = await fetch("/api/settings");
@@ -1390,6 +1420,27 @@
   }).catch(() => {});
   // The turn's end comes back over the event stream; the button only asks.
   // It goes dead for this turn on the click, and a failed request revives it.
+  // The queued request comes back over the event stream; only a refusal is
+  // shown from here.
+  $("run-now").onclick = async () => {
+    $("run-now").disabled = true;
+    $("run-error").textContent = "";
+    try {
+      const response = await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: $("run-task").value, repo: $("run-repo").value }),
+      });
+      if (!response.ok) {
+        const refusal = await response.json().catch(() => ({}));
+        $("run-error").textContent = refusal.error || "run now failed (" + response.status + ")";
+      }
+    } catch {
+      $("run-error").textContent = "run now failed: the runner is unreachable";
+    } finally {
+      $("run-now").disabled = false;
+    }
+  };
   $("cancel").onclick = () => {
     canceling = state.activity.id;
     render();

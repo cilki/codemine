@@ -61,6 +61,15 @@ fn main() -> Result<()> {
     let _workspace = setup(&mut cli)?;
     // Before anything reads the task pool, which is fixed once read.
     prompts::load_custom_tasks(&cli.workspace.join(prompts::CUSTOM_TASKS))?;
+    // Checked here, with the pool known, rather than after a turn's worth of
+    // setup: a misspelt `--task` should fail at once.
+    if let Some((task, _)) = &cli.run
+        && !prompts::defines(task)
+    {
+        bail!("--task: no task is called {task}");
+    }
+    // `--once --task --repo` takes that turn and nothing the draw would.
+    let named = cli.run.is_some();
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
     // Point opencode at the proxy before anything lists models. The web UI
@@ -77,10 +86,14 @@ fn main() -> Result<()> {
     Status::update(&status, |s| {
         s.allowance.set_limit(store.snapshot().0.rate_limit)
     });
+    // What jumps the draw: forge activity the watcher below queues, and the
+    // turns the user asks for by name, from the web UI or `--task`.
+    let pending = events::Pending::new();
     let addr = webui::spawn(
         cli.listen,
         status.clone(),
         store.clone(),
+        pending.clone(),
         cli.workspace.clone(),
     )?;
     info!("webui listening on http://{addr}");
@@ -103,7 +116,6 @@ fn main() -> Result<()> {
     // repository for a feedback turn ahead of the draw, ends the between-turn
     // sleep early, and starts a turn outside the schedule's window, which
     // holds only the automatic turns.
-    let pending = events::Pending::new();
     events::spawn(store.clone(), pending.clone())?;
 
     let mut applied_generation = None;
@@ -176,6 +188,15 @@ fn main() -> Result<()> {
                 continue;
             }
         };
+        // Queued once there is a forge to queue it on, and taken by the pick
+        // ahead of anything else.
+        if let Some((task, repo)) = cli.run.take() {
+            pending.request(events::Request {
+                kind: cfg.forge.kind,
+                repo,
+                task,
+            });
+        }
 
         // The schedule's window gates automatic turns only: a turn the forge
         // asked for — a review request, a comment on the bot's PR — starts
@@ -185,6 +206,7 @@ fn main() -> Result<()> {
         // already under way is left to finish, since the window gates when
         // turns start, not how long they may run.
         let draw = match cfg.schedule.hold(schedule::local_second_of_day()) {
+            _ if named => Draw::QueuedOnly,
             None => Draw::Any,
             Some(_) if !pending.is_empty() => {
                 info!("forge activity off hours; drawing from the queue alone");
@@ -229,6 +251,9 @@ fn main() -> Result<()> {
             // — the queue was drained, and the watcher only refills it on a
             // newer feed stamp, so there is nothing to spin on.
             Ok(Report::Idle(Idle::NothingToDo)) if draw == Draw::QueuedOnly => {
+                if named {
+                    bail!("--once: the named turn could not run; the log above says why");
+                }
                 info!("the queued activity needed no turn; back to the hold");
             }
             // The draw took no turn. Which of its two reasons it is decides

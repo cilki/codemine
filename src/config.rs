@@ -279,11 +279,14 @@ pub struct Config {
     pub workspace: PathBuf,
 }
 
-pub const USAGE: &str = "usage: codemine [--listen ADDR] [--workspace DIR] [--once]
+pub const USAGE: &str =
+    "usage: codemine [--listen ADDR] [--workspace DIR] [--once [--task TASK --repo REPO]]
 
   --listen ADDR     bind address for the web UI (default 0.0.0.0:8080)
   --workspace DIR   persistent workspace root (default ~/.codemine)
   --once            run a single turn and exit
+  --task TASK       with --once and --repo: run this task rather than a drawn one
+  --repo REPO       with --once and --task: on this enabled repository (owner/name)
   --help            show this help";
 
 /// Command-line options; everything else is configured through the web UI
@@ -292,6 +295,9 @@ pub struct Cli {
     pub listen: SocketAddr,
     pub workspace: PathBuf,
     pub once: bool,
+    /// `--task` and `--repo`: the one (task, repository) pair `--once` runs
+    /// instead of drawing one.
+    pub run: Option<(String, String)>,
 }
 
 impl Cli {
@@ -302,7 +308,9 @@ impl Cli {
             listen: SocketAddr::from(([0, 0, 0, 0], 8080)),
             workspace: default_workspace(),
             once: false,
+            run: None,
         };
+        let (mut task, mut repo) = (None, None);
         let mut args = args.skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -321,10 +329,28 @@ impl Cli {
                     cli.workspace = PathBuf::from(value);
                 }
                 "--once" => cli.once = true,
+                "--task" => {
+                    task = Some(
+                        args.next()
+                            .ok_or_else(|| anyhow!("--task needs a task name\n{USAGE}"))?,
+                    );
+                }
+                "--repo" => {
+                    repo = Some(
+                        args.next()
+                            .ok_or_else(|| anyhow!("--repo needs a repository\n{USAGE}"))?,
+                    );
+                }
                 "--help" | "-h" => return Ok(None),
                 other => bail!("unknown argument: {other}\n{USAGE}"),
             }
         }
+        cli.run = match (task, repo) {
+            (None, None) => None,
+            (Some(task), Some(repo)) if cli.once => Some((task, repo)),
+            (Some(_), Some(_)) => bail!("--task and --repo only go with --once\n{USAGE}"),
+            _ => bail!("--task and --repo go together\n{USAGE}"),
+        };
         Ok(Some(cli))
     }
 }
@@ -398,6 +424,21 @@ mod tests {
         assert!(parse(&["--listen"]).is_err());
         assert!(parse(&["--listen", "nonsense"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+    }
+
+    /// `--task` and `--repo` name one pair for `--once` to run, so each is
+    /// refused without the other and both without `--once`.
+    #[test]
+    fn parse_a_named_turn() {
+        let cli = parse(&["--once", "--task", "docs", "--repo", "me/repo"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(cli.run, Some(("docs".into(), "me/repo".into())));
+        assert!(parse(&["--once", "--task", "docs"]).is_err());
+        assert!(parse(&["--once", "--repo", "me/repo"]).is_err());
+        assert!(parse(&["--task", "docs", "--repo", "me/repo"]).is_err());
+        assert!(parse(&["--once", "--task"]).is_err());
+        assert_eq!(parse(&["--once"]).unwrap().unwrap().run, None);
     }
 
     /// Everything the runner puts outside the workspace hangs off `home()`,

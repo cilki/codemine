@@ -23,6 +23,7 @@ use axum::routing::get;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::events::{Request, SharedPending};
 use crate::settings::{Settings, SharedSettings};
 use crate::status::{Activity, Shared, Status, epoch_now};
 
@@ -42,6 +43,8 @@ static INDEX_HTML: &str = include_str!("webui.html");
 struct AppState {
     status: Shared,
     settings: SharedSettings,
+    /// Where a run-now request is queued for the turn runner.
+    pending: SharedPending,
     /// The workspace root, which is all the page wants of it: the disk
     /// figures in the host details describe the filesystem it sits on.
     #[cfg_attr(not(feature = "hostinfo"), allow(dead_code))]
@@ -55,6 +58,7 @@ pub fn spawn(
     addr: SocketAddr,
     status: Shared,
     settings: SharedSettings,
+    pending: SharedPending,
     workspace: PathBuf,
 ) -> Result<SocketAddr> {
     let listener = std::net::TcpListener::bind(addr)
@@ -76,6 +80,7 @@ pub fn spawn(
                     AppState {
                         status,
                         settings,
+                        pending,
                         workspace,
                     },
                 ))
@@ -95,6 +100,7 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/paused", axum::routing::put(api_put_paused))
         .route("/api/cancel", axum::routing::post(api_post_cancel))
+        .route("/api/run", axum::routing::post(api_post_run))
         .route("/api/options", get(api_options))
         .route("/api/repos", get(api_repos))
         .with_state(state);
@@ -549,6 +555,59 @@ async fn api_post_cancel(State(state): State<AppState>) -> Response {
     Json(json!({ "canceled": true })).into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct RunNow {
+    task: String,
+    repo: String,
+}
+
+/// Queue one named (task, repository) pair as the next turn. The task must
+/// be one the runner defines and the repository one the settings enable on
+/// the configured forge; the task needn't be ticked for it, so a new task
+/// can be tried before it is turned on. Nothing is probed here: whether the
+/// forge still lists the repository and whether the task's precondition
+/// holds are the turn runner's to check when it takes the request, which it
+/// does as soon as the running turn (if any) is over and the rate limit has
+/// room — the schedule's window does not hold it.
+async fn api_post_run(State(state): State<AppState>, Json(incoming): Json<RunNow>) -> Response {
+    if !crate::prompts::defines(&incoming.task) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("no task is called {}", incoming.task),
+        );
+    }
+    let (settings, _) = state.settings.snapshot();
+    let Some(forge) = settings.runtime_forge() else {
+        return error(
+            StatusCode::CONFLICT,
+            format!("{} is not configured", settings.forge.kind.name()),
+        );
+    };
+    if !forge.repos.contains_key(&incoming.repo) {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "{} is not an enabled {} repository",
+                incoming.repo,
+                forge.kind.name()
+            ),
+        );
+    }
+    tracing::info!(
+        "run now: {} on {} queued from the web UI",
+        incoming.task,
+        incoming.repo
+    );
+    state.pending.request(Request {
+        kind: forge.kind,
+        repo: incoming.repo,
+        task: incoming.task,
+    });
+    let requested = state.pending.requests();
+    Status::update(&state.status, |s| s.requested = requested.clone());
+    Json(json!({ "requested": requested })).into_response()
+}
+
 /// The repositories the picker offers for one forge, sorted: everything the
 /// forge lists, plus the enabled ones it didn't list, so a repository that
 /// was renamed or fell out of the token's reach can't silently drop out of
@@ -633,6 +692,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             status.clone(),
             store,
+            crate::events::Pending::new(),
             dir.path().to_path_buf(),
         )
         .unwrap();
@@ -1061,6 +1121,62 @@ mod tests {
         let update = json!({ "forge": { "kind": "bitbucket" } });
         let response = request(addr, "PUT", "/api/settings", &update.to_string());
         assert!(response.starts_with("HTTP/1.1 4"), "{response}");
+    }
+
+    /// A run-now request is refused for an unknown task, an unconfigured
+    /// forge or a repository the settings don't enable, and otherwise queued
+    /// — even for a task not ticked on the repository — and shown on the
+    /// status.
+    #[test]
+    fn run_now_validates_and_queues() {
+        let (addr, _dir) = serve_in_tempdir(&Shared::new());
+        let run = |addr, task: &str, repo: &str| {
+            let body = json!({ "task": task, "repo": repo }).to_string();
+            request(addr, "POST", "/api/run", &body)
+        };
+        let response = run(addr, "docs", "me/repo");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = json!({ "forge": { "kind": "github", "token": "t", "repos": {
+            "me/repo": { "enabled": true, "tasks": ["review"] },
+            "me/off": { "enabled": false, "tasks": ["docs"] },
+        } } });
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let store = Arc::new(SettingsStore::load(dir.path().join("config.json")).unwrap());
+        let status = Shared::new();
+        let pending = crate::events::Pending::new();
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            status.clone(),
+            store,
+            pending.clone(),
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+
+        let response = run(addr, "no-such-task", "me/repo");
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        let response = run(addr, "docs", "me/off");
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        let response = run(addr, "docs", "me/elsewhere");
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(pending.is_empty());
+
+        let response = run(addr, "docs", "me/repo");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let queued = crate::events::Request {
+            kind: crate::config::ForgeKind::Github,
+            repo: "me/repo".into(),
+            task: "docs".into(),
+        };
+        assert_eq!(pending.requests(), [queued]);
+        assert_eq!(status.lock().requested, pending.requests());
+        let value = body_json(&request(addr, "GET", "/api/status", ""));
+        assert_eq!(
+            value["requested"],
+            json!([{ "repo": "me/repo", "task": "docs" }])
+        );
     }
 
     /// The health event names the one forge's reading, not a map keyed by
