@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Forge, ForgeKind};
+use crate::precheck::PR_LIMIT;
 use crate::schedule::Schedule;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -29,6 +30,11 @@ pub struct Settings {
     /// fractional `hourly_limit` still load: the old key is ignored, so the
     /// limit starts out unset and the next save drops it.
     pub rate_limit: Option<RateLimit>,
+    /// While the bot has this many open PRs of its own on a repository, the
+    /// tasks that would open more aren't drawn there; the ones that work on
+    /// existing PRs, and the ones that only file issues, still are. None is
+    /// no budget.
+    pub max_open_prs: Option<u32>,
     /// Seconds before a turn is cut off.
     pub turn_timeout_secs: u64,
     /// The daily window automatic turns may start in; off by default. Turns
@@ -43,6 +49,7 @@ impl Default for Settings {
             forge: ForgeSettings::default(),
             model: String::new(),
             rate_limit: None,
+            max_open_prs: None,
             turn_timeout_secs: 21600,
             schedule: Schedule::default(),
         }
@@ -319,6 +326,7 @@ impl Settings {
             // email comes from each forge's account via identity::resolve.
             author_name: model_author_name(&self.model),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
+            max_open_prs: self.max_open_prs.map(|budget| budget as usize),
             schedule: self.schedule,
             workspace: workspace.to_owned(),
         }
@@ -367,6 +375,11 @@ impl Settings {
     fn validate(&self) -> Result<()> {
         if let Some(limit) = &self.rate_limit {
             limit.validate()?;
+        }
+        if let Some(budget) = self.max_open_prs
+            && !(1..=PR_LIMIT).contains(&(budget as usize))
+        {
+            bail!("the open-PR budget must be between 1 and {PR_LIMIT}");
         }
         if self.turn_timeout_secs == 0 {
             bail!("turn timeout must be positive");
@@ -785,6 +798,17 @@ mod tests {
             hours: MAX_WINDOW_HOURS,
         });
         assert!(settings.clone().apply_update(good).is_ok());
+        // The open-PR budget can't be zero, and can't count past one page.
+        for budget in [0, PR_LIMIT as u32 + 1] {
+            let mut bad = configured();
+            bad.max_open_prs = Some(budget);
+            assert!(settings.apply_update(bad).is_err(), "{budget}");
+        }
+        for budget in [1, PR_LIMIT as u32] {
+            let mut good = configured();
+            good.max_open_prs = Some(budget);
+            assert!(settings.clone().apply_update(good).is_ok(), "{budget}");
+        }
         let mut bad = configured();
         bad.turn_timeout_secs = 0;
         assert!(settings.apply_update(bad).is_err());
@@ -798,6 +822,7 @@ mod tests {
         // The failed updates changed nothing.
         assert_eq!(settings.turn_timeout_secs, 21600);
         assert_eq!(settings.rate_limit, None);
+        assert_eq!(settings.max_open_prs, None);
     }
 
     /// The limit used to be a fractional `hourly_limit` spent from a token

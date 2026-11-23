@@ -12,8 +12,9 @@ use crate::cache::gated;
 use crate::config::{Forge, ForgeKind};
 
 /// Open PRs examined per repository; the bot's own open PRs, and the ones it
-/// is asked to review, fit well inside one page.
-const PR_LIMIT: usize = 20;
+/// is asked to review, fit well inside one page. It also caps the open-PR
+/// budget, which can't count past one page.
+pub const PR_LIMIT: usize = 20;
 
 /// Draw a (task, repo) pair worth an agent turn. The pairs are every
 /// repository in `pool` with every task it has on (`Forge::repos`). The gated
@@ -153,6 +154,12 @@ fn pulls(listing: serde_json::Value) -> Result<Vec<serde_json::Value>> {
         serde_json::Value::Array(prs) => Ok(prs),
         _ => bail!("expected an array of pulls"),
     }
+}
+
+/// How many of the PRs on the page [`open_prs`] fetched are the bot's own,
+/// which is what the open-PR budget is measured in.
+pub fn own_prs(forge: &Forge, open: &[serde_json::Value]) -> usize {
+    open.iter().filter(|pr| authored_by(pr, &forge.login)).count()
 }
 
 /// The bot's open PRs that conflict with their base branch, as sorted

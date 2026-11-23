@@ -20,7 +20,7 @@
 //! clone, so the fresh clones a restart brings leave it valid.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
@@ -28,7 +28,7 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::{Forge, ForgeKind};
 use crate::precheck::{conflicting_prs, review_requests};
@@ -217,6 +217,12 @@ pub struct Probe<'a> {
     listings: RefCell<BTreeMap<String, Option<OpenPrs>>>,
     conflicts: RefCell<BTreeMap<String, Option<PrKeys>>>,
     reviews: RefCell<BTreeMap<String, Option<PrKeys>>>,
+    /// The most open PRs of the bot's a repository may have before the tasks
+    /// that open more are held back there; `None` is no budget.
+    pr_budget: Option<usize>,
+    /// The repositories already logged as at the budget this draw, so the
+    /// hold is reported once per repository rather than once per task.
+    held: RefCell<BTreeSet<String>>,
 }
 
 impl<'a> Probe<'a> {
@@ -229,20 +235,32 @@ impl<'a> Probe<'a> {
             listings: RefCell::default(),
             conflicts: RefCell::default(),
             reviews: RefCell::default(),
+            pr_budget: None,
+            held: RefCell::default(),
+        }
+    }
+
+    /// The same probe, holding back the PR-opening tasks on any repository
+    /// where the bot already has `budget` open PRs.
+    pub fn with_pr_budget(self, budget: Option<usize>) -> Probe<'a> {
+        Probe {
+            pr_budget: budget,
+            ..self
         }
     }
 
     /// Whether the task is worth a turn on this repository: it must have
-    /// something to act on, and must not already have come up empty at
-    /// exactly this state. The memory is checked first, so a task held back
-    /// by it never reaches the precondition probe.
+    /// something to act on, must not already have come up empty at exactly
+    /// this state, and must not be one that opens PRs on a repository already
+    /// at its open-PR budget. The memory is checked first, so a task held
+    /// back by it never reaches the precondition probe.
     pub fn actionable(&self, task: &str, repo: &str) -> bool {
-        !self.remembered(task, repo) && self.has_work(task, repo)
+        !self.remembered(task, repo) && !self.over_budget(task, repo) && self.has_work(task, repo)
     }
 
     /// Whether the task has anything to act on here, whatever the memory
-    /// says: the precondition alone, which is all a turn the user asked for
-    /// by name is held to.
+    /// or the open-PR budget says: the precondition alone, which is all a
+    /// turn the user asked for by name is held to.
     pub fn has_work(&self, task: &str, repo: &str) -> bool {
         match basis(task) {
             // A task that answers out of the feed has nothing to answer when
@@ -343,14 +361,46 @@ impl<'a> Probe<'a> {
         if let Some(keys) = memo.borrow().get(repo) {
             return keys.clone();
         }
-        let open = once(&self.listings, repo, || {
-            crate::precheck::open_prs(self.forge, repo)
-                .map(Rc::new)
-                .with_context(|| format!("failed to list {repo}'s open PRs"))
-        })?;
+        let open = self.open_prs(repo)?;
         once(memo, repo, || {
             read(self.forge, repo, &open).with_context(|| format!("failed to read {repo}'s {what}"))
         })
+    }
+
+    /// The repository's page of open PRs, fetched once per draw and shared
+    /// by everything read off it.
+    fn open_prs(&self, repo: &str) -> Option<OpenPrs> {
+        once(&self.listings, repo, || {
+            crate::precheck::open_prs(self.forge, repo)
+                .map(Rc::new)
+                .with_context(|| format!("failed to list {repo}'s open PRs"))
+        })
+    }
+
+    /// Whether the task would open yet another PR on a repository where the
+    /// bot already has its budget's worth open. The tasks that service the
+    /// queue (the gated ones) and the ones that only file issues are never
+    /// held back, and nothing is without a budget. Fail-open: an unreadable
+    /// listing is no reason to stand down every ungated task, and it is
+    /// logged by the getter.
+    fn over_budget(&self, task: &str, repo: &str) -> bool {
+        let Some(budget) = self.pr_budget else {
+            return false;
+        };
+        if gated(task) || !crate::prompts::task(task).is_some_and(|t| t.opens_prs()) {
+            return false;
+        }
+        let Some(open) = self.open_prs(repo) else {
+            return false;
+        };
+        let own = crate::precheck::own_prs(self.forge, &open);
+        if own < budget {
+            return false;
+        }
+        if self.held.borrow_mut().insert(repo.to_owned()) {
+            info!("{repo}: {own} open PRs of the bot's, holding back the tasks that open more");
+        }
+        true
     }
 
     /// The forge's unread notifications as repository → newest stamp, read
@@ -646,6 +696,75 @@ mod tests {
             assert!(!unreadable.remembered(task, "me/repo"), "{task}");
             assert!(!unreadable.actionable(task, "me/repo"), "{task}");
         }
+    }
+
+    /// The forge the open-PR budget tests run on: it needs a login for the
+    /// bot's own PRs to be told apart from anyone else's.
+    static BOT: std::sync::LazyLock<Forge> = std::sync::LazyLock::new(|| Forge {
+        login: "bot".into(),
+        ..forge(ForgeKind::Github)
+    });
+
+    /// A probe with a budget of `budget` PRs and `me/repo`'s open-PR page
+    /// already answered: `authors` are the open PRs' authors, `None` a page
+    /// that couldn't be read.
+    fn budget_probe<'a>(cache: &'a Cache, budget: usize, authors: Option<&[&str]>) -> Probe<'a> {
+        let probe = Probe::new(cache, &BOT).with_pr_budget(Some(budget));
+        let page = authors.map(|authors| {
+            Rc::new(
+                authors
+                    .iter()
+                    .map(|login| serde_json::json!({ "user": { "login": login } }))
+                    .collect(),
+            )
+        });
+        probe.listings.borrow_mut().insert("me/repo".into(), page);
+        // `rebase` and `review` have work, so only the budget can hold them.
+        for memo in [&probe.conflicts, &probe.reviews] {
+            memo.borrow_mut()
+                .insert("me/repo".into(), Some(vec!["12@abc".into()]));
+        }
+        probe
+    }
+
+    /// At the budget, the tasks that would open another PR are held back,
+    /// while the ones that work on the open PRs and the ones that only file
+    /// issues still draw. One below it, everything draws.
+    #[test]
+    fn a_repository_at_its_pr_budget_holds_back_the_tasks_that_open_prs() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        let full = budget_probe(&cache, 2, Some(&["bot", "bot"]));
+        for task in ["docs", "bump", "simplify"] {
+            assert!(!full.actionable(task, "me/repo"), "{task}");
+        }
+        for task in ["rebase", "review", "feature"] {
+            assert!(full.actionable(task, "me/repo"), "{task}");
+        }
+        let room = budget_probe(&cache, 3, Some(&["bot", "bot"]));
+        assert!(room.actionable("docs", "me/repo"));
+    }
+
+    /// Only the bot's own PRs count against its budget.
+    #[test]
+    fn other_authors_prs_do_not_count_against_the_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        let probe = budget_probe(&cache, 2, Some(&["bot", "alice", "bob"]));
+        assert!(probe.actionable("docs", "me/repo"));
+    }
+
+    /// An unreadable listing fails open: one bad page shouldn't stand down
+    /// every ungated task. Without a budget the listing isn't read at all.
+    #[test]
+    fn the_budget_fails_open_and_costs_nothing_unset() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(&root);
+        assert!(budget_probe(&cache, 1, None).actionable("docs", "me/repo"));
+
+        let unbudgeted = Probe::new(&cache, &BOT);
+        assert!(unbudgeted.actionable("docs", "me/repo"));
+        assert!(unbudgeted.listings.borrow().is_empty());
     }
 
     /// A task with no precondition of its own is drawn without any forge
