@@ -38,8 +38,10 @@ fn opencode_data_dir() -> PathBuf {
 /// session-summary records that carry their diffs with them at a few hundred
 /// kilobytes of patch text each.
 pub struct Sampler {
-    /// The turn's start; messages recorded before it are not its cost.
-    since: SystemTime,
+    /// The turn's start, in the `time_created` column's own units
+    /// (milliseconds since the epoch); messages recorded before it are not
+    /// its cost.
+    since_ms: i64,
     /// The sum so far. None until a message with a `tokens` object has been
     /// seen at all, which is how a turn opencode hasn't recorded anything
     /// for yet is told from one that has genuinely cost nothing.
@@ -53,7 +55,9 @@ pub struct Sampler {
 impl Sampler {
     pub fn new(since: SystemTime) -> Sampler {
         Sampler {
-            since,
+            since_ms: since
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as i64),
             sum: None,
             cursor: None,
         }
@@ -94,10 +98,10 @@ impl Sampler {
     /// forward from it. False when the database holds nothing of this turn's,
     /// which leaves the sampler looking.
     fn open_window(&mut self, path: &Path) -> bool {
-        let Some((db, since_ms)) = self.open(path) else {
+        let Some(db) = open(path) else {
             return false;
         };
-        let stop_ms = since_ms - CLOCK_SLACK.as_millis() as i64;
+        let stop_ms = self.since_ms - CLOCK_SLACK.as_millis() as i64;
         // Descending rowid is a reverse walk of the table's own b-tree, not
         // a sort: rowid *is* the key, so nothing is materialized and the
         // walk can be abandoned as soon as it reads past the window.
@@ -105,7 +109,7 @@ impl Sampler {
             &db,
             "SELECT rowid, time_created, data FROM message ORDER BY rowid DESC",
             [],
-            since_ms,
+            self.since_ms,
             Some(stop_ms),
             0,
         ) else {
@@ -125,7 +129,7 @@ impl Sampler {
     /// here is newer than everything already counted, so an older stamp on
     /// one is the clock stepping back, never the edge of the window.
     fn advance(&mut self, path: &Path, from: i64) {
-        let Some((db, since_ms)) = self.open(path) else {
+        let Some(db) = open(path) else {
             // The file opencode was writing is gone — a channel switch, or a
             // reinstall mid-turn. Keep what was counted and go looking again
             // at the next sample rather than reporting nothing from here on.
@@ -136,7 +140,7 @@ impl Sampler {
             &db,
             "SELECT rowid, time_created, data FROM message WHERE rowid > ?1 ORDER BY rowid",
             [from],
-            since_ms,
+            self.since_ms,
             None,
             from,
         ) else {
@@ -148,17 +152,12 @@ impl Sampler {
         }
         self.cursor = Some((path.to_owned(), reached));
     }
+}
 
-    /// The database open read-only, with the turn's start in the column's
-    /// own units. None when either can't be had, which is a sample that
-    /// reports what it had before.
-    fn open(&self, path: &Path) -> Option<(rusqlite::Connection, i64)> {
-        let since_ms = self.since.duration_since(UNIX_EPOCH).ok()?.as_millis() as i64;
-        let db =
-            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .ok()?;
-        Some((db, since_ms))
-    }
+/// The database open read-only; None when it can't be, which is a sample
+/// that reports what it had before.
+fn open(path: &Path) -> Option<rusqlite::Connection> {
+    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
 }
 
 /// Sum the token counts of the turn's messages among the rows `sql` selects

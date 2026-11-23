@@ -331,11 +331,6 @@ pub struct Status {
     /// touch it. See `webui::turns_json`.
     #[serde(skip)]
     pub turns: VecDeque<TurnRecord>,
-    /// Bumped on every change to `turns`, so the event stream can tell a
-    /// moved history from an unmoved one without serializing 44 KB of it to
-    /// compare — which is the whole cost the separate event exists to avoid.
-    #[serde(skip)]
-    pub turns_revision: u64,
     /// Tail of the last finished turn's log. Skipped by the serialization:
     /// the page is sent it as a `log` event, and carrying up to 100 lines of
     /// it on every status event as well sent it again with each token sample.
@@ -385,7 +380,6 @@ impl Status {
             self.totals.rtk.add(rtk);
         }
         self.turns.push_front(record);
-        self.turns_revision += 1;
         // A record is the only way to reach a turn's log — the web UI asks
         // for one by the turn id this list is keyed on — so the file
         // behind an aged-out record is unreachable bytes from here on, and
@@ -452,9 +446,6 @@ mod tests {
 
         let status = shared.lock();
         assert_eq!(status.turns.len(), 63);
-        // The revision is how the event stream notices the list moved — it
-        // compares nothing else — so every record has to move it.
-        assert_eq!(status.turns_revision, 63);
         assert_eq!(status.turns[0].outcome, Outcome::Skipped);
         assert_eq!(status.totals.completed, 60);
         assert_eq!(status.totals.skipped, 1);

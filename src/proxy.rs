@@ -238,17 +238,13 @@ fn unmanaged(proxy_up: bool, error: Option<&str>) -> AuthHealth {
 /// Distill the management API's auth-files listing into health. Kept pure
 /// (JSON in, health out) so the parse is testable against captured fixtures.
 fn health_from(files: &serde_json::Value) -> AuthHealth {
-    let empty = Vec::new();
-    let claude_entries: Vec<&serde_json::Value> = files["files"]
+    // The first Claude entry that isn't disabled speaks for the account;
+    // codemine deployments hold one login, not a load-balanced pool.
+    let live = files["files"]
         .as_array()
-        .unwrap_or(&empty)
-        .iter()
+        .into_iter()
+        .flatten()
         .filter(|entry| is_claude_entry(entry))
-        .collect();
-    // The first entry that isn't disabled speaks for the account; codemine
-    // deployments hold one login, not a load-balanced pool.
-    let live = claude_entries
-        .iter()
         .find(|entry| !entry["disabled"].as_bool().unwrap_or(false));
     AuthHealth {
         proxy_up: true,

@@ -190,7 +190,8 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         // All start as None so the first pass always sends a full snapshot,
         // even when the log tail is legitimately empty.
         let (mut sent_status, mut sent_proxy, mut sent_forge) = (None, None, None);
-        let mut sent_turns: Option<u64> = None;
+        // The newest turn's id, or None for an empty list, once sent.
+        let mut sent_turns: Option<Option<u64>> = None;
         let mut sent_deliveries: Option<u64> = None;
         let mut log_cursor = None;
         #[cfg(feature = "hostinfo")]
@@ -226,11 +227,14 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             // The history rides an event of its own so a status that only
             // moved its token sample doesn't drag 44 KB of finished turns
             // along with it, and goes out ahead of the status so the page's
-            // first status event already has rows to render beside it. Its
-            // revision is what decides whether to send, rather than the JSON
-            // the others compare: building those 44 KB every tick just to
-            // find them unchanged is the cost this is here to avoid.
-            let revision = state.status.lock().turns_revision;
+            // first status event already has rows to render beside it. The
+            // newest turn's id is what decides whether to send, rather than
+            // the JSON the others compare: building those 44 KB every tick
+            // just to find them unchanged is the cost this is here to avoid.
+            // A turn joins the list at the front and ids never repeat within
+            // the process (`turn::next_id`), so the front id moves exactly
+            // when the list does; ageing out only trims the back.
+            let revision = state.status.lock().turns.front().map(|turn| turn.id);
             if sent_turns != Some(revision) {
                 if send(&tx, "turns", &turns_json(&state.status))
                     .await

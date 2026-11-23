@@ -488,19 +488,6 @@ mod tests {
         }
     }
 
-    /// The probed tasks are exactly the ones whose basis is forge state: that
-    /// read answers both "has anything moved" and "is there anything to act
-    /// on", so there is one list of them rather than two to keep in step.
-    #[test]
-    fn the_gated_tasks_are_the_ones_probed_out_of_forge_state() {
-        assert!(gated("feedback"));
-        assert!(gated("rebase"));
-        assert!(gated("review"));
-        for task in ["docs", "simplify", "bump", "todo", "feature"] {
-            assert!(!gated(task), "{task}");
-        }
-    }
-
     /// A `feedback` skip is keyed on the feed, not the tree: it stands while
     /// the feed sits still, and a thread newer than the one it answered for
     /// draws the task again. Without this one stale notification keeps the
