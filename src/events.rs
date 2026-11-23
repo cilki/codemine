@@ -54,12 +54,14 @@ struct Queues {
 }
 
 /// A turn the user asked for by name: this task on this repository, next.
+/// The task is the slug of one the runner defines, which whoever queues the
+/// request has looked up; the pool is fixed once read, so it stays defined.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Request {
     #[serde(skip)]
     pub kind: ForgeKind,
     pub repo: String,
-    pub task: String,
+    pub task: &'static str,
 }
 
 pub type SharedPending = Arc<Pending>;
@@ -250,10 +252,10 @@ mod tests {
     #[test]
     fn requests_dedup_and_count_as_pending() {
         let pending = Pending::new();
-        let request = |task: &str| Request {
+        let request = |task: &'static str| Request {
             kind: ForgeKind::Github,
             repo: "me/a".into(),
-            task: task.into(),
+            task,
         };
         pending.request(request("docs"));
         pending.request(request("docs"));

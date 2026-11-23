@@ -23,7 +23,7 @@ use axum::routing::get;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::events::{Request, SharedPending};
+use crate::events::{Pending, Request, SharedPending};
 use crate::settings::{Settings, SharedSettings};
 use crate::status::{Activity, Shared, Status, epoch_now};
 
@@ -137,7 +137,7 @@ fn error(status: StatusCode, reason: impl std::fmt::Display) -> Response {
 /// cost of the history is worth paying to keep the endpoint a complete view
 /// of the state. The event stream is where the two are kept apart.
 async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
-    let status = stamped(&status_json(&state.status));
+    let status = stamped(&status_json(&state.status, &state.pending));
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         with_member(&status, "turns", &turns_json(&state.status)),
@@ -187,7 +187,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
             // the host and proxy events compare and send the same JSON. The
             // log carries its own memory of what the page has been told, so
             // it can send what was appended rather than the window again.
-            let snapshot = status_json(&state.status);
+            let snapshot = status_json(&state.status, &state.pending);
             let status = stamped(&snapshot);
             let log = log_update(&state.status, &mut log_cursor);
             #[cfg(feature = "hostinfo")]
@@ -273,9 +273,13 @@ async fn send(
 /// The status as JSON, which is what both its readers start from: the event
 /// stream compares it to tell a real change from the clock ticking, and
 /// `stamped` turns it into what the page consumes. The finished-turn list is
-/// not in it — see [`turns_json`].
-fn status_json(status: &Shared) -> String {
-    serde_json::to_string(&*status.lock()).unwrap_or_else(|_| "{}".into())
+/// not in it — see [`turns_json`]. The run-now requests still waiting are,
+/// read straight off the queue the turn runner takes them from, so the page
+/// can say what is coming next.
+fn status_json(status: &Shared, pending: &Pending) -> String {
+    let json = serde_json::to_string(&*status.lock()).unwrap_or_else(|_| "{}".into());
+    let requested = serde_json::to_string(&pending.requests()).unwrap_or_else(|_| "[]".into());
+    with_member(&json, "requested", &requested)
 }
 
 /// The finished turns as JSON, serialized apart from the status they live in.
@@ -299,7 +303,8 @@ fn stamped(status: &str) -> String {
 }
 
 /// One more member spliced onto the front of a serialized object's own, the
-/// way the server stamp and the turn list reach the page's view of a status.
+/// way the server stamp, the run-now queue and the turn list reach the page's
+/// view of a status.
 ///
 /// Spliced rather than serialized alongside the status, because both of its
 /// callers want the status more than one way — the event stream with the
@@ -570,12 +575,12 @@ struct RunNow {
 /// does as soon as the running turn (if any) is over and the rate limit has
 /// room — the schedule's window does not hold it.
 async fn api_post_run(State(state): State<AppState>, Json(incoming): Json<RunNow>) -> Response {
-    if !crate::prompts::defines(&incoming.task) {
+    let Some(task) = crate::prompts::task(&incoming.task) else {
         return error(
             StatusCode::BAD_REQUEST,
             format!("no task is called {}", incoming.task),
         );
-    }
+    };
     let (settings, _) = state.settings.snapshot();
     let Some(forge) = settings.runtime_forge() else {
         return error(
@@ -601,11 +606,12 @@ async fn api_post_run(State(state): State<AppState>, Json(incoming): Json<RunNow
     state.pending.request(Request {
         kind: forge.kind,
         repo: incoming.repo,
-        task: incoming.task,
+        task: &task.slug,
     });
-    let requested = state.pending.requests();
-    Status::update(&state.status, |s| s.requested = requested.clone());
-    Json(json!({ "requested": requested })).into_response()
+    // Nothing on the status moved, but the page's view of the queue did:
+    // wake the event stream rather than leave it to the next tick.
+    Status::update(&state.status, |_| ());
+    Json(json!({ "requested": state.pending.requests() })).into_response()
 }
 
 /// The repositories the picker offers for one forge, sorted: everything the
@@ -1168,10 +1174,9 @@ mod tests {
         let queued = crate::events::Request {
             kind: crate::config::ForgeKind::Github,
             repo: "me/repo".into(),
-            task: "docs".into(),
+            task: "docs",
         };
         assert_eq!(pending.requests(), [queued]);
-        assert_eq!(status.lock().requested, pending.requests());
         let value = body_json(&request(addr, "GET", "/api/status", ""));
         assert_eq!(
             value["requested"],
@@ -1235,10 +1240,10 @@ mod tests {
     /// the JSON it compares must not carry the clock the one it sends does.
     #[test]
     fn the_compared_status_carries_no_clock() {
-        let status = Shared::new();
-        let snapshot = status_json(&status);
+        let (status, pending) = (Shared::new(), crate::events::Pending::new());
+        let snapshot = status_json(&status, &pending);
         assert!(!snapshot.contains("\"now\""), "{snapshot}");
-        assert_eq!(snapshot, status_json(&status));
+        assert_eq!(snapshot, status_json(&status, &pending));
         assert!(stamped(&snapshot).contains("\"now\""));
     }
 

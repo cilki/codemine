@@ -178,8 +178,6 @@ pub fn run(
         |task, repo| probe.has_work(task, repo),
         |task, repo| probe.actionable(task, repo),
     );
-    // Whatever the pick took off the run-now queue is off the page's too.
-    Status::update(status, |s| s.requested = pending.requests());
     let Some((task, repo)) = picked else {
         return Ok(Report::Idle(Idle::NothingToDo));
     };
@@ -277,8 +275,8 @@ fn pool(forge: &Forge) -> Result<Vec<String>> {
 /// skip memory doesn't hold it back and the task needn't be ticked for the
 /// repository — only `ready`, the task's precondition, has to hold, so a
 /// `rebase` with no conflicting PR still isn't spent on. A request for a
-/// task the runner doesn't define or a repository outside the pool is
-/// dropped with a warning, as is one whose precondition fails.
+/// repository outside the pool is dropped with a warning, as is one whose
+/// precondition fails.
 ///
 /// Fresh forge activity comes next: the watcher saw a comment or a
 /// review request land, so that repository gets a feedback or review turn
@@ -303,12 +301,8 @@ fn pick<'a>(
         if request.kind != forge.kind {
             continue;
         }
-        let (task, repo) = (&request.task, &request.repo);
-        let Some(task) = crate::prompts::task(task).map(|task| task.slug.as_str()) else {
-            warn!("run now: no task is called {task}; dropping the request");
-            continue;
-        };
-        let Some(repo) = pool.iter().find(|name| *name == repo) else {
+        let crate::events::Request { task, repo, .. } = request;
+        let Some(repo) = pool.iter().find(|name| **name == repo) else {
             warn!(
                 "run now: {repo} is not an enabled repository {} lists; dropping {task} on it",
                 forge.kind.name()
@@ -801,11 +795,11 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    fn request(repo: &str, task: &str) -> crate::events::Request {
+    fn request(repo: &str, task: &'static str) -> crate::events::Request {
         crate::events::Request {
             kind: ForgeKind::Github,
             repo: repo.into(),
-            task: task.into(),
+            task,
         }
     }
 
@@ -828,14 +822,13 @@ mod tests {
     }
 
     /// A request is still held to its task's precondition, and one that
-    /// can't be honoured — no such task, another forge's, a repository
-    /// outside the pool — is dropped, leaving the rest of the pick to go on.
+    /// can't be honoured — another forge's, a repository outside the pool —
+    /// is dropped, leaving the rest of the pick to go on.
     #[test]
     fn a_request_that_cannot_run_is_dropped() {
         let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback"]);
         let pending = Pending::new();
         pending.request(request("me/repo", "rebase"));
-        pending.request(request("me/repo", "no-such-task"));
         pending.request(request("me/gone", "docs"));
         pending.request(crate::events::Request {
             kind: ForgeKind::Gitea,

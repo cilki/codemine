@@ -340,10 +340,6 @@ pub struct Status {
     /// When set, turns are held after one died on proxy auth: the epoch at
     /// which the main loop will try again even without a fresh login.
     pub oauth_gated_until: Option<u64>,
-    /// The run-now requests still waiting for a turn, oldest first: a copy of
-    /// the queue's, refreshed whenever one is queued or taken, so the page
-    /// can say what is coming next.
-    pub requested: Vec<crate::events::Request>,
 }
 
 impl Shared {

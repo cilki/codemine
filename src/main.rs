@@ -63,13 +63,15 @@ fn main() -> Result<()> {
     prompts::load_custom_tasks(&cli.workspace.join(prompts::CUSTOM_TASKS))?;
     // Checked here, with the pool known, rather than after a turn's worth of
     // setup: a misspelt `--task` should fail at once.
-    if let Some((task, _)) = &cli.run
-        && !prompts::defines(task)
-    {
-        bail!("--task: no task is called {task}");
-    }
+    let mut run = match cli.run.take() {
+        Some((task, repo)) => match prompts::task(&task) {
+            Some(task) => Some((task.slug.as_str(), repo)),
+            None => bail!("--task: no task is called {task}"),
+        },
+        None => None,
+    };
     // `--once --task --repo` takes that turn and nothing the draw would.
-    let named = cli.run.is_some();
+    let named = run.is_some();
 
     let store = Arc::new(SettingsStore::load(cli.workspace.join("config.json"))?);
     // Point opencode at the proxy before anything lists models. The web UI
@@ -190,7 +192,7 @@ fn main() -> Result<()> {
         };
         // Queued once there is a forge to queue it on, and taken by the pick
         // ahead of anything else.
-        if let Some((task, repo)) = cli.run.take() {
+        if let Some((task, repo)) = run.take() {
             pending.request(events::Request {
                 kind: cfg.forge.kind,
                 repo,
