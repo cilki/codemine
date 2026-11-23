@@ -7,6 +7,7 @@
 mod cache;
 mod child;
 mod config;
+mod deliveries;
 mod emblem;
 mod events;
 #[cfg(feature = "hostinfo")]
@@ -82,6 +83,11 @@ fn main() -> Result<()> {
     // tree's commit, or the notification feed for `feedback` — so it isn't
     // drawn again until that moves.
     let cache = cache::Cache::load(cli.workspace.join("skips.json"));
+    // The PRs and issues turns opened and what became of them, with every
+    // task's turns and tokens: what the page weighs the tasks by.
+    let ledger = Arc::new(deliveries::Deliveries::load(
+        cli.workspace.join("deliveries.json"),
+    ));
     let status = Shared::new();
     // The stored limit, from here on kept current by the web UI's settings
     // edits, which are the only way the settings change.
@@ -96,6 +102,7 @@ fn main() -> Result<()> {
         status.clone(),
         store.clone(),
         pending.clone(),
+        ledger.clone(),
         cli.workspace.clone(),
     )?;
     info!("webui listening on http://{addr}");
@@ -245,7 +252,10 @@ fn main() -> Result<()> {
             continue;
         }
 
-        match turn::run(&cfg, &opencode, &status, &pending, &cache, draw) {
+        // Ask what became of the PRs and issues earlier turns opened, the
+        // ones not asked about within the hour; nothing at all most passes.
+        ledger.settle(&cfg.forge, status::epoch_now());
+        match turn::run(&cfg, &opencode, &status, &pending, &cache, &ledger, draw) {
             // An off-hours pass whose queued activity turned out to be
             // handled already (or on a repository since disabled) says
             // nothing about the pool: it never drew from it. Straight back

@@ -14,6 +14,7 @@ use wait_timeout::ChildExt;
 
 use crate::cache;
 use crate::config::{Config, Forge, ForgeKind};
+use crate::deliveries::{CLOCK_SLACK_SECS, Deliveries, Opened};
 use crate::precheck;
 use crate::scan::{Verdict, last_lines};
 use crate::status::{
@@ -125,16 +126,36 @@ impl Turn<'_> {
     /// an idle page shows, and the turn joins the list and the totals. The
     /// one place a turn is recorded, whether it ran to the end or never got
     /// past preparing its clone.
-    fn finish(&self, status: &Shared, tail: &str, outcome: Outcome, elapsed: u64, spent: Spent) {
+    ///
+    /// The turn is counted against its task in `ledger` too, with whatever
+    /// it `opened`, which is what the page's per-task summary adds up.
+    fn finish(
+        &self,
+        status: &Shared,
+        ledger: &Deliveries,
+        tail: &str,
+        outcome: Outcome,
+        spent: Spent,
+        opened: Vec<Opened>,
+    ) {
+        ledger.record_turn(
+            self.forge.kind,
+            self.repo,
+            self.task,
+            self.started,
+            spent.tokens.as_ref(),
+            &opened,
+        );
         let record = TurnRecord {
             task: self.task.to_owned(),
             repo: self.repo.to_owned(),
             forge: self.forge_name().into(),
             id: self.id,
             started: self.started,
-            duration_secs: elapsed,
+            duration_secs: self.elapsed(),
             outcome,
             tokens: spent.tokens,
+            deliveries: opened,
             log_path: self.log_path.clone(),
         };
         Status::update(status, |s| {
@@ -156,6 +177,7 @@ pub fn run(
     status: &Shared,
     pending: &crate::events::Pending,
     cache: &cache::Cache,
+    ledger: &Deliveries,
     draw: Draw,
 ) -> Result<Report> {
     let forge = &cfg.forge;
@@ -211,7 +233,8 @@ pub fn run(
             "failed to prepare {repo} in {elapsed}s: {err:#}\n{}",
             last_lines(&tail, 20)
         );
-        turn.finish(status, &tail, Outcome::Failed, elapsed, Spent::default());
+        let spent = Spent::default();
+        turn.finish(status, ledger, &tail, Outcome::Failed, spent, Vec::new());
         return Ok(Report::Ran {
             verdict: Verdict::default(),
             canceled: false,
@@ -251,9 +274,29 @@ pub fn run(
         _ => cache.forget(task, forge.kind, repo),
     }
 
-    turn.finish(status, &tail, outcome, elapsed, spent);
+    let opened = match outcome {
+        Outcome::Completed => delivered(&turn),
+        _ => Vec::new(),
+    };
+    turn.finish(status, ledger, &tail, outcome, spent, opened);
 
     Ok(Report::Ran { verdict, canceled })
+}
+
+/// What a completed turn delivered: the PRs and issues the bot opened on the
+/// repository since the turn started. Only a completed turn is asked about,
+/// since only one of those claims to have changed anything on the forge.
+/// Best-effort: a forge that can't answer costs the turn its links and the
+/// summary its count, not the turn.
+fn delivered(turn: &Turn) -> Vec<Opened> {
+    let since = turn.started.saturating_sub(CLOCK_SLACK_SECS);
+    precheck::opened_since(turn.forge, turn.repo, since).unwrap_or_else(|err| {
+        warn!(
+            "failed to list what the turn opened on {}: {err:#}",
+            turn.repo
+        );
+        Vec::new()
+    })
 }
 
 /// Everything the draw may choose from: every enabled repository the forge

@@ -99,6 +99,10 @@ pub struct TurnRecord {
     pub outcome: Outcome,
     /// None when opencode's session storage couldn't be read.
     pub tokens: Option<TokenUsage>,
+    /// The PRs and issues the turn opened, which the page links to and
+    /// colors by what has since become of them; empty for any turn that
+    /// didn't complete.
+    pub deliveries: Vec<crate::deliveries::Opened>,
     /// The turn's full log on disk, kept until the record ages out.
     #[serde(skip)]
     pub log_path: PathBuf,
@@ -424,6 +428,7 @@ mod tests {
                 output: 5,
                 ..Default::default()
             }),
+            deliveries: Vec::new(),
             log_path: PathBuf::new(),
         }
     }

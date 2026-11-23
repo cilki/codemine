@@ -164,6 +164,19 @@ You can view and manage the **codemine** instance via a simple web UI on
 port 8080. This is where you configure your forge settings, rate limits, select
 a model, choose which tasks run on which repositories, view agent logs, etc.
 
+#### What lands
+
+After a turn completes, **codemine** asks the forge which PRs and issues the
+bot opened on the repository since the turn started, and links them from the
+turn's row. Each one that is still open is checked again about once an hour
+until it is merged or closed, and the row colors the link to match. Under the
+Turns list a summary shows one line per task: its turns, the PRs it opened and
+how many were merged, closed unmerged, or are still open, the issues it opened
+(and how many were closed), and the tokens it spent per merged PR. The same
+figures are served at `GET /api/deliveries`. They live in `deliveries.json` in
+the workspace and survive restarts, unlike the turn list. Anything the bot's
+account opens on the repository during a turn counts as that turn's.
+
 #### Skip caching
 
 A turn that reports nothing to do remembers the state it answered for, and the

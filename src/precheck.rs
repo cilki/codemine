@@ -231,6 +231,74 @@ pub fn review_requests(
     Ok(keys)
 }
 
+/// The PRs and issues the bot opened on the repository at or after `since`
+/// (epoch seconds): what a completed turn delivered. Asked after the turn
+/// rather than diffed against a listing taken before it, so it costs one
+/// request (two on GitLab, which lists merge requests and issues apart) and
+/// still sees a PR the turn opened and closed again. The forges filter by
+/// author and by update time — anything created since was updated since —
+/// and the creation time is checked off each row. One page is plenty: a
+/// turn opens one PR, or an issue, not fifty.
+pub fn opened_since(
+    forge: &Forge,
+    repo: &str,
+    since: u64,
+) -> Result<Vec<crate::deliveries::Opened>> {
+    use crate::deliveries::{Kind, format_rfc3339, opened_in};
+    if forge.login.is_empty() {
+        bail!("the {} login is unresolved", forge.kind.name());
+    }
+    let (login, after) = (&forge.login, format_rfc3339(since));
+    Ok(match forge.kind {
+        ForgeKind::Gitea => {
+            let path = format!(
+                "repos/{repo}/issues?state=all&created_by={login}&since={after}&limit={PR_LIMIT}"
+            );
+            opened_in(&pulls(gitea_json(forge, &path)?)?, login, since, None)
+        }
+        ForgeKind::Github => {
+            let path = format!(
+                "repos/{repo}/issues?state=all&creator={login}&since={after}&per_page={PR_LIMIT}"
+            );
+            opened_in(&pulls(api_json(forge, "gh", &path)?)?, login, since, None)
+        }
+        ForgeKind::Gitlab => {
+            let mut opened = Vec::new();
+            for (listing, kind) in [("merge_requests", Kind::Pr), ("issues", Kind::Issue)] {
+                let path = format!(
+                    "projects/{}/{listing}?state=all&author_username={login}&created_after={after}&per_page={PR_LIMIT}",
+                    project(repo)
+                );
+                let listed = pulls(api_json(forge, "glab", &path)?)?;
+                opened.extend(opened_in(&listed, login, since, Some(kind)));
+            }
+            opened
+        }
+    })
+}
+
+/// What became of one PR or issue the bot opened. Gitea's and GitHub's
+/// issue endpoint answers for a PR as well and says whether it merged, so
+/// one path serves both kinds there; GitLab keeps the two apart.
+pub fn delivery_state(
+    forge: &Forge,
+    repo: &str,
+    kind: crate::deliveries::Kind,
+    number: u64,
+) -> Result<crate::deliveries::State> {
+    let listing = match kind {
+        crate::deliveries::Kind::Pr => "merge_requests",
+        crate::deliveries::Kind::Issue => "issues",
+    };
+    let item = forge_json(
+        forge,
+        &format!("repos/{repo}/issues/{number}"),
+        &format!("repos/{repo}/issues/{number}"),
+        &format!("projects/{}/{listing}/{number}", project(repo)),
+    )?;
+    crate::deliveries::state_of(&item).context("the forge's answer named no state")
+}
+
 /// One GET via the gh/glab `api` subcommand, parsed as JSON. Unlike
 /// `turn::list_rows` there is no pagination: one page decides the answer.
 pub fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Value> {

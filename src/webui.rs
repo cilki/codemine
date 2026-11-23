@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -23,6 +24,7 @@ use axum::routing::get;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::deliveries::Deliveries;
 use crate::events::{Pending, Request, SharedPending};
 use crate::settings::{Settings, SharedSettings};
 use crate::status::{Activity, Shared, Status, epoch_now};
@@ -45,6 +47,8 @@ struct AppState {
     settings: SharedSettings,
     /// Where a run-now request is queued for the turn runner.
     pending: SharedPending,
+    /// What turns delivered, for the turn rows' links and the summary.
+    deliveries: Arc<Deliveries>,
     /// The workspace root, which is all the page wants of it: the disk
     /// figures in the host details describe the filesystem it sits on.
     #[cfg_attr(not(feature = "hostinfo"), allow(dead_code))]
@@ -59,6 +63,7 @@ pub fn spawn(
     status: Shared,
     settings: SharedSettings,
     pending: SharedPending,
+    deliveries: Arc<Deliveries>,
     workspace: PathBuf,
 ) -> Result<SocketAddr> {
     let listener = std::net::TcpListener::bind(addr)
@@ -81,6 +86,7 @@ pub fn spawn(
                         status,
                         settings,
                         pending,
+                        deliveries,
                         workspace,
                     },
                 ))
@@ -96,6 +102,7 @@ async fn serve(listener: std::net::TcpListener, state: AppState) -> Result<()> {
         .route("/favicon.svg", get(favicon))
         .route("/api/status", get(api_status))
         .route("/api/turns/{id}/log", get(api_turn_log))
+        .route("/api/deliveries", get(api_deliveries))
         .route("/api/events", get(api_events))
         .route("/api/settings", get(api_settings).put(api_put_settings))
         .route("/api/paused", axum::routing::put(api_put_paused))
@@ -163,6 +170,12 @@ async fn api_turn_log(State(state): State<AppState>, Path(id): Path<u64>) -> Res
     }
 }
 
+/// What turns delivered: each delivery's state by the key the page builds
+/// from a turn row (`forge:repo:kind:number`), and one summary line per task.
+async fn api_deliveries(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(state.deliveries.view())
+}
+
 /// Push state to the page so it never has to poll: a `status` event on every
 /// change to the shared state, a `turns` event whenever a turn joins or
 /// leaves the history, a `log` or `log-append` event whenever the tail
@@ -178,6 +191,7 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
         // even when the log tail is legitimately empty.
         let (mut sent_status, mut sent_proxy, mut sent_forge) = (None, None, None);
         let mut sent_turns: Option<u64> = None;
+        let mut sent_deliveries: Option<u64> = None;
         let mut log_cursor = None;
         #[cfg(feature = "hostinfo")]
         let mut sent_host = None;
@@ -225,6 +239,16 @@ async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
                     return;
                 }
                 sent_turns = Some(revision);
+            }
+            // Likewise what turns delivered, which moves when a turn ends
+            // or an hourly recheck finds a PR merged or closed.
+            let revision = state.deliveries.revision();
+            if sent_deliveries != Some(revision) {
+                let view = state.deliveries.view().to_string();
+                if send(&tx, "deliveries", &view).await.is_err() {
+                    return;
+                }
+                sent_deliveries = Some(revision);
             }
             #[cfg_attr(not(feature = "hostinfo"), allow(unused_mut))]
             let mut channels = vec![
@@ -699,6 +723,7 @@ mod tests {
             status.clone(),
             store,
             crate::events::Pending::new(),
+            Arc::new(Deliveries::load(dir.path().join("deliveries.json"))),
             dir.path().to_path_buf(),
         )
         .unwrap();
@@ -967,6 +992,7 @@ mod tests {
                 cache_read: 9_876_543,
                 cache_write: 123_456,
             }),
+            deliveries: Vec::new(),
             log_path: std::path::PathBuf::from("/nonexistent"),
         }
     }
@@ -1157,6 +1183,7 @@ mod tests {
             status.clone(),
             store,
             pending.clone(),
+            Arc::new(Deliveries::load(dir.path().join("deliveries.json"))),
             dir.path().to_path_buf(),
         )
         .unwrap();

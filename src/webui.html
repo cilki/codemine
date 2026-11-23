@@ -112,6 +112,15 @@
   .outcome.failed { color: #e74c3c; }
   .outcome.timeout { color: #e67e22; }
   .outcome.canceled { color: #e67e22; }
+  /* What a completed turn opened, colored by what has become of it. */
+  .delivery { color: #61afef; text-decoration: none; margin-left: 6px; }
+  .delivery.merged { color: #a371f7; }
+  .delivery.closed { color: #e74c3c; text-decoration: line-through; }
+  #delivery-summary { flex: none; margin-top: 8px; font-size: 0.8em; overflow-x: auto; }
+  #delivery-summary table { border-collapse: collapse; width: 100%; }
+  #delivery-summary th { color: #9aa0a6; font-weight: normal; text-align: right; padding: 2px 6px; }
+  #delivery-summary td { text-align: right; padding: 2px 6px; border-top: 1px solid rgb(62, 68, 70); }
+  #delivery-summary th:first-child, #delivery-summary td:first-child { text-align: left; }
   /* One hue per task type, handed out by `badge`, so a turn's kind reads
      before its text does. */
   .task {
@@ -291,6 +300,7 @@
         </span></div>
       <div class="muted run-note"><span id="run-queued"></span> <span id="run-error"></span></div>
       <div id="turns"><span class="muted">No turns yet.</span></div>
+      <div id="delivery-summary" hidden></div>
     </div>
     <div class="panel">
       <div class="panel-title log-head"><span id="log-title">Log</span>
@@ -383,6 +393,9 @@
   // for the history rather than `turns`, which is already the id of the
   // container the rows go in.
   let turnHistory = [];
+  // What turns delivered: `states` maps forge:repo:kind:number to open,
+  // merged or closed, and `summary` has one line per task.
+  let deliveryView = { states: {}, summary: [] };
   // The turn (by its id) a cancel was sent for, so the button stays
   // dead until that turn is gone and can't fire twice or hit its successor.
   let canceling = null;
@@ -612,6 +625,8 @@
       // Clicking a turn shows its full log; clicking again goes back to live.
       row.onclick = () => viewing === turn.id ? viewLive() : viewTurn(turn);
       if (turn.tokens) row.title = tokenBreakdown(turn.tokens);
+      const opened = (turn.deliveries || []).map(d => deliveryLink(turn, d));
+      if (opened.length) row.querySelector(".turn-meta").firstChild.append(...opened);
       return row;
     });
     // The in-flight turn leads the list; its log is the live tail, so
@@ -628,6 +643,55 @@
       rows.unshift(row);
     }
     if (rows.length) $("turns").replaceChildren(...rows);
+  }
+
+  // A link to a PR or issue a turn opened, colored by what became of it.
+  // Clicking it opens the forge rather than the turn's log.
+  function deliveryLink(turn, d) {
+    const key = [turn.forge, turn.repo, d.kind, d.number].join(":");
+    const status = deliveryView.states[key] || "open";
+    const link = Object.assign(document.createElement("a"), {
+      className: "delivery " + status,
+      href: d.url,
+      target: "_blank",
+      rel: "noopener",
+      textContent: (d.kind === "pr" ? "PR #" : "issue #") + d.number,
+      title: (d.kind === "pr" ? "PR" : "issue") + " " + status,
+    });
+    link.onclick = event => event.stopPropagation();
+    return link;
+  }
+
+  // One line per task: how many turns it took, what they opened, what
+  // became of it, and what it spent per PR that was merged.
+  function renderDeliveries() {
+    const box = $("delivery-summary");
+    const lines = deliveryView.summary.filter(line => line.turns || line.prs || line.issues);
+    box.hidden = !lines.length;
+    if (!lines.length) return;
+    const cell = (tag, text, title) => Object.assign(document.createElement(tag),
+      { textContent: text, ...(title ? { title } : {}) });
+    const head = document.createElement("tr");
+    head.append(...[
+      ["task"], ["turns"], ["PRs", "PRs the task's turns opened"], ["merged"],
+      ["closed", "closed without being merged"], ["open"],
+      ["issues", "issues opened (closed)"],
+      ["tokens / merged", "everything the task spent, per PR of its that was merged"],
+    ].map(([text, title]) => cell("th", text, title)));
+    const rows = lines.map(line => {
+      const row = document.createElement("tr");
+      const task = document.createElement("td");
+      task.append(badge(line.task));
+      row.append(task,
+        cell("td", line.turns), cell("td", line.prs), cell("td", line.merged),
+        cell("td", line.closed), cell("td", line.open),
+        cell("td", line.issues + (line.issues_closed ? " (" + line.issues_closed + ")" : "")),
+        cell("td", line.tokens_per_merged == null ? "–" : fmtTokens(line.tokens_per_merged)));
+      return row;
+    });
+    const table = document.createElement("table");
+    table.append(head, ...rows);
+    box.replaceChildren(table);
   }
 
   // A hue per task type, spaced around the wheel so the tasks the sweep
@@ -875,6 +939,12 @@
     // the rows are repainted here rather than on every status event.
     events.addEventListener("turns", event => {
       turnHistory = JSON.parse(event.data);
+      if (state) render();
+    });
+    // Sent when a turn ends or a recheck finds a PR merged or closed.
+    events.addEventListener("deliveries", event => {
+      deliveryView = JSON.parse(event.data);
+      renderDeliveries();
       if (state) render();
     });
     events.addEventListener("log", event => setLog(JSON.parse(event.data)));
