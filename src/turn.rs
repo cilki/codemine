@@ -79,6 +79,9 @@ struct Turn<'a> {
     repo: &'a str,
     /// The repository's persistent clone: the agent's working directory.
     dir: PathBuf,
+    /// What earlier turns of the task on the repository left for this one,
+    /// and what this one leaves for the next: see `workspace::notes_path`.
+    notes: PathBuf,
     /// The turn's log under `<workspace>/logs`, which the page tails while
     /// the turn runs and serves in full once it is over.
     log_path: PathBuf,
@@ -211,6 +214,7 @@ pub fn run(
         forge,
         repo,
         dir: workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo),
+        notes: workspace::notes_path(&cfg.workspace, forge.kind.name(), repo, task),
         log_path,
         id,
         started: epoch_now(),
@@ -248,6 +252,11 @@ pub fn run(
     // draw compares a remembered skip against, memoized if the draw already
     // took it. Best-effort: without it the task is simply drawn again.
     let state = probe.state(task, repo);
+    // Notes are a convenience: a turn whose notes directory can't be made
+    // still runs, it just has nowhere to leave them.
+    if let Err(err) = workspace::prepare_notes(&turn.notes) {
+        warn!("{err:#}");
+    }
     let mut child = spawn_agent(cfg, opencode, &turn, &log)?;
     // Now that the group exists, let the web UI pause and resume it.
     Status::update(status, |s| {
@@ -257,6 +266,9 @@ pub fn run(
     });
     let (exit, canceled, spent) = supervise(cfg, status, &turn, &mut child)?;
     let elapsed = turn.elapsed();
+    if let Err(err) = workspace::cap_notes(&turn.notes, workspace::NOTES_CAP) {
+        warn!("{err:#}");
+    }
 
     let tail = read_tail(&mut log, 64 * 1024)?;
     let verdict = Verdict::read(&tail);
@@ -435,6 +447,7 @@ fn spawn_agent(
         turn.repo,
         turn.forge_name(),
         &turn.dir,
+        &turn.notes,
         crate::workspace::codegraph_available(),
     ));
     // Commits are attributed to the model that authored them; the email comes
