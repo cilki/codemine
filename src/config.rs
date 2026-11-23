@@ -270,7 +270,6 @@ impl Forge {
 pub struct Config {
     pub forge: Forge,
     pub model: String,
-    pub author_name: String,
     pub turn_timeout: Duration,
     /// The daily window automatic turns may start in.
     pub schedule: crate::schedule::Schedule,

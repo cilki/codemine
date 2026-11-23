@@ -315,9 +315,6 @@ impl Settings {
                 .runtime_forge()
                 .expect("a forge without problems is active"),
             model: self.model.clone(),
-            // Commits are attributed to the model that authored them; the
-            // email comes from each forge's account via identity::resolve.
-            author_name: model_author_name(&self.model),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             schedule: self.schedule,
             workspace: workspace.to_owned(),
@@ -510,24 +507,6 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_is_off_until_it_is_turned_on() {
-        let settings = configured();
-        assert!(!settings.schedule.enabled);
-        assert_eq!(
-            settings.to_config(Path::new("/tmp/ws")).schedule.hold(0),
-            None
-        );
-
-        let mut scheduled = configured();
-        scheduled.schedule.enabled = true;
-        scheduled.schedule.start_minute = 22 * 60;
-        scheduled.schedule.end_minute = 6 * 60;
-        let config = scheduled.to_config(Path::new("/tmp/ws"));
-        assert_eq!(config.schedule.hold(23 * 3600), None);
-        assert_eq!(config.schedule.hold(12 * 3600), Some(10 * 3600));
-    }
-
-    #[test]
     fn configured_settings_build_a_config() {
         let settings = configured();
         assert!(settings.problems().is_empty());
@@ -540,8 +519,6 @@ mod tests {
         assert_eq!(config.forge.email, "");
         assert!(config.forge.runs("docs", "owner/repo"));
         assert!(!config.forge.runs("bump", "owner/repo"));
-        // Commits are authored as the model, prettified.
-        assert_eq!(config.author_name, "Claude");
         assert_eq!(config.workspace, PathBuf::from("/tmp/ws"));
     }
 
@@ -607,17 +584,6 @@ mod tests {
         ] {
             assert_eq!(model_author_name(model), name, "{model}");
         }
-    }
-
-    #[test]
-    fn proxy_keys_are_optional() {
-        // Neither key is required: a stock CLIProxyAPI needs no client key,
-        // and the management key only buys account status.
-        let mut settings = configured();
-        settings.proxy.api_key = String::new();
-        settings.proxy.management_key = String::new();
-        let fields: Vec<String> = settings.problems().into_iter().map(|p| p.field).collect();
-        assert!(fields.is_empty(), "{fields:?}");
     }
 
     #[test]

@@ -394,6 +394,9 @@ fn spawn_agent(
         &turn.dir,
         crate::workspace::codegraph_available(),
     ));
+    // Commits are attributed to the model that authored them; the email comes
+    // from the forge's account via identity::resolve.
+    let author = crate::settings::model_author_name(&cfg.model);
     Command::new(&argv[0])
         .args(&argv[1..])
         // Own process group, so the timeout can take down the whole tree.
@@ -419,9 +422,9 @@ fn spawn_agent(
         // The agent's skills run gh/glab inside the session; the forge's
         // auth has to reach them since nothing is in the process env.
         .envs(cfg.forge.env())
-        .env("GIT_AUTHOR_NAME", &cfg.author_name)
+        .env("GIT_AUTHOR_NAME", &author)
         .env("GIT_AUTHOR_EMAIL", &turn.forge.email)
-        .env("GIT_COMMITTER_NAME", &cfg.author_name)
+        .env("GIT_COMMITTER_NAME", &author)
         .env("GIT_COMMITTER_EMAIL", &turn.forge.email)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
