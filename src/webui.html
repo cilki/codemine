@@ -344,6 +344,8 @@
         <input id="s-max-open-prs" type="number" min="1" max="20" step="1" placeholder="unlimited">
       </div>
       <div class="field"><label for="s-timeout">Turn timeout (minutes)</label><input id="s-timeout" type="number" min="1"></div>
+      <div class="field" title="Each turn runs on a repository of its own, and running turns count against the rate limit as if they had already completed. Lowering it lets the turns under way finish.">
+        <label for="s-concurrency">Turns at once</label><input id="s-concurrency" type="number" min="1" max="4" step="1"></div>
       <div class="field">
         <label class="check" for="s-schedule-enabled"><input type="checkbox" id="s-schedule-enabled">
           Only start automatic turns between</label>
@@ -1292,6 +1294,7 @@
     $("s-rate-hours").value = s.rate_limit?.hours ?? "";
     $("s-max-open-prs").value = s.max_open_prs ?? "";
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
+    $("s-concurrency").value = s.concurrency;
     renderSchedule(s.schedule);
     renderSigning(s);
     $("s-forge-commands").checked = !!s.forge_commands;
@@ -1346,6 +1349,7 @@
     // window is an hour.
     const tasks = num($("s-rate-tasks").value);
     const hours = num($("s-rate-hours").value);
+    const concurrency = num($("s-concurrency").value) ?? 1;
     // The server reads both as whole numbers and would refuse a fraction
     // with a parse error nobody can act on, so say what is wrong here.
     // The range itself is the server's to check.
@@ -1355,6 +1359,8 @@
     const maxOpenPrs = num($("s-max-open-prs").value);
     if (maxOpenPrs !== null && !Number.isInteger(maxOpenPrs))
       throw new Error("the open-PR budget takes a whole number of PRs");
+    if (!Number.isInteger(concurrency))
+      throw new Error("turns at once is a whole number");
     const body = {
       proxy: {
         base_url: $("proxy-base-url").value,
@@ -1367,6 +1373,7 @@
       max_open_prs: maxOpenPrs,
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
       sign_commits: $("s-sign-commits").checked,
+      concurrency,
       schedule: {
         enabled: $("s-schedule-enabled").checked,
         start_minute: toMinutes($("s-schedule-start").value),

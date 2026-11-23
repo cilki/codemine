@@ -18,9 +18,7 @@ use crate::deliveries::{CLOCK_SLACK_SECS, Deliveries, Opened};
 use crate::ledger::Ledger;
 use crate::precheck;
 use crate::scan::{Verdict, last_lines};
-use crate::status::{
-    Activity, Outcome, Savings, Shared, Status, TokenUsage, TurnRecord, epoch_now,
-};
+use crate::status::{Outcome, Running, Savings, Shared, Status, TokenUsage, TurnRecord, epoch_now};
 use crate::workspace;
 
 /// What a pass may draw from. The schedule's window gates automatic turns —
@@ -50,22 +48,54 @@ pub enum Idle {
     NoListedRepos,
 }
 
-/// How a pass went: the draw took no turn, and why, or a turn ran —
-/// whatever became of it.
-pub enum Report {
+/// How a finished turn went, which the main loop acts on.
+pub struct Ran {
+    /// What the turn's log said about it: a usage notice holds the next
+    /// turn, a proxy auth failure briefly gates turns, and a refused model
+    /// blocks them until another is picked. A turn that died preparing its
+    /// clone never wrote a log to read, and says nothing.
+    pub verdict: Verdict,
+    /// What the turn amounted to, as its record shows it: a completed one
+    /// counts toward the rate limit, and after a cancelled one the main loop
+    /// skips the between-turn sleep.
+    pub outcome: Outcome,
+}
+
+/// What a draw came to: no turn, and why, or one ready to be run.
+pub enum Drawn {
     Idle(Idle),
-    Ran {
-        /// What the turn's log said about it, which the main loop acts on: a
-        /// usage notice holds the next turn, a proxy auth failure briefly
-        /// gates turns, and a refused model blocks them until another is
-        /// picked. A turn that died preparing its clone never wrote a log to
-        /// read, and says nothing.
-        verdict: Verdict,
-        /// What the turn amounted to, as its record shows it: a completed
-        /// one counts toward the rate limit, and after a cancelled one the
-        /// main loop skips the between-turn sleep.
-        outcome: Outcome,
-    },
+    Turn(Box<Started>),
+}
+
+/// A drawn turn, already shown as running and holding its repository, that
+/// has yet to prepare its clone and start the agent. Owned, so it can be
+/// handed to the thread that runs it.
+pub struct Started {
+    task: String,
+    repo: String,
+    /// What the forge comment that asked for this turn wants it to look at.
+    focus: Option<crate::events::Focus>,
+    log_path: PathBuf,
+    log: File,
+    id: u64,
+    wall: SystemTime,
+    clock: Instant,
+    /// Whatever the task's answer depends on, read before the agent runs and
+    /// can move it — see `Started::run`.
+    state: Option<String>,
+}
+
+impl Started {
+    /// The repository the turn runs on, which no other turn may take while
+    /// this one is under way.
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// The id the turn is shown and recorded under.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// One turn's identity, as everything that reports on it spells it: the pair
@@ -80,7 +110,7 @@ struct Turn<'a> {
     forge: &'a Forge,
     repo: &'a str,
     /// What the forge comment that asked for this turn wants it to look at.
-    focus: Option<crate::events::Focus>,
+    focus: Option<&'a crate::events::Focus>,
     /// The repository's persistent clone: the agent's working directory.
     dir: PathBuf,
     /// What earlier turns of the task on the repository left for this one,
@@ -106,7 +136,9 @@ impl Turn<'_> {
 
     /// The turn's start in epoch seconds.
     fn started(&self) -> u64 {
-        self.wall.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+        self.wall
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
     }
 
     fn elapsed(&self) -> u64 {
@@ -114,8 +146,8 @@ impl Turn<'_> {
     }
 
     /// What the page shows while the turn runs.
-    fn activity(&self) -> Activity {
-        Activity::Running {
+    fn running(&self) -> Running {
+        Running {
             task: self.task.to_owned(),
             repo: self.repo.to_owned(),
             forge: self.forge_name().into(),
@@ -183,6 +215,7 @@ impl Turn<'_> {
         };
         Status::update(status, |s| {
             s.log_tail = last_lines(tail, 100).to_owned();
+            s.running.retain(|running| running.id != self.id);
             s.record_turn(record, spent.rtk.as_ref());
         });
         own
@@ -215,25 +248,25 @@ impl Turn<'_> {
     }
 }
 
-/// Run one opencode turn against the repository's workspace clone and report
-/// how it went. The clone survives across turns, and so does the turn's log
-/// under `<workspace>/logs`, for as long as the process runs. `opencode` is
-/// the version the agent is started with, which settles its flags, and
-/// `draw` is whether the random draw is on the table or only what the forge
-/// queued — see `Draw`. `cache` holds the draw back from pairs that have
-/// already answered for the current state, and `weights` weighs the rest;
-/// `ledger` is where what the turn delivered is counted.
-#[allow(clippy::too_many_arguments)]
-pub fn run(
+/// Draw the next turn, with every repository in `busy` — the ones a turn is
+/// already running on — left out: two turns in one clone would reset and
+/// branch each other's working tree. A run-now request or queued activity
+/// for a busy repository stays queued for a later draw instead of being
+/// dropped. A drawn turn is shown as running from here on, and its log is
+/// open; `draw` is whether the random draw is on the table or only what the
+/// open; `draw` is whether the random draw is on the table or only what the
+/// forge queued — see `Draw`. `cache` holds the draw back from pairs that
+/// have already answered for the current state, and `weights` weighs the
+/// rest.
+pub fn draw(
     cfg: &Config,
-    opencode: &crate::opencode::Version,
     status: &Shared,
     pending: &crate::events::Pending,
     cache: &cache::Cache,
-    ledger: &Deliveries,
     weights: &Ledger,
     draw: Draw,
-) -> Result<Report> {
+    busy: &BTreeSet<String>,
+) -> Result<Drawn> {
     let forge = &cfg.forge;
     let pool = pool(forge)?;
     if pool.is_empty() {
@@ -241,8 +274,13 @@ pub fn run(
         // what does is an enabled repository the forge no longer lists —
         // renamed, deleted, or out of the token's reach. The caller reports
         // it, since it is the one that knows how to show a blocker.
-        return Ok(Report::Idle(Idle::NoListedRepos));
+        return Ok(Drawn::Idle(Idle::NoListedRepos));
     }
+    let free: Vec<String> = pool
+        .iter()
+        .filter(|repo| !busy.contains(*repo))
+        .cloned()
+        .collect();
     // The precondition probes plus the skip cache, sharing one set of forge
     // lookups across everything this draw asks about.
     let probe = cache::Probe::new(cache, forge).with_pr_budget(cfg.max_open_prs);
@@ -250,6 +288,7 @@ pub fn run(
     let picked = pick(
         forge,
         &pool,
+        &free,
         pending,
         draw,
         |task, repo| probe.has_work(task, repo),
@@ -260,108 +299,179 @@ pub fn run(
         },
     );
     let Some((task, repo, focus)) = picked else {
-        return Ok(Report::Idle(Idle::NothingToDo));
+        return Ok(Drawn::Idle(Idle::NothingToDo));
     };
 
     let id = next_id();
-    let (log_path, mut log) = open_log(&cfg.workspace.join("logs"), id)?;
-    let turn = Turn {
-        task,
-        forge,
-        repo,
+    let (log_path, log) = open_log(&cfg.workspace.join("logs"), id)?;
+    let started = Started {
+        task: task.to_owned(),
+        repo: repo.to_owned(),
         focus,
-        dir: workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo),
-        notes: workspace::notes_path(&cfg.workspace, forge.kind.name(), repo, task),
         log_path,
+        log,
         id,
         wall: SystemTime::now(),
         clock: Instant::now(),
+        // Whatever this task's answer depends on, read before the agent runs
+        // and can move it: the default-branch commit, the notification stamp
+        // before any of the feed is marked read, the conflicting PRs or
+        // review requests before a force-push or a submitted review. It is
+        // the same reading the draw compares a remembered skip against,
+        // memoized since the draw just took it. Best-effort: without it the
+        // task is simply drawn again.
+        state: probe.state(task, repo),
     };
+    let turn = started.turn(cfg);
     info!(
         "new task: {} ({task} on {} {repo})",
         turn.dir.display(),
         turn.forge_name()
     );
-    Status::update(status, |s| s.activity = turn.activity());
+    Status::update(status, |s| s.running.push(turn.running()));
+    Ok(Drawn::Turn(Box::new(started)))
+}
 
-    // A failed preparation (deleted repository, network blip, ...) fails the
-    // turn, not the runner.
-    if let Err(err) = workspace::prepare(&cfg.workspace, forge, repo, &turn.dir, &log) {
-        let elapsed = turn.elapsed();
-        // The log is all the web UI shows of the turn, and git's own output
-        // stops wherever git was stopped — a timed-out clone ends at
-        // `Cloning into ...` — so the reason goes in after it.
-        if let Err(write) = note(
-            &mut log,
-            &format!("failed to prepare {repo} after {elapsed}s: {err:#}"),
-        ) {
-            warn!("failed to write to the turn log: {write:#}");
+impl Started {
+    fn turn<'a>(&'a self, cfg: &'a Config) -> Turn<'a> {
+        Turn {
+            task: &self.task,
+            forge: &cfg.forge,
+            repo: &self.repo,
+            focus: self.focus.as_ref(),
+            dir: workspace::repo_dir(&cfg.workspace, cfg.forge.kind.name(), &self.repo),
+            notes: workspace::notes_path(
+                &cfg.workspace,
+                cfg.forge.kind.name(),
+                &self.repo,
+                &self.task,
+            ),
+            log_path: self.log_path.clone(),
+            id: self.id,
+            wall: self.wall,
+            clock: self.clock,
         }
-        let tail = read_tail(&mut log, 64 * 1024)?;
-        warn!(
-            "failed to prepare {repo} in {elapsed}s: {err:#}\n{}",
-            last_lines(&tail, 20)
-        );
-        let spent = Spent::default();
-        let failed = Outcome::Failed;
-        turn.finish(status, ledger, weights, &tail, failed, spent, Vec::new());
-        return Ok(Report::Ran {
-            verdict: Verdict::default(),
-            outcome: Outcome::Failed,
+    }
+
+    /// Run the drawn turn against the repository's workspace clone and
+    /// report how it went. The clone survives across turns, and so does the
+    /// turn's log under `<workspace>/logs`, for as long as the process runs.
+    /// `opencode` is the version the agent is started with, which settles
+    /// its flags. However it ends, the turn is off the page's running list
+    /// when this returns.
+    pub fn run(
+        self,
+        cfg: &Config,
+        opencode: &crate::opencode::Version,
+        status: &Shared,
+        cache: &cache::Cache,
+        ledger: &Deliveries,
+        weights: &Ledger,
+    ) -> Result<Ran> {
+        let id = self.id;
+        let ran = self.run_inner(cfg, opencode, status, cache, ledger, weights);
+        // `finish` already took it off on every path that records the turn;
+        // this is for the ones that fail before it can, which would leave the
+        // repository shown as busy for good.
+        if ran.is_err() {
+            Status::update(status, |s| s.running.retain(|running| running.id != id));
+        }
+        ran
+    }
+
+    fn run_inner(
+        &self,
+        cfg: &Config,
+        opencode: &crate::opencode::Version,
+        status: &Shared,
+        cache: &cache::Cache,
+        ledger: &Deliveries,
+        weights: &Ledger,
+    ) -> Result<Ran> {
+        let mut log = self.log.try_clone()?;
+        let turn = self.turn(cfg);
+        let (forge, task, repo) = (&cfg.forge, turn.task, turn.repo);
+
+        // A failed preparation (deleted repository, network blip, ...) fails
+        // the turn, not the runner.
+        if let Err(err) = workspace::prepare(&cfg.workspace, forge, repo, &turn.dir, &log) {
+            let elapsed = turn.elapsed();
+            // The log is all the web UI shows of the turn, and git's own
+            // output stops wherever git was stopped — a timed-out clone ends
+            // at `Cloning into ...` — so the reason goes in after it.
+            if let Err(write) = note(
+                &mut log,
+                &format!("failed to prepare {repo} after {elapsed}s: {err:#}"),
+            ) {
+                warn!("failed to write to the turn log: {write:#}");
+            }
+            let tail = read_tail(&mut log, 64 * 1024)?;
+            warn!(
+                "failed to prepare {repo} in {elapsed}s: {err:#}\n{}",
+                last_lines(&tail, 20)
+            );
+            let spent = Spent::default();
+            let failed = Outcome::Failed;
+            turn.finish(status, ledger, weights, &tail, failed, spent, Vec::new());
+            return Ok(Ran {
+                verdict: Verdict::default(),
+                outcome: Outcome::Failed,
+            });
+        }
+
+        // Notes are a convenience: a turn whose notes directory can't be made
+        // still runs, it just has nowhere to leave them.
+        if let Err(err) = workspace::prepare_notes(&turn.notes) {
+            warn!("{err:#}");
+        }
+        let mut child = spawn_agent(cfg, opencode, &turn, &log)?;
+        // Now that the group exists, let the web UI pause and resume it.
+        Status::update(status, |s| {
+            if let Some(running) = s.running_mut(Some(turn.id)) {
+                running.pgid = child.id() as i32;
+            }
         });
-    }
-
-    // Whatever this task's answer depends on, read before the agent runs and
-    // can move it: the default-branch commit, the notification stamp before
-    // any of the feed is marked read, the conflicting PRs or review requests
-    // before a force-push or a submitted review. It is the same reading the
-    // draw compares a remembered skip against, memoized if the draw already
-    // took it. Best-effort: without it the task is simply drawn again.
-    let state = probe.state(task, repo);
-    // Notes are a convenience: a turn whose notes directory can't be made
-    // still runs, it just has nowhere to leave them.
-    if let Err(err) = workspace::prepare_notes(&turn.notes) {
-        warn!("{err:#}");
-    }
-    let mut child = spawn_agent(cfg, opencode, &turn, &log)?;
-    // Now that the group exists, let the web UI pause and resume it.
-    Status::update(status, |s| {
-        if let Activity::Running { pgid, .. } = &mut s.activity {
-            *pgid = child.id() as i32;
+        let (exit, canceled, spent) = supervise(cfg, status, &turn, &mut child)?;
+        let elapsed = turn.elapsed();
+        if let Err(err) = workspace::cap_notes(&turn.notes, workspace::NOTES_CAP) {
+            warn!("{err:#}");
         }
-    });
-    let (exit, canceled, spent) = supervise(cfg, status, &turn, &mut child)?;
-    let elapsed = turn.elapsed();
-    if let Err(err) = workspace::cap_notes(&turn.notes, workspace::NOTES_CAP) {
-        warn!("{err:#}");
+
+        let tail = read_tail(&mut log, 64 * 1024)?;
+        let verdict = Verdict::read(&tail);
+        let outcome = outcome_of(exit, canceled, &verdict, elapsed, &tail);
+
+        // A task that came up empty is held back until the state it answered
+        // for moves; any other outcome retires whatever was remembered, since
+        // a completed turn changed something and a turn that failed, timed
+        // out, or was cancelled never got to answer. A turn that died
+        // preparing returned above without touching the memory: it has
+        // nothing to say about whether the old mark still stands. A task that
+        // keeps no memory has no `state` and nothing remembered to forget.
+        match (outcome, &self.state) {
+            (Outcome::Skipped, Some(state)) => cache.remember(task, forge.kind, repo, state),
+            _ => cache.forget(task, forge.kind, repo),
+        }
+
+        let opened = match outcome {
+            Outcome::Completed => delivered(&turn),
+            _ => Vec::new(),
+        };
+        let own = turn.finish(
+            status,
+            ledger,
+            weights,
+            &tail,
+            outcome,
+            spent.clone(),
+            opened,
+        );
+        if cfg.post_receipts {
+            turn.post_receipts(&cfg.model, &spent, &own);
+        }
+
+        Ok(Ran { verdict, outcome })
     }
-
-    let tail = read_tail(&mut log, 64 * 1024)?;
-    let verdict = Verdict::read(&tail);
-    let outcome = outcome_of(exit, canceled, &verdict, elapsed, &tail);
-
-    // A task that came up empty is held back until the state it answered for
-    // moves; any other outcome retires whatever was remembered, since a
-    // completed turn changed something and a turn that failed, timed out, or
-    // was cancelled never got to answer. A turn that died preparing returned
-    // above without touching the memory: it never read `state`, so it has
-    // nothing to say about whether the old mark still stands. A task that
-    // keeps no memory has no `state` and nothing remembered to forget.
-    match (outcome, &state) {
-        (Outcome::Skipped, Some(state)) => cache.remember(task, forge.kind, repo, state),
-        _ => cache.forget(task, forge.kind, repo),
-    }
-
-    let opened = match outcome {
-        Outcome::Completed => delivered(&turn),
-        _ => Vec::new(),
-    };
-    let own = turn.finish(status, ledger, weights, &tail, outcome, spent.clone(), opened);
-    if cfg.post_receipts {
-        turn.post_receipts(&cfg.model, &spent, &own);
-    }
-
-    Ok(Report::Ran { verdict, outcome })
 }
 
 /// What a completed turn delivered: the PRs and issues the bot opened on the
@@ -415,62 +525,79 @@ fn pool(forge: &Forge) -> Result<Vec<String>> {
 /// pair has work, which the caller answers from the prechecks and the skip
 /// cache; `weigh` is how much the random draw should favour one, which it
 /// answers from the ledger.
+///
+/// `free` is the part of `pool` no turn is running on, and the only part
+/// anything is drawn from. A request or queued activity for a repository in
+/// the pool but not free is neither drawn nor dropped: it goes back on the
+/// queue, in the order it came off, for the draw after that turn is over.
+#[allow(clippy::too_many_arguments)]
 fn pick<'a>(
     forge: &'a Forge,
-    pool: &'a [String],
+    pool: &[String],
+    free: &'a [String],
     pending: &crate::events::Pending,
     draw: Draw,
     ready: impl Fn(&str, &str) -> bool,
     check: impl Fn(&str, &str) -> bool,
     weigh: impl Fn(&str, &str) -> f64,
 ) -> Option<(&'a str, &'a str, Option<crate::events::Focus>)> {
-    while let Some(request) = pending.pop_request() {
-        if request.kind != forge.kind {
-            continue;
+    let mut deferred = crate::events::Deferred::default();
+    let picked = (|| {
+        while let Some(request) = pending.pop_request() {
+            if request.kind != forge.kind {
+                continue;
+            }
+            let (task, repo) = (request.task, &request.repo);
+            let Some(repo) = free.iter().find(|name| *name == repo) else {
+                if pool.contains(repo) {
+                    deferred.requests.push(request);
+                    continue;
+                }
+                warn!(
+                    "run now: {repo} is not an enabled repository {} lists; dropping {task} on it",
+                    forge.kind.name()
+                );
+                continue;
+            };
+            if !ready(task, repo) {
+                warn!("run now: {task} has nothing to act on in {repo}; dropping the request");
+                continue;
+            }
+            match &request.focus {
+                Some(focus) => info!(
+                    "run now: {task} on {repo}, as @{} asked in {}",
+                    focus.author, focus.url
+                ),
+                None => info!("run now: {task} on {repo}, as asked"),
+            }
+            return Some((task, repo.as_str(), request.focus));
         }
-        let crate::events::Request {
-            task, repo, focus, ..
-        } = request;
-        let Some(repo) = pool.iter().find(|name| **name == repo) else {
-            warn!(
-                "run now: {repo} is not an enabled repository {} lists; dropping {task} on it",
-                forge.kind.name()
-            );
-            continue;
-        };
-        if !ready(task, repo) {
-            warn!("run now: {task} has nothing to act on in {repo}; dropping the request");
-            continue;
-        }
-        match &focus {
-            Some(focus) => info!(
-                "run now: {task} on {repo}, as @{} asked in {}",
-                focus.author, focus.url
-            ),
-            None => info!("run now: {task} on {repo}, as asked"),
-        }
-        return Some((task, repo, focus));
-    }
-    while let Some((kind, repo)) = pending.pop() {
-        if kind != forge.kind {
-            continue;
-        }
-        let Some(repo) = pool.iter().find(|name| **name == repo) else {
-            continue;
-        };
-        for task in crate::events::QUEUED_TASKS {
-            if forge.runs(task, repo) && check(task, repo) {
-                info!("fresh activity on {repo}; drawing {task} on it first");
-                return Some((task, repo, None));
+        while let Some((kind, repo)) = pending.pop() {
+            if kind != forge.kind {
+                continue;
+            }
+            let Some(repo) = free.iter().find(|name| **name == repo) else {
+                if pool.contains(&repo) {
+                    deferred.activity.push((kind, repo));
+                }
+                continue;
+            };
+            for task in crate::events::QUEUED_TASKS {
+                if forge.runs(task, repo) && check(task, repo) {
+                    info!("fresh activity on {repo}; drawing {task} on it first");
+                    return Some((task, repo.as_str(), None));
+                }
             }
         }
-    }
-    match draw {
-        Draw::Any => {
-            precheck::draw(forge, pool, check, weigh).map(|(task, repo)| (task, repo, None))
+        match draw {
+            Draw::Any => {
+                precheck::draw(forge, free, &check, &weigh).map(|(task, repo)| (task, repo, None))
+            }
+            Draw::QueuedOnly => None,
         }
-        Draw::QueuedOnly => None,
-    }
+    })();
+    pending.defer(deferred);
+    picked
 }
 
 /// A fresh turn id: 1 for the process's first turn, one more for each after.
@@ -540,7 +667,7 @@ fn spawn_agent(
                 }),
             },
             crate::workspace::codegraph_available(),
-            turn.focus.as_ref(),
+            turn.focus,
         ))
         // Own process group, so the timeout can take down the whole tree.
         .process_group(0)
@@ -615,13 +742,11 @@ fn supervise(
     let mut canceled = false;
     let exit = loop {
         // Checked first so a cancel clicked during preparation lands too.
-        if matches!(
-            status.lock().activity,
-            Activity::Running {
-                cancel_requested: true,
-                ..
-            }
-        ) {
+        if status
+            .lock()
+            .running_mut(Some(turn.id))
+            .is_some_and(|running| running.cancel_requested)
+        {
             canceled = true;
             break None;
         }
@@ -635,9 +760,9 @@ fn supervise(
         let next = resample(&spent);
         if next != spent {
             Status::update(status, |s| {
-                if let Activity::Running { tokens, rtk, .. } = &mut s.activity {
-                    *tokens = next.tokens.clone();
-                    *rtk = next.rtk.clone();
+                if let Some(running) = s.running_mut(Some(turn.id)) {
+                    running.tokens = next.tokens.clone();
+                    running.rtk = next.rtk.clone();
                 }
             });
             spent = next;
@@ -877,6 +1002,7 @@ mod tests {
             let picked = pick(
                 &forge,
                 &pool,
+                &pool,
                 &pending,
                 draw,
                 |_, _| true,
@@ -897,6 +1023,7 @@ mod tests {
         let probed = std::cell::Cell::new(0);
         let picked = pick(
             &forge,
+            &pool,
             &pool,
             &pending,
             Draw::QueuedOnly,
@@ -924,6 +1051,7 @@ mod tests {
         let picked = pick(
             &forge,
             &pool,
+            &pool,
             &pending,
             Draw::QueuedOnly,
             |_, _| true,
@@ -938,6 +1066,7 @@ mod tests {
         let seen = std::cell::RefCell::new(Vec::new());
         let picked = pick(
             &forge,
+            &pool,
             &pool,
             &pending,
             Draw::Any,
@@ -962,6 +1091,7 @@ mod tests {
         pending.push(ForgeKind::Github, "me/gone".into());
         let picked = pick(
             &forge,
+            &pool,
             &pool,
             &pending,
             Draw::QueuedOnly,
@@ -995,6 +1125,7 @@ mod tests {
             let picked = pick(
                 &forge,
                 &pool,
+                &pool,
                 &pending,
                 draw,
                 |_, _| true,
@@ -1026,6 +1157,7 @@ mod tests {
         let picked = pick(
             &forge,
             &pool,
+            &pool,
             &pending,
             Draw::Any,
             |_, _| true,
@@ -1053,6 +1185,7 @@ mod tests {
         let picked = pick(
             &forge,
             &pool,
+            &pool,
             &pending,
             Draw::QueuedOnly,
             ready,
@@ -1060,6 +1193,39 @@ mod tests {
             alike,
         );
         assert_eq!(picked, Some(("review", "me/repo", None)));
+        assert!(pending.is_empty());
+    }
+
+    /// A repository a turn is already running on is drawn by nothing, and
+    /// what was queued for it — a run-now request, fresh activity — waits on
+    /// the queue for the draw after that turn, rather than being dropped as
+    /// if the repository had left the pool.
+    #[test]
+    fn a_busy_repository_is_passed_over_and_its_queue_kept() {
+        let (forge, pool) = Forge::sweep(&["me/busy", "me/free"], &["review", "respond", "docs"]);
+        let free: Vec<String> = vec!["me/free".into()];
+        let pending = Pending::new();
+        pending.request(request("me/busy", "docs"));
+        pending.push(ForgeKind::Github, "me/busy".into());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let picked = pick(
+            &forge,
+            &pool,
+            &free,
+            &pending,
+            Draw::Any,
+            |_, _| true,
+            |task, repo| {
+                seen.borrow_mut().push(repo.to_owned());
+                task == "docs"
+            },
+            alike,
+        );
+        assert_eq!(picked, Some(("docs", "me/free", None)));
+        assert!(seen.borrow().iter().all(|repo| repo == "me/free"));
+        // Both still queued, in the order they came off.
+        assert_eq!(pending.pop_request(), Some(request("me/busy", "docs")));
+        assert_eq!(pending.pop(), Some((ForgeKind::Github, "me/busy".into())));
         assert!(pending.is_empty());
     }
 

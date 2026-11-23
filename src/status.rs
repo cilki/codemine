@@ -139,33 +139,10 @@ pub enum Activity {
     IncompleteInstall {
         reason: String,
     },
-    Running {
-        task: String,
-        repo: String,
-        forge: String,
-        #[serde(skip)]
-        log_path: PathBuf,
-        /// The agent's process group, for the web UI's pause and resume
-        /// signals; 0 until the process is actually spawned.
-        #[serde(skip)]
-        pgid: i32,
-        /// The process group is SIGSTOPped through the web UI. Both flags
-        /// live and die with this turn's activity, so neither needs a reset.
-        paused: bool,
-        /// The web UI asked for the turn to be cancelled; the turn runner
-        /// notices at its next wait hop and kills the agent's tree.
-        #[serde(skip)]
-        cancel_requested: bool,
-        /// The id the turn's record will carry once it is over.
-        id: u64,
-        started: u64,
-        /// What the turn has spent so far, resampled while it runs; None
-        /// until opencode has recorded its first message.
-        tokens: Option<TokenUsage>,
-        /// What rtk has trimmed for the turn so far; None while its
-        /// history can't be read.
-        rtk: Option<Savings>,
-    },
+    /// Never stored: the running turns live in `Status::running`, and this is
+    /// how the oldest of them is shown in `activity`, for a page that draws a
+    /// single running turn — see `Status`'s serialization.
+    Running(Running),
     Sleeping {
         until: u64,
     },
@@ -190,6 +167,36 @@ pub enum Activity {
     OffHours {
         until: u64,
     },
+}
+
+/// One turn under way, as the page shows it and the web UI signals it.
+#[derive(Serialize, Clone)]
+pub struct Running {
+    pub task: String,
+    pub repo: String,
+    pub forge: String,
+    #[serde(skip)]
+    pub log_path: PathBuf,
+    /// The agent's process group, for the web UI's pause and resume
+    /// signals; 0 until the process is actually spawned.
+    #[serde(skip)]
+    pub pgid: i32,
+    /// The process group is SIGSTOPped through the web UI. Both flags live
+    /// and die with this entry, so neither needs a reset.
+    pub paused: bool,
+    /// The web UI asked for the turn to be cancelled; the turn runner
+    /// notices at its next wait hop and kills the agent's tree.
+    #[serde(skip)]
+    pub cancel_requested: bool,
+    /// The id the turn's record will carry once it is over.
+    pub id: u64,
+    pub started: u64,
+    /// What the turn has spent so far, resampled while it runs; None until
+    /// opencode has recorded its first message.
+    pub tokens: Option<TokenUsage>,
+    /// What rtk has trimmed for the turn so far; None while its history
+    /// can't be read.
+    pub rtk: Option<Savings>,
 }
 
 /// The rate limit's sliding window: when the recent completed tasks
@@ -284,14 +291,27 @@ impl Window {
             .map(|limit| (self.inside(limit, now).count(), limit))
     }
 
-    /// How long until a turn may start, in whole seconds; None when one may
-    /// start right now. With the window full, that is when the oldest of
-    /// the newest `tasks` completions ages out — always at least a second
-    /// off, since a completion still inside the window hasn't aged out yet.
-    pub fn hold(&self, now: u64) -> Option<u64> {
+    /// How many turns the limit lets run at once, before any of them has
+    /// completed; None while no limit applies. With that many running, each
+    /// may yet complete inside the window, so another may not start until
+    /// one of them is over.
+    pub fn slots(&self) -> Option<usize> {
+        self.limit.map(|limit| limit.tasks as usize)
+    }
+
+    /// How long until a turn may start alongside the `running` ones, in
+    /// whole seconds; None when one may start right now. Each running turn
+    /// is counted as a completion still to come, so turns started in
+    /// parallel can never add up to more than the limit promises. With the
+    /// window full, that is when the completion that frees a place ages out
+    /// — always at least a second off, since a completion still inside the
+    /// window hasn't aged out yet. Only asked with fewer turns running than
+    /// `slots`; with as many, no completion aging out makes room.
+    pub fn hold(&self, now: u64, running: usize) -> Option<u64> {
         let limit = self.limit?;
-        let deciding: Vec<_> = self.deciding(limit, now).collect();
-        (deciding.len() >= limit.tasks as usize).then(|| deciding[0] + limit.window_secs() - now)
+        let free = (limit.tasks as usize).saturating_sub(running).max(1);
+        let inside: Vec<_> = self.inside(limit, now).collect();
+        (inside.len() >= free).then(|| inside[inside.len() - free] + limit.window_secs() - now)
     }
 }
 
@@ -310,9 +330,14 @@ pub struct Totals {
     pub rtk: Savings,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Default)]
 pub struct Status {
+    /// What the runner is doing about starting turns: waiting out a gap, a
+    /// hold, a blocker. Never `Activity::Running`; the turns under way are
+    /// `running`.
     pub activity: Activity,
+    /// The turns under way, oldest first, each on a repository of its own.
+    pub running: Vec<Running>,
     /// The rate limit's window, which the main loop records completions in
     /// and the web UI sets the limit of; serialized as what the page shows,
     /// or null when no limit is configured and turns run back to back.
@@ -322,23 +347,52 @@ pub struct Status {
     /// history across restarts, so this is the whole list the UI shows.
     /// `totals` counts every turn, including the ones that have aged out.
     ///
-    /// Skipped by the derived serialization, because the list is two orders
+    /// Left out of the serialization (see `View`), because the list is two orders
     /// of magnitude bigger than everything else here put together and moves
     /// only when a turn finishes, where the rest of the status moves every
     /// few seconds while one runs. Both of its readers serialize it
     /// separately — the event stream as an event of its own, `/api/status`
     /// spliced back in — so neither pays for it on a status that didn't
     /// touch it. See `webui::turns_json`.
-    #[serde(skip)]
     pub turns: VecDeque<TurnRecord>,
-    /// Tail of the last finished turn's log. Skipped by the serialization:
+    /// Tail of the last finished turn's log. Left out of the serialization:
     /// the page is sent it as a `log` event, and carrying up to 100 lines of
     /// it on every status event as well sent it again with each token sample.
-    #[serde(skip)]
     pub log_tail: String,
     /// When set, turns are held after one died on proxy auth: the epoch at
     /// which the main loop will try again even without a fresh login.
     pub oauth_gated_until: Option<u64>,
+}
+
+/// The status as the page reads it. `activity` is the oldest running turn
+/// while any is under way, and what the runner is doing otherwise: the page
+/// draws one running turn, and a runner with one under way is doing that
+/// whatever its loop is waiting on in the meantime. Every running turn is
+/// listed in `running` as well.
+#[derive(Serialize)]
+struct View<'a> {
+    activity: std::borrow::Cow<'a, Activity>,
+    running: &'a [Running],
+    allowance: &'a Window,
+    totals: &'a Totals,
+    oauth_gated_until: Option<u64>,
+}
+
+impl Serialize for Status {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use std::borrow::Cow;
+        View {
+            activity: match self.running.first() {
+                Some(oldest) => Cow::Owned(Activity::Running(oldest.clone())),
+                None => Cow::Borrowed(&self.activity),
+            },
+            running: &self.running,
+            allowance: &self.allowance,
+            totals: &self.totals,
+            oauth_gated_until: self.oauth_gated_until,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl Shared {
@@ -361,6 +415,15 @@ impl Status {
         let value = f(&mut shared.lock());
         shared.changes.send_modify(|revision| *revision += 1);
         value
+    }
+
+    /// The running turn with this id, or the oldest one when `id` is None —
+    /// the one a page that draws a single running turn is showing.
+    pub fn running_mut(&mut self, id: Option<u64>) -> Option<&mut Running> {
+        match id {
+            Some(id) => self.running.iter_mut().find(|turn| turn.id == id),
+            None => self.running.first_mut(),
+        }
     }
 
     /// Add a finished turn to the list and the totals. What rtk saved it goes
@@ -530,19 +593,19 @@ mod tests {
         // for the first of them to be an hour old — not half an hour, the
         // way a refilling bucket would have let it.
         let mut window = limited(2, 1);
-        assert_eq!(window.hold(0), None);
+        assert_eq!(window.hold(0, 0), None);
         window.record(0);
-        assert_eq!(window.hold(0), None);
+        assert_eq!(window.hold(0, 0), None);
         window.record(600);
         assert_eq!(used(&window, 600), 2);
-        assert_eq!(window.hold(600), Some(HOUR - 600));
-        assert_eq!(window.hold(1800), Some(HOUR - 1800));
+        assert_eq!(window.hold(600, 0), Some(HOUR - 600));
+        assert_eq!(window.hold(1800, 0), Some(HOUR - 1800));
         // The first ages out at the hour, and the second ten minutes later.
-        assert_eq!(window.hold(HOUR), None);
+        assert_eq!(window.hold(HOUR, 0), None);
         assert_eq!(used(&window, HOUR), 1);
         window.record(HOUR);
-        assert_eq!(window.hold(HOUR), Some(600));
-        assert_eq!(window.hold(HOUR + 600), None);
+        assert_eq!(window.hold(HOUR, 0), Some(600));
+        assert_eq!(window.hold(HOUR + 600, 0), None);
     }
 
     #[test]
@@ -551,25 +614,25 @@ mod tests {
         // worth of a turn.
         let mut window = limited(1, 2);
         window.record(100);
-        assert_eq!(window.hold(100), Some(2 * HOUR));
-        assert_eq!(window.hold(HOUR + 100), Some(HOUR));
-        assert_eq!(window.hold(2 * HOUR + 100), None);
+        assert_eq!(window.hold(100, 0), Some(2 * HOUR));
+        assert_eq!(window.hold(HOUR + 100, 0), Some(HOUR));
+        assert_eq!(window.hold(2 * HOUR + 100, 0), None);
     }
 
     #[test]
     fn an_edited_limit_applies_to_the_completions_on_record() {
         let mut window = limited(1, 1);
         window.record(0);
-        assert_eq!(window.hold(60), Some(HOUR - 60));
+        assert_eq!(window.hold(60, 0), Some(HOUR - 60));
         // Raised: the second slot is free at once.
         window.set_limit(Some(RateLimit { tasks: 2, hours: 1 }));
-        assert_eq!(window.hold(60), None);
+        assert_eq!(window.hold(60, 0), None);
         // Widened: the completion now holds for three hours, not one.
         window.set_limit(Some(RateLimit { tasks: 1, hours: 3 }));
-        assert_eq!(window.hold(60), Some(3 * HOUR - 60));
+        assert_eq!(window.hold(60, 0), Some(3 * HOUR - 60));
         // Lifted: no hold at all, and no figures to show.
         window.set_limit(None);
-        assert_eq!(window.hold(60), None);
+        assert_eq!(window.hold(60, 0), None);
         assert!(window.used(60).is_none());
     }
 
@@ -585,7 +648,64 @@ mod tests {
         assert_eq!(used(&window, 120), 3);
         // The newest two decide: the next slot opens when the one at 60 is
         // an hour old.
-        assert_eq!(window.hold(120), Some(HOUR + 60 - 120));
+        assert_eq!(window.hold(120, 0), Some(HOUR + 60 - 120));
+    }
+
+    /// Turns running in parallel count as completions still to come: three a
+    /// day with two running leaves room for one more start, not three, so
+    /// the turns under way can never add up to more than the limit allows.
+    #[test]
+    fn running_turns_count_against_the_window() {
+        let mut window = limited(3, 1);
+        assert_eq!(window.slots(), Some(3));
+        assert_eq!(window.hold(0, 2), None);
+        window.record(0);
+        // One completed and two running: the window is spoken for until the
+        // completion ages out.
+        assert_eq!(window.hold(600, 2), Some(HOUR - 600));
+        // With one running, the completion leaves a place free.
+        assert_eq!(window.hold(600, 1), None);
+        window.record(900);
+        // Two completed, one running: the older completion frees the place.
+        assert_eq!(window.hold(1200, 1), Some(HOUR - 1200));
+        assert_eq!(Window::default().slots(), None);
+    }
+
+    /// The page draws one running turn, read off `activity`: while any is
+    /// under way that is the oldest, whatever the loop is waiting on, and
+    /// every one of them is listed under `running`.
+    #[test]
+    fn the_oldest_running_turn_is_the_activity_shown() {
+        let running = |id: u64, repo: &str| Running {
+            task: "todo".into(),
+            repo: repo.into(),
+            forge: "gitea".into(),
+            log_path: PathBuf::new(),
+            pgid: 0,
+            paused: false,
+            cancel_requested: false,
+            id,
+            started: id,
+            tokens: None,
+            rtk: None,
+        };
+        let mut status = Status {
+            activity: Activity::Sleeping { until: 5 },
+            ..Status::default()
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["activity"]["state"], "sleeping");
+        assert_eq!(value["running"], serde_json::json!([]));
+
+        status.running = vec![running(1, "o/a"), running(2, "o/b")];
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["activity"]["state"], "running");
+        assert_eq!(value["activity"]["id"], 1);
+        assert_eq!(value["activity"]["repo"], "o/a");
+        assert_eq!(value["running"][1]["repo"], "o/b");
+        assert_eq!(status.running_mut(Some(2)).unwrap().repo, "o/b");
+        assert_eq!(status.running_mut(None).unwrap().id, 1);
+        assert!(status.running_mut(Some(3)).is_none());
     }
 
     /// Nothing older than the widest window is kept, so a runner left

@@ -1,7 +1,8 @@
 //! Continuously run opencode on the sweep prompt to sweep repositories on our code
 //! forge. Each turn runs in a fresh session against a per-repo clone that
 //! stays cloned and codegraph-indexed across turns (but not across restarts),
-//! back-to-back with the previous one. Everything except the CLI flags is
+//! back-to-back with the previous one, or beside others on other repositories
+//! as the concurrency setting allows. Everything except the CLI flags is
 //! configured through the always-on web UI and persisted in the workspace.
 
 mod cache;
@@ -34,6 +35,7 @@ mod usage;
 mod webui;
 mod workspace;
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,7 +49,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::{Cli, Config, Forge, ForgeKind, USAGE};
 use crate::settings::{Problem, Settings, SettingsStore};
 use crate::status::{Activity, Outcome, Shared, Status};
-use crate::turn::{Draw, Idle, Report};
+use crate::turn::{Draw, Drawn, Idle};
 
 fn main() -> Result<()> {
     let Some(mut cli) = Cli::parse(std::env::args())? else {
@@ -87,7 +89,7 @@ fn main() -> Result<()> {
     // A task that came up empty remembers the state it answered for — the
     // tree's commit, or the notification feed for `respond` — so it isn't
     // drawn again until that moves.
-    let cache = cache::Cache::load(cli.workspace.join("skips.json"));
+    let cache = Arc::new(cache::Cache::load(cli.workspace.join("skips.json")));
     // The PRs and issues turns opened and what became of them, with every
     // task's turns and tokens: what the page weighs the tasks by.
     let ledger = Arc::new(deliveries::Deliveries::load(
@@ -95,7 +97,7 @@ fn main() -> Result<()> {
     ));
     // What every pair has yielded and when it last ran, which weighs the
     // draw among the pairs the cache lets through.
-    let weights = ledger::Ledger::load(cli.workspace.join("ledger.json"));
+    let weights = Arc::new(ledger::Ledger::load(cli.workspace.join("ledger.json")));
     let status = Shared::new();
     // The stored limit, from here on kept current by the web UI's settings
     // edits, which are the only way the settings change.
@@ -148,7 +150,59 @@ fn main() -> Result<()> {
     // How many draws in a row have found nothing, which is what lengthens the
     // gap before the next one — see `idle_gap`.
     let mut idle_draws: u32 = 0;
+    // The repositories a turn is running on, one turn each, and where those
+    // turns report once they are over. The loop draws and starts turns; each
+    // runs on a thread of its own, so the loop can fill the next free slot
+    // while it does — see `Settings::concurrency`.
+    let mut busy: BTreeSet<String> = BTreeSet::new();
+    let reports = Reports::default();
+    // Whether `--once` has started its turn, after which it waits for that
+    // turn and exits.
+    let mut took_turn = false;
     loop {
+        // The turns that finished since the last pass, and the gap they ask
+        // for before the next one starts: a usage-limit notice holds every
+        // new start until the window reopens, but never the turns still
+        // running, the way the schedule's window gates when turns start and
+        // not how long they may run.
+        let finished = std::mem::take(&mut *sync::lock(&reports));
+        let mut rest = None;
+        for done in finished {
+            busy.remove(&done.repo);
+            let asked = settle(done, &status, &mut rejected_model);
+            rest = match (rest, asked) {
+                (None, asked) => asked,
+                (Some(held), None) => Some(held),
+                (Some(a), Some(b)) => Some(a.max(b)),
+            };
+        }
+        if cli.once && took_turn && busy.is_empty() {
+            return Ok(());
+        }
+        let generation = store.generation();
+        let edited = || store.generation() != generation;
+        let reported = || !sync::lock(&reports).is_empty();
+        if let Some(usage_limit) = rest {
+            sleep(&status, usage_limit, None, || {
+                wake(&pending, &busy, edited(), reported())
+            });
+        }
+
+        // Every slot taken — by the concurrency setting, or by the rate
+        // limit, which counts a running turn as a completion still to come —
+        // means nothing can start before one of them is over. Nothing else
+        // is asked meanwhile: the probes below cost a proxy round trip and
+        // an opencode spawn, and no answer they give could start a turn.
+        let slots = match cli.once {
+            true => 1,
+            false => store.snapshot().0.concurrency as usize,
+        };
+        let slots = slots.min(status.lock().allowance.slots().unwrap_or(usize::MAX));
+        if busy.len() >= slots {
+            wait(60, 1, || edited() || reported());
+            continue;
+        }
+
         // Ahead of the settings: no edit on the page fixes an opencode that
         // can't say its version, and every turn would start it with flags
         // that may not be its own.
@@ -156,7 +210,7 @@ fn main() -> Result<()> {
             Ok(opencode) => opencode,
             Err(reason) => {
                 report_incomplete_install(&cli, &mut blocked, &status, reason)?;
-                std::thread::sleep(INSTALL_RETRY);
+                wait(INSTALL_RETRY, 1, reported);
                 continue;
             }
         };
@@ -201,7 +255,7 @@ fn main() -> Result<()> {
             Ok(cfg) => cfg,
             Err(problems) => {
                 report_blocker(&cli, &mut blocked, &status, problems)?;
-                std::thread::sleep(UNCONFIGURED_RETRY);
+                wait(UNCONFIGURED_RETRY, 1, reported);
                 continue;
             }
         };
@@ -226,7 +280,7 @@ fn main() -> Result<()> {
         let draw = match settings.schedule.hold(schedule::local_second_of_day()) {
             _ if named => Draw::QueuedOnly,
             None => Draw::Any,
-            Some(_) if !pending.is_empty() => {
+            Some(_) if pending.startable(&busy) => {
                 info!("forge activity off hours; drawing from the queue alone");
                 Draw::QueuedOnly
             }
@@ -238,17 +292,20 @@ fn main() -> Result<()> {
                 // so a widened window applies at once instead of at the end
                 // of the hold — and by forge activity, which may run off
                 // hours.
-                wait(closed.min(60), 1, || edited() || !pending.is_empty());
+                wait(closed.min(60), 1, || {
+                    edited() || pending.startable(&busy) || reported()
+                });
                 continue;
             }
         };
 
         // Ask the rate limit whether its window has room for another
-        // completed task. The window is the one in the shared status, whose
-        // limit the web UI sets on every edit — see `status::Window` — so an
-        // edit applies to the completions on record at once.
+        // completed task beside the ones that may yet complete. The window
+        // is the one in the shared status, whose limit the web UI sets on
+        // every edit — see `status::Window` — so an edit applies to the
+        // completions on record at once.
         let now = status::epoch_now();
-        let hold = status.lock().allowance.hold(now);
+        let hold = status.lock().allowance.hold(now, busy.len());
         if let Some(left) = hold {
             Status::update(&status, |s| {
                 s.activity = Activity::RateLimited { until: now + left }
@@ -257,23 +314,21 @@ fn main() -> Result<()> {
             // Sleep in slices and fall back into the loop, cut short by an
             // edit, so a limit raised in the web UI applies at once instead
             // of at the end of the wait.
-            wait(left.min(60), 1, edited);
+            wait(left.min(60), 1, || edited() || reported());
             continue;
         }
 
         // Ask what became of the PRs and issues earlier turns opened, the
         // ones not asked about within the hour; nothing at all most passes.
         ledger.settle(&cfg.forge, status::epoch_now());
-        match turn::run(
-            &cfg, &opencode, &status, &pending, &cache, &ledger, &weights, draw,
-        ) {
+        match turn::draw(&cfg, &status, &pending, &cache, &weights, draw, &busy) {
             // An off-hours pass whose queued activity turned out to be
             // handled already (or on a repository since disabled) says
             // nothing about the pool: it never drew from it. Straight back
             // around into the hold, with no idle gap and no "nothing to do"
             // — the queue was drained, and the watcher only refills it on a
             // newer feed stamp, so there is nothing to spin on.
-            Ok(Report::Idle(Idle::NothingToDo)) if draw == Draw::QueuedOnly => {
+            Ok(Drawn::Idle(Idle::NothingToDo)) if draw == Draw::QueuedOnly => {
                 if named {
                     bail!("--once: the named turn could not run; the log above says why");
                 }
@@ -283,7 +338,7 @@ fn main() -> Result<()> {
             // listed: renamed, deleted, archived, or out of the token's
             // reach. Only a human can clear that, so it is a blocker like any
             // settings problem, tied to the repository picker that fixes it.
-            Ok(Report::Idle(Idle::NoListedRepos)) => {
+            Ok(Drawn::Idle(Idle::NoListedRepos)) => {
                 // The pool is broken rather than caught up, so the next draw
                 // after it is fixed is a first draw again.
                 idle_draws = 0;
@@ -296,78 +351,199 @@ fn main() -> Result<()> {
                 // this answer costs a repository listing, where re-reading the
                 // settings costs nothing. Sliced and cut short by an edit, so
                 // a corrected enabled set applies at once.
-                wait(POOL_RETRY, 5, edited);
+                wait(POOL_RETRY, 5, || edited() || reported());
             }
             // A caught-up pool is no problem at all — just what a runner with
             // nothing to do looks like — and mustn't flag the settings.
-            Ok(Report::Idle(Idle::NothingToDo)) => {
+            Ok(Drawn::Idle(Idle::NothingToDo)) => {
                 // Said once, not once per pass: this answer stands until
-                // somebody pushes a commit or comments on a PR.
-                if blocked.news(&[NOTHING_TO_DO.to_owned()]) {
+                // somebody pushes a commit or comments on a PR. Not said at
+                // all while turns are running, which is no runner with
+                // nothing to do.
+                if busy.is_empty() && blocked.news(&[NOTHING_TO_DO.to_owned()]) {
                     info!("{NOTHING_TO_DO}");
                 }
                 idle_draws = idle_draws.saturating_add(1);
-                sleep(&cli, None, &status, &pending, Some(idle_draws), edited);
+                if !cli.once {
+                    sleep(&status, None, Some(idle_draws), || {
+                        wake(&pending, &busy, edited(), reported())
+                    });
+                }
             }
-            Ok(Report::Ran { verdict, outcome }) => {
+            Ok(Drawn::Turn(started)) => {
                 idle_draws = 0;
+                took_turn = true;
                 if blocked.cleared() {
                     info!("taking turns again");
                 }
-                if verdict.auth_error {
-                    let until = status::epoch_now() + AUTH_RETRY;
-                    error!(
-                        "the turn died on proxy auth; holding turns for {} minutes",
-                        AUTH_RETRY / 60
-                    );
-                    Status::update(&status, |s| s.oauth_gated_until = Some(until));
-                }
-                if let Some(complaint) = verdict.rejected_model {
-                    error!("opencode refused the configured model: {complaint}");
-                    rejected_model = Some((cfg.model.clone(), complaint));
-                }
-                if outcome == Outcome::Completed {
-                    // Recorded with or without a limit, so one set later
-                    // counts what actually ran; only logged under one.
-                    let now = status::epoch_now();
-                    let used = Status::update(&status, |s| {
-                        s.allowance.record(now);
-                        s.allowance.used(now)
-                    });
-                    if let Some((used, limit)) = used {
-                        info!(
-                            "{used} of {} completed tasks in the last {}h",
-                            limit.tasks, limit.hours
-                        );
+                let repo = started.repo().to_owned();
+                busy.insert(repo.clone());
+                if let Err(err) = start(
+                    *started, cfg, opencode, &status, &cache, &ledger, &weights, &reports,
+                ) {
+                    // The turn never got a thread to run on, so it is over
+                    // before it began; the repository is free again.
+                    error!("failed to start the turn on {repo}: {err:#}");
+                    busy.remove(&repo);
+                    took_turn = false;
+                    if !cli.once {
+                        sleep(&status, None, None, || {
+                            wake(&pending, &busy, edited(), reported())
+                        });
                     }
                 }
-                // A cancelled turn heads straight into the next one — that is
-                // the button's promise — but a usage-limit backoff still
-                // holds, since retrying early just burns the next turn on the
-                // same limit.
-                if outcome != Outcome::Canceled || verdict.usage_limit.is_some() {
-                    sleep(&cli, verdict.usage_limit, &status, &pending, None, edited);
-                }
+                // Straight back around: the next free slot, if there is
+                // one, is drawn for at once.
+                continue;
             }
-            // A failing turn (bad token, unreachable forge, ...) must not
+            // A failing draw (bad token, unreachable forge, ...) must not
             // kill the runner now that config is editable at runtime.
             Err(err) => {
                 idle_draws = 0;
                 error!("turn failed: {err:#}");
                 Status::update(&status, |s| s.log_tail = format!("turn failed: {err:#}"));
-                sleep(&cli, None, &status, &pending, None, edited);
+                if !cli.once {
+                    sleep(&status, None, None, || {
+                        wake(&pending, &busy, edited(), reported())
+                    });
+                }
             }
         }
-        if cli.once {
+        if cli.once && busy.is_empty() {
             return Ok(());
         }
+    }
+}
+
+/// What the turns running on their own threads hand back as they finish,
+/// oldest first, for the main loop to act on.
+type Reports = Arc<std::sync::Mutex<Vec<Done>>>;
+
+/// One finished turn, as the main loop needs it: the repository it held,
+/// the model it ran (which a refusal is held against), and how it went.
+struct Done {
+    repo: String,
+    model: String,
+    ran: Result<turn::Ran>,
+}
+
+/// Run a drawn turn on a thread of its own, which reports to `reports` when
+/// it is over — whether the turn ran, failed, or panicked, so its repository
+/// can never be held for good.
+#[allow(clippy::too_many_arguments)]
+fn start(
+    started: turn::Started,
+    cfg: Config,
+    opencode: opencode::Version,
+    status: &Shared,
+    cache: &Arc<cache::Cache>,
+    ledger: &Arc<deliveries::Deliveries>,
+    weights: &Arc<ledger::Ledger>,
+    reports: &Reports,
+) -> Result<()> {
+    let (status, cache, reports) = (status.clone(), cache.clone(), reports.clone());
+    let (ledger, weights) = (ledger.clone(), weights.clone());
+    let id = started.id();
+    let cleanup = status.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("turn-{id}"))
+        .spawn(move || {
+            let repo = started.repo().to_owned();
+            let model = cfg.model.clone();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                started.run(&cfg, &opencode, &status, &cache, &ledger, &weights)
+            }))
+            .unwrap_or_else(|_| {
+                Status::update(&status, |s| s.running.retain(|turn| turn.id != id));
+                Err(anyhow::anyhow!("the turn's thread panicked"))
+            });
+            sync::lock(&reports).push(Done { repo, model, ran });
+        });
+    if let Err(err) = spawned {
+        Status::update(&cleanup, |s| s.running.retain(|turn| turn.id != id));
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// Act on a finished turn: a proxy auth failure gates turns for a while, a
+/// refused model blocks them until another is picked, and a completion goes
+/// on the rate limit's record. Returns the gap the turn asks for before the
+/// next one starts — None for none at all, `Some(usage_limit)` otherwise —
+/// since a cancelled turn heads straight into the next one, that being the
+/// button's promise, but a usage-limit backoff still holds: retrying early
+/// just burns the next turn on the same limit.
+fn settle(
+    done: Done,
+    status: &Shared,
+    rejected_model: &mut Option<(String, String)>,
+) -> Option<Option<u64>> {
+    let turn::Ran { verdict, outcome } = match done.ran {
+        Ok(ran) => ran,
+        // A failing turn (unreachable forge, a clone that can't be written,
+        // ...) must not kill the runner now that config is editable at
+        // runtime.
+        Err(err) => {
+            error!("turn failed: {err:#}");
+            Status::update(status, |s| s.log_tail = format!("turn failed: {err:#}"));
+            return Some(None);
+        }
+    };
+    if verdict.auth_error {
+        let until = status::epoch_now() + AUTH_RETRY;
+        error!(
+            "the turn died on proxy auth; holding turns for {} minutes",
+            AUTH_RETRY / 60
+        );
+        Status::update(status, |s| s.oauth_gated_until = Some(until));
+    }
+    if let Some(complaint) = verdict.rejected_model {
+        error!("opencode refused the configured model: {complaint}");
+        *rejected_model = Some((done.model, complaint));
+    }
+    if outcome == Outcome::Completed {
+        // Recorded with or without a limit, so one set later counts what
+        // actually ran; only logged under one.
+        let now = status::epoch_now();
+        let used = Status::update(status, |s| {
+            s.allowance.record(now);
+            s.allowance.used(now)
+        });
+        if let Some((used, limit)) = used {
+            info!(
+                "{used} of {} completed tasks in the last {}h",
+                limit.tasks, limit.hours
+            );
+        }
+    }
+    (outcome != Outcome::Canceled || verdict.usage_limit.is_some()).then_some(verdict.usage_limit)
+}
+
+/// What cuts a pause between turns short, as the line that says so: forge
+/// activity some free repository can take, a settings edit, or a running
+/// turn finishing, whose report the loop has to act on. None while the pause
+/// still applies.
+fn wake(
+    pending: &events::Pending,
+    busy: &BTreeSet<String>,
+    edited: bool,
+    reported: bool,
+) -> Option<&'static str> {
+    if pending.startable(busy) {
+        Some("forge activity; ending the sleep early")
+    } else if edited {
+        Some("settings edited; drawing again")
+    } else if reported {
+        Some("a turn finished; ending the sleep early")
+    } else {
+        None
     }
 }
 
 /// How long the loop waits before looking again while something blocks turns
 /// from running. The web UI is how those get fixed, so this is also how long
 /// a fix takes to be noticed.
-const UNCONFIGURED_RETRY: Duration = Duration::from_secs(5);
+const UNCONFIGURED_RETRY: u64 = 5;
 
 /// How long the loop waits before re-asking the forge for its repository
 /// listing when not one enabled repository came back. Longer than
@@ -427,7 +603,7 @@ fn report_incomplete_install(
 /// How often an incomplete install is asked about again. Only the install
 /// fixes it, and asking spawns opencode, so less often than the settings are
 /// re-read.
-const INSTALL_RETRY: Duration = Duration::from_secs(60);
+const INSTALL_RETRY: u64 = 60;
 
 /// What `--once` does when a turn can't start at all. The flag promises a
 /// single turn and an exit, so every hold the loop would otherwise sit out —
@@ -733,7 +909,9 @@ fn apply_forge_auth(workspace: &Path, forge: &Forge) -> Result<()> {
     // refuses to update an existing name.
     if forge.kind == ForgeKind::Gitea {
         // Ignored: there is usually no previous login to delete.
-        drop(child::output(Command::new("tea").args(["login", "delete", "gitea"])));
+        drop(child::output(
+            Command::new("tea").args(["login", "delete", "gitea"]),
+        ));
         // The token goes in through tea's own environment variable rather
         // than `--token`, because `/proc/<pid>/cmdline` is world-readable:
         // an option carries the token to every local user for as long as
@@ -856,18 +1034,15 @@ fn hold(usage_limit: Option<u64>, idle: Option<u32>, now: u64) -> (u64, bool) {
 
 /// When the usage window is exhausted, Anthropic reports the epoch at which it
 /// reopens; wait for that instead of burning turns until then. Otherwise pause
-/// just long enough to keep a failing run from spinning the loop.
+/// just long enough to keep a failing run from spinning the loop. `wake` says
+/// what, if anything, ends the pause early — see the function of that name.
+/// Under `--once` the caller doesn't pause at all.
 fn sleep(
-    cli: &Cli,
-    usage_limit: Option<u64>,
     status: &status::Shared,
-    pending: &events::Pending,
+    usage_limit: Option<u64>,
     idle: Option<u32>,
-    edited: impl Fn() -> bool,
+    wake: impl Fn() -> Option<&'static str>,
 ) {
-    if cli.once {
-        return;
-    }
     let now = status::epoch_now();
     let (seconds, limited) = hold(usage_limit, idle, now);
     let until = now + seconds;
@@ -890,15 +1065,13 @@ fn sleep(
         if limited {
             return false;
         }
-        if !pending.is_empty() {
-            info!("forge activity; ending the sleep early");
-            return true;
+        match wake() {
+            Some(why) => {
+                info!("{why}");
+                true
+            }
+            None => false,
         }
-        if edited() {
-            info!("settings edited; drawing again");
-            return true;
-        }
-        false
     });
 }
 
@@ -1215,6 +1388,68 @@ mod tests {
         let start = Instant::now();
         wait(u64::MAX, 5, || false);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// What a finished turn asks of the loop now that the loop no longer runs
+    /// it inline: a gap before the next start unless it was cancelled — but
+    /// a usage notice holds even then — a completion on the rate limit's
+    /// record, and a refusal held against the model the turn ran, not
+    /// whatever the settings say by the time it reports.
+    #[test]
+    fn a_finished_turn_settles_the_gap_the_limit_and_the_model() {
+        let status = Shared::new();
+        let mut rejected = None;
+        let done = |verdict: scan::Verdict, outcome: Outcome| Done {
+            repo: "o/r".into(),
+            model: "anthropic/old".into(),
+            ran: Ok(turn::Ran { verdict, outcome }),
+        };
+        let completed = scan::Verdict {
+            completed: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            settle(done(completed, Outcome::Completed), &status, &mut rejected),
+            Some(None)
+        );
+        assert_eq!(status.lock().allowance.used(status::epoch_now()), None);
+        Status::update(&status, |s| {
+            s.allowance
+                .set_limit(Some(settings::RateLimit { tasks: 5, hours: 1 }))
+        });
+        assert_eq!(
+            status.lock().allowance.used(status::epoch_now()).unwrap().0,
+            1
+        );
+
+        assert_eq!(
+            settle(
+                done(Default::default(), Outcome::Canceled),
+                &status,
+                &mut rejected
+            ),
+            None
+        );
+        let usage = scan::Verdict {
+            usage_limit: Some(42),
+            rejected_model: Some("no such model".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            settle(done(usage, Outcome::Canceled), &status, &mut rejected),
+            Some(Some(42))
+        );
+        assert_eq!(
+            rejected,
+            Some(("anthropic/old".into(), "no such model".into()))
+        );
+
+        let failed = Done {
+            ran: Err(anyhow::anyhow!("clone vanished")),
+            ..done(Default::default(), Outcome::Failed)
+        };
+        assert_eq!(settle(failed, &status, &mut rejected), Some(None));
+        assert!(status.lock().log_tail.contains("clone vanished"));
     }
 
     /// The usage hold is the one wait nothing can cut short, and the epoch it

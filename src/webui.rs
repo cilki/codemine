@@ -27,7 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::deliveries::Deliveries;
 use crate::events::{Pending, Request, SharedPending};
 use crate::settings::{Settings, SharedSettings};
-use crate::status::{Activity, Shared, Status, epoch_now};
+use crate::status::{Shared, Status, epoch_now};
 
 /// How often the live log tail is re-read and the host details refreshed.
 /// Status updates are pushed the moment they happen; a log file growing or a
@@ -150,16 +150,17 @@ async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-/// One finished turn's full log, identified by the turn's id. Served raw,
-/// ANSI escapes and all; the page renders them.
+/// One turn's full log so far, finished or still running, identified by the
+/// turn's id. Served raw, ANSI escapes and all; the page renders them.
 async fn api_turn_log(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
-    let path = state
-        .status
-        .lock()
-        .turns
-        .iter()
-        .find(|record| record.id == id)
-        .map(|record| record.log_path.clone());
+    let path = {
+        let status = state.status.lock();
+        let finished = status.turns.iter().find(|record| record.id == id);
+        finished.map(|record| record.log_path.clone()).or_else(|| {
+            let running = status.running.iter().find(|turn| turn.id == id);
+            running.map(|turn| turn.log_path.clone())
+        })
+    };
     let Some(path) = path else {
         return (StatusCode::NOT_FOUND, "no such turn").into_response();
     };
@@ -372,10 +373,8 @@ fn log_update(status: &Shared, cursor: &mut Option<LogCursor>) -> Option<(&'stat
     // can't be opened).
     let (log_path, fallback) = {
         let status = status.lock();
-        let path = match &status.activity {
-            Activity::Running { log_path, .. } => Some(log_path.clone()),
-            _ => None,
-        };
+        // The oldest running turn's, the one the page shows.
+        let path = status.running.first().map(|turn| turn.log_path.clone());
         (path, status.log_tail.clone())
     };
     let open = log_path.and_then(|path| {
@@ -476,7 +475,10 @@ async fn api_options(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// The settings with tokens redacted to a `token_set` flag; tokens are
 /// write-only and never leave the server.
 async fn api_settings(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(settings_view(&state.settings.snapshot().0, &state.workspace))
+    Json(settings_view(
+        &state.settings.snapshot().0,
+        &state.workspace,
+    ))
 }
 
 /// The settings as the page gets them: secrets redacted, and while signing
@@ -548,24 +550,30 @@ async fn api_put_settings(
 #[derive(serde::Deserialize)]
 struct Paused {
     paused: bool,
+    /// Which running turn; the oldest when absent — see `Status::running_mut`.
+    #[serde(default)]
+    id: Option<u64>,
 }
 
-/// Pause or resume the running turn by SIGSTOPping or SIGCONTing the agent's
+/// Pause or resume a running turn by SIGSTOPping or SIGCONTing the agent's
 /// whole process group. Only meaningful while a turn is running; the state is
 /// not persisted, so a restart always starts running.
 async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paused>) -> Response {
-    let pgid = match &state.status.lock().activity {
-        Activity::Running { pgid, .. } => *pgid,
-        _ => 0,
-    };
+    let pgid = state
+        .status
+        .lock()
+        .running_mut(incoming.id)
+        .map_or(0, |turn| turn.pgid);
     if pgid <= 0 {
-        return error(StatusCode::CONFLICT, "no turn is running");
+        return error(StatusCode::CONFLICT, "no such turn is running");
     }
     match crate::workspace::pause_group(pgid, incoming.paused) {
         Ok(()) => {
             Status::update(&state.status, |s| {
-                if let Activity::Running { paused, .. } = &mut s.activity {
-                    *paused = incoming.paused;
+                // Matched by process group, not by `id`: an absent id names
+                // the oldest turn, which may have finished since.
+                if let Some(turn) = s.running.iter_mut().find(|turn| turn.pgid == pgid) {
+                    turn.paused = incoming.paused;
                 }
             });
             Json(json!({ "paused": incoming.paused })).into_response()
@@ -574,19 +582,25 @@ async fn api_put_paused(State(state): State<AppState>, Json(incoming): Json<Paus
     }
 }
 
-/// Cancel the running turn and move on to the next: the flag is picked up at
+/// Which running turn a request is about: `?id=`, or the oldest without it.
+#[derive(serde::Deserialize)]
+struct Which {
+    id: Option<u64>,
+}
+
+/// Cancel a running turn and move on to the next: the flag is picked up at
 /// the turn runner's next wait hop (within seconds), which kills the agent's
 /// process tree, records the turn as canceled, and skips the between-turn
 /// sleep. A paused tree is killable too — the kill SIGCONTs it on the way.
-async fn api_post_cancel(State(state): State<AppState>) -> Response {
+async fn api_post_cancel(
+    State(state): State<AppState>,
+    axum::extract::Query(which): axum::extract::Query<Which>,
+) -> Response {
     let mut status = state.status.lock();
-    let Activity::Running {
-        cancel_requested, ..
-    } = &mut status.activity
-    else {
-        return error(StatusCode::CONFLICT, "no turn is running");
+    let Some(turn) = status.running_mut(which.id) else {
+        return error(StatusCode::CONFLICT, "no such turn is running");
     };
-    *cancel_requested = true;
+    turn.cancel_requested = true;
     Json(json!({ "canceled": true })).into_response()
 }
 
@@ -697,7 +711,7 @@ async fn api_repos(State(state): State<AppState>) -> Response {
 mod tests {
     use super::*;
     use crate::settings::SettingsStore;
-    use crate::status::Status;
+    use crate::status::{Activity, Running, Status};
     use std::io::{Read, Write};
     use std::sync::Arc;
 
@@ -738,8 +752,8 @@ mod tests {
     }
 
     /// A turn under way, as the runner would show it, writing `log_path`.
-    fn running(log_path: &std::path::Path, pgid: i32) -> Activity {
-        Activity::Running {
+    fn running(log_path: &std::path::Path, pgid: i32) -> Running {
+        Running {
             task: "simplify".into(),
             repo: "o/r".into(),
             forge: "github".into(),
@@ -888,7 +902,7 @@ mod tests {
             .spawn()
             .unwrap();
         Status::update(&status, |s| {
-            s.activity = running(&dir.path().join("log"), child.id() as i32);
+            s.running = vec![running(&dir.path().join("log"), child.id() as i32)];
         });
 
         let response = request(addr, "PUT", "/api/paused", r#"{"paused":true}"#);
@@ -921,17 +935,45 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 409"), "{response}");
 
         Status::update(&status, |s| {
-            s.activity = running(&dir.path().join("log"), 1)
+            s.running = vec![running(&dir.path().join("log"), 1)]
         });
         let response = request(addr, "POST", "/api/cancel", "");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(matches!(
-            status.lock().activity,
-            Activity::Running {
-                cancel_requested: true,
-                ..
-            }
-        ));
+        assert!(status.lock().running[0].cancel_requested);
+    }
+
+    /// With turns running side by side, `?id=` picks which one is cancelled,
+    /// an unknown id cancels nothing, and a running turn's log is served by
+    /// its id like a finished one's.
+    #[test]
+    fn a_running_turn_is_addressed_by_its_id() {
+        let status = Shared::new();
+        let (addr, dir) = serve_in_tempdir(&status);
+        let second = dir.path().join("2.log");
+        std::fs::write(&second, "second turn so far\n").unwrap();
+        Status::update(&status, |s| {
+            let first = running(&dir.path().join("1.log"), 1);
+            let second = Running {
+                id: 2,
+                repo: "o/other".into(),
+                ..running(&second, 2)
+            };
+            s.running = vec![first, second];
+        });
+
+        let response = request(addr, "POST", "/api/cancel?id=3", "");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        let response = request(addr, "POST", "/api/cancel?id=2", "");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        {
+            let status = status.lock();
+            assert!(!status.running[0].cancel_requested);
+            assert!(status.running[1].cancel_requested);
+        }
+
+        let response = request(addr, "GET", "/api/turns/2/log", "");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("second turn so far\n"), "{response}");
     }
 
     #[test]
@@ -1017,8 +1059,8 @@ mod tests {
         // The running turn's token count moving, as the sampler moves it.
         let sample = |n: u64| {
             Status::update(&status, |s| {
-                if let Activity::Running { tokens, .. } = &mut s.activity {
-                    *tokens = Some(crate::status::TokenUsage {
+                if let Some(running) = s.running.first_mut() {
+                    running.tokens = Some(crate::status::TokenUsage {
                         input: n,
                         ..Default::default()
                     });
@@ -1026,7 +1068,7 @@ mod tests {
             })
         };
         Status::update(&status, |s| {
-            s.activity = running(&dir.path().join("turn.log"), 0);
+            s.running = vec![running(&dir.path().join("turn.log"), 0)];
             // A full history, which is what the stream used to re-send.
             for n in 0..200 {
                 s.record_turn(record(1_760_000_000 - n * 1200), None);
@@ -1062,6 +1104,7 @@ mod tests {
         // A turn finishing is what moves the list, and that does go out.
         Status::update(&status, |s| {
             s.activity = Activity::Sleeping { until: 0 };
+            s.running.clear();
             s.record_turn(record(1_760_009_999), None);
         });
         let finished = read_until(&mut stream, "event: turns");
@@ -1308,7 +1351,7 @@ mod tests {
         assert_eq!(update(&mut cursor), None);
 
         // A turn starts: the window it has so far, then only what it adds.
-        Status::update(&status, |s| s.activity = running(&path, 0));
+        Status::update(&status, |s| s.running = vec![running(&path, 0)]);
         assert_eq!(update(&mut cursor), Some(("log", "first\n".to_owned())));
         assert_eq!(update(&mut cursor), None);
         append(&path, "second\n");
@@ -1342,7 +1385,7 @@ mod tests {
         // append to and the window is stated again.
         let next = dir.path().join("next.log");
         std::fs::write(&next, "next turn\n").unwrap();
-        Status::update(&status, |s| s.activity = running(&next, 0));
+        Status::update(&status, |s| s.running = vec![running(&next, 0)]);
         assert_eq!(update(&mut cursor), Some(("log", "next turn\n".to_owned())));
 
         // And so is a log that shrank under the page: whatever it holds is
@@ -1362,6 +1405,7 @@ mod tests {
         // The turn ends: back to the stored tail.
         Status::update(&status, |s| {
             s.activity = Activity::Sleeping { until: 0 };
+            s.running.clear();
             s.log_tail = "cut\n".into();
         });
         assert_eq!(update(&mut cursor), Some(("log", "cut\n".to_owned())));

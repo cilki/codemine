@@ -144,15 +144,24 @@ already open, and so does `feature`, which only files issues. Merge or close a
 PR and the held-back tasks are drawn again. A custom task that only files
 issues can say so with a `<!-- delivers: issue -->` line under its heading.
 
+Turns run one at a time unless you raise **Turns at once** (up to 4). Each turn
+then runs on a repository of its own: a repository with a turn under way is
+left out of the draw, and anything queued for it waits until that turn is
+over. Running turns count against the rate limit as if they had already
+completed, so turns started side by side never add up to more than it allows.
+A usage-limit notice from any turn holds every new start, but leaves the turns
+already running alone.
+
 #### Run now
 
 To take a specific turn rather than wait for the draw, pick a task and an
 enabled repository beside the Turns list and press **run now** (or
 `POST /api/run` with `{"task": "docs", "repo": "owner/name"}`). The request is
-the next turn the runner takes: after the running turn, if any, and once the
-rate limit has room, but regardless of the schedule's window. The task doesn't
-need to be ticked for the repository, and neither a remembered skip nor the
-open-PR budget holds it back, so this is also how to try a new custom task or have a skipped one look
+the next turn the runner takes: as soon as a slot is free and the rate limit
+has room, but regardless of the schedule's window, and once any turn already
+running on that repository is over. The task doesn't need to be ticked for the
+repository, and neither a remembered skip nor the open-PR budget holds it back,
+so this is also how to try a new custom task or have a skipped one look
 again. A gated task still needs work to act on: `rebase` with no conflicting
 PR, say, is dropped with a warning in the log instead of run.
 

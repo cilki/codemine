@@ -37,6 +37,8 @@ pub struct Settings {
     pub max_open_prs: Option<u32>,
     /// Seconds before a turn is cut off.
     pub turn_timeout_secs: u64,
+    /// How many turns may run at once, each on a repository of its own.
+    pub concurrency: u32,
     /// The daily window automatic turns may start in; off by default. Turns
     /// the forge asks for start outside it too.
     pub schedule: Schedule,
@@ -65,6 +67,7 @@ impl Default for Settings {
             rate_limit: None,
             max_open_prs: None,
             turn_timeout_secs: 21600,
+            concurrency: 1,
             schedule: Schedule::default(),
             sign_commits: false,
             forge_commands: false,
@@ -77,6 +80,11 @@ impl Default for Settings {
 /// times this far back, so a window edited up to the cap still sees exactly
 /// what happened inside it.
 pub const MAX_WINDOW_HOURS: u32 = 24;
+
+/// The most turns the settings let run at once. Each is an opencode session
+/// with its own build and test runs in it, and the hosts this runs on are
+/// small, so the cap is kept close to what one of them can bear.
+pub const MAX_CONCURRENCY: u32 = 4;
 
 /// "At most `tasks` completed tasks in any `hours` hours", counted over a
 /// sliding window: a turn may start once fewer than `tasks` completions fall
@@ -397,6 +405,9 @@ impl Settings {
         }
         if self.turn_timeout_secs == 0 {
             bail!("turn timeout must be positive");
+        }
+        if !(1..=MAX_CONCURRENCY).contains(&self.concurrency) {
+            bail!("concurrency must be between 1 and {MAX_CONCURRENCY} turns");
         }
         self.schedule.validate()?;
         // Empty is how a forge asks for its default instance; Gitea has
@@ -802,10 +813,19 @@ mod tests {
         bad.schedule.enabled = true;
         bad.schedule.end_minute = bad.schedule.start_minute;
         assert!(settings.apply_update(bad).is_err());
+        for concurrency in [0, MAX_CONCURRENCY + 1] {
+            let mut bad = configured();
+            bad.concurrency = concurrency;
+            assert!(settings.apply_update(bad).is_err(), "{concurrency}");
+        }
+        let mut good = configured();
+        good.concurrency = MAX_CONCURRENCY;
+        assert!(settings.clone().apply_update(good).is_ok());
         // The failed updates changed nothing.
         assert_eq!(settings.turn_timeout_secs, 21600);
         assert_eq!(settings.rate_limit, None);
         assert_eq!(settings.max_open_prs, None);
+        assert_eq!(settings.concurrency, 1);
     }
 
     /// The limit used to be a fractional `hourly_limit` spent from a token
@@ -820,6 +840,8 @@ mod tests {
         .unwrap();
         assert_eq!(settings.model, "anthropic/claude");
         assert_eq!(settings.rate_limit, None);
+        // Written before turns could run in parallel: one at a time.
+        assert_eq!(settings.concurrency, 1);
         let value = serde_json::to_value(&settings).unwrap();
         assert!(value.get("hourly_limit").is_none());
     }

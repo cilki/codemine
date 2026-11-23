@@ -16,7 +16,7 @@
 //! With forge commands on, the same feed is also read for comments that ask
 //! the bot for a task by name; see `commands`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -81,6 +81,14 @@ pub struct Focus {
     pub text: String,
 }
 
+/// What a draw took off the queues for a repository a turn is already
+/// running on, to go back on them — see `Pending::defer`.
+#[derive(Default)]
+pub struct Deferred {
+    pub requests: Vec<Request>,
+    pub activity: Vec<(ForgeKind, String)>,
+}
+
 pub type SharedPending = Arc<Pending>;
 
 impl Pending {
@@ -121,9 +129,44 @@ impl Pending {
         self.lock().requested.iter().cloned().collect()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         let queues = self.lock();
         queues.activity.is_empty() && queues.requested.is_empty()
+    }
+
+    /// Whether anything queued could start a turn now: an entry for a
+    /// repository outside `busy`, the ones a turn is already running on.
+    /// What waits on a busy repository can't be drawn until that turn is
+    /// over, so it must not cut a wait short, or the loop would redraw for
+    /// it every few seconds.
+    pub fn startable(&self, busy: &BTreeSet<String>) -> bool {
+        let queues = self.lock();
+        queues.activity.iter().any(|(_, repo)| !busy.contains(repo))
+            || queues
+                .requested
+                .iter()
+                .any(|request| !busy.contains(&request.repo))
+    }
+
+    /// Put back what a draw took off the queues but couldn't run yet, ahead
+    /// of anything queued since and in the order it was taken.
+    pub fn defer(&self, deferred: Deferred) {
+        let mut queues = self.lock();
+        for request in deferred.requests.into_iter().rev() {
+            if !queues.requested.contains(&request) {
+                queues.requested.push_front(request);
+            }
+        }
+        for (kind, repo) in deferred.activity.into_iter().rev() {
+            if !queues
+                .activity
+                .iter()
+                .any(|(k, r)| *k == kind && *r == repo)
+            {
+                queues.activity.push_front((kind, repo));
+            }
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Queues> {
@@ -325,6 +368,39 @@ mod tests {
         pending.request(asked("#2"));
         pending.request(asked("#1"));
         assert_eq!(pending.requests(), [asked("#1"), asked("#2")]);
+    }
+
+    /// What waits on a repository a turn is running on can't start a turn,
+    /// so it doesn't count as startable — else every wait would end at once
+    /// and the loop redraw for it every few seconds. Deferred entries go
+    /// back ahead of anything queued since, in the order they were taken.
+    #[test]
+    fn entries_for_a_busy_repository_wait_their_turn() {
+        let pending = Pending::new();
+        let busy = BTreeSet::from(["me/a".to_owned()]);
+        let request = |repo: &str| Request {
+            kind: ForgeKind::Github,
+            repo: repo.into(),
+            task: "docs",
+            focus: None,
+        };
+        assert!(!pending.startable(&busy));
+        pending.push(ForgeKind::Github, "me/a".into());
+        pending.request(request("me/a"));
+        assert!(!pending.startable(&busy));
+        assert!(pending.startable(&BTreeSet::new()));
+        pending.request(request("me/b"));
+        assert!(pending.startable(&busy));
+
+        let taken = Deferred {
+            requests: vec![pending.pop_request().unwrap()],
+            activity: vec![pending.pop().unwrap()],
+        };
+        pending.push(ForgeKind::Github, "me/c".into());
+        pending.defer(taken);
+        assert_eq!(pending.requests(), [request("me/a"), request("me/b")]);
+        assert_eq!(pending.pop(), Some((ForgeKind::Github, "me/a".into())));
+        assert_eq!(pending.pop(), Some((ForgeKind::Github, "me/c".into())));
     }
 
     #[test]
