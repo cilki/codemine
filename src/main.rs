@@ -268,33 +268,36 @@ fn main() -> Result<()> {
                 }
                 info!("the queued activity needed no turn; back to the hold");
             }
-            // The draw took no turn. Which of its two reasons it is decides
-            // how that is shown: a pool the forge doesn't list is a blocker
-            // like any settings problem, where a caught-up pool is simply
-            // what a runner with nothing to do looks like.
-            Ok(Report::Idle(idle)) => match idle_problem(idle) {
-                Some(problem) => {
-                    // The pool is broken rather than caught up, so the next
-                    // draw after it is fixed is a first draw again.
-                    idle_draws = 0;
-                    report_blocker(&cli, &mut blocked, &status, vec![problem])?;
-                    // Re-asked on the turn interval rather than the settings
-                    // one: this answer costs a repository listing, where
-                    // re-reading the settings costs nothing. Sliced and
-                    // cut short by an edit, so a corrected enabled set
-                    // applies at once.
-                    wait(POOL_RETRY, 5, edited);
+            // The draw took no turn because not one enabled repository is
+            // listed: renamed, deleted, archived, or out of the token's
+            // reach. Only a human can clear that, so it is a blocker like any
+            // settings problem, tied to the repository picker that fixes it.
+            Ok(Report::Idle(Idle::NoListedRepos)) => {
+                // The pool is broken rather than caught up, so the next draw
+                // after it is fixed is a first draw again.
+                idle_draws = 0;
+                let problem = Problem::new(
+                    "repos",
+                    "none of the enabled repositories are listed by the forge, or all are archived",
+                );
+                report_blocker(&cli, &mut blocked, &status, vec![problem])?;
+                // Re-asked on the turn interval rather than the settings one:
+                // this answer costs a repository listing, where re-reading the
+                // settings costs nothing. Sliced and cut short by an edit, so
+                // a corrected enabled set applies at once.
+                wait(POOL_RETRY, 5, edited);
+            }
+            // A caught-up pool is no problem at all — just what a runner with
+            // nothing to do looks like — and mustn't flag the settings.
+            Ok(Report::Idle(Idle::NothingToDo)) => {
+                // Said once, not once per pass: this answer stands until
+                // somebody pushes a commit or comments on a PR.
+                if blocked.news(&[NOTHING_TO_DO.to_owned()]) {
+                    info!("{NOTHING_TO_DO}");
                 }
-                None => {
-                    // Said once, not once per pass: this answer stands until
-                    // somebody pushes a commit or comments on a PR.
-                    if blocked.news(&[NOTHING_TO_DO.to_owned()]) {
-                        info!("{NOTHING_TO_DO}");
-                    }
-                    idle_draws = idle_draws.saturating_add(1);
-                    sleep(&cli, None, &status, &pending, Some(idle_draws), edited);
-                }
-            },
+                idle_draws = idle_draws.saturating_add(1);
+                sleep(&cli, None, &status, &pending, Some(idle_draws), edited);
+            }
             Ok(Report::Ran { verdict, canceled }) => {
                 idle_draws = 0;
                 if blocked.cleared() {
@@ -365,23 +368,6 @@ const POOL_RETRY: u64 = 60;
 /// a runner that has caught up with its repositories looks like — so it is
 /// reported as the runner's state rather than as something to fix.
 const NOTHING_TO_DO: &str = "every enabled task has nothing to do on any enabled repository";
-
-/// The blocker a pass that took no turn amounts to, if any. An enabled set
-/// that the forge lists none of is a misconfiguration — the repository was
-/// renamed, deleted, archived, or has fallen out of the token's reach — and
-/// only a human can clear it, so it is tied to the repository picker that
-/// fixes it.
-/// A pool that is merely caught up is no problem at all, and mustn't flag the
-/// settings as if it were.
-fn idle_problem(idle: Idle) -> Option<Problem> {
-    match idle {
-        Idle::NothingToDo => None,
-        Idle::NoListedRepos => Some(Problem::new(
-            "repos",
-            "none of the enabled repositories are listed by the forge, or all are archived",
-        )),
-    }
-}
 
 /// Log, show, and (under `--once`) give up on whatever is keeping turns from
 /// running. The web UI shows the problems against the fields that fix them,
@@ -1253,25 +1239,6 @@ mod tests {
         assert!(!blocked.cleared());
         // Blocked again after a clear stretch: news once more.
         assert!(blocked.news(&reasons(&["no repositories are enabled"])));
-    }
-
-    /// A pass that drew nothing is reported by what caused it: an enabled
-    /// repository set the forge lists none of is a misconfiguration pinned
-    /// to the picker that fixes it, while a pool that has merely caught up
-    /// is no problem at all — reporting it as one would redden the settings
-    /// button on a perfectly healthy runner.
-    #[test]
-    fn only_an_unlisted_repository_set_is_a_problem() {
-        let problem = idle_problem(Idle::NoListedRepos).expect("a blocker");
-        // The field is what the page outlines, so it has to name the
-        // repository picker rather than the forge's token or URL.
-        assert_eq!(problem.field, "repos");
-        assert!(
-            problem.message.contains("listed by the forge"),
-            "{}",
-            problem.message
-        );
-        assert!(idle_problem(Idle::NothingToDo).is_none());
     }
 
     /// "Nothing to do" and "pausing between turns" used to be the same state
