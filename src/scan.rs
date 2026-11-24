@@ -18,7 +18,8 @@
 #[derive(Default)]
 pub struct Verdict {
     /// The agent reported real forge changes with a `TASK COMPLETED` marker;
-    /// only these turns count toward the rate limit.
+    /// a turn that also exited cleanly is `Outcome::Completed`, the only
+    /// outcome that counts toward the rate limit.
     pub completed: bool,
     /// The session ended on an opencode error report rather than on the
     /// agent's own marker, which it does while still exiting 0.

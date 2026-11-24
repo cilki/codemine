@@ -5,11 +5,19 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+/// Stored in config.json as its slug (`name`) — the same word the web UI puts
+/// in its dropdown and the sweep prompt names the forge by.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum ForgeKind {
     Gitea,
+    /// GitHub needs no URL and is the forge most tokens are for, so a fresh
+    /// install's dropdown starts there.
+    #[default]
     Github,
     Gitlab,
 }
@@ -18,12 +26,11 @@ impl ForgeKind {
     /// Every forge the runner knows, in the order the UI lists them.
     ///
     /// The one place the set is written down. The settings offer each of
-    /// these in the forge dropdown, `from_slug` reads a stored one back, and
-    /// `workspace::clear_clones` wipes the clones under each. They used to
-    /// spell the three kinds out for themselves — `clear_clones` as bare
-    /// slug strings that had to be kept in step with `name` by hand, where
-    /// a forge missing from its copy would quietly keep its clones across
-    /// every restart.
+    /// these in the forge dropdown and `workspace::clear_clones` wipes the
+    /// clones under each. They used to spell the three kinds out for
+    /// themselves — `clear_clones` as bare slug strings that had to be kept
+    /// in step with `name` by hand, where a forge missing from its copy would
+    /// quietly keep its clones across every restart.
     pub const ALL: [ForgeKind; 3] = [ForgeKind::Gitea, ForgeKind::Github, ForgeKind::Gitlab];
 
     /// The slug passed to the sweep prompt; it doubles as the skill name.
@@ -33,37 +40,6 @@ impl ForgeKind {
             ForgeKind::Github => "github",
             ForgeKind::Gitlab => "gitlab",
         }
-    }
-
-    /// The kind a slug names, if any. Read back off `name` rather than
-    /// matched a second time, so the two directions cannot disagree about
-    /// what a forge is called.
-    pub fn from_slug(slug: &str) -> Option<Self> {
-        ForgeKind::ALL.into_iter().find(|kind| kind.name() == slug)
-    }
-}
-
-/// The kind is stored in config.json as its slug — the same word the web UI
-/// puts in its dropdown and the sweep prompt names the forge by.
-impl Serialize for ForgeKind {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.name())
-    }
-}
-
-impl<'de> Deserialize<'de> for ForgeKind {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let slug = String::deserialize(deserializer)?;
-        ForgeKind::from_slug(&slug)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown forge: {slug}")))
-    }
-}
-
-/// GitHub needs no URL and is the forge most tokens are for, so a fresh
-/// install's dropdown starts there.
-impl Default for ForgeKind {
-    fn default() -> Self {
-        ForgeKind::Github
     }
 }
 
@@ -273,8 +249,6 @@ pub struct Config {
     pub turn_timeout: Duration,
     /// The open-PR budget per repository; see `Settings::max_open_prs`.
     pub max_open_prs: Option<usize>,
-    /// The daily window automatic turns may start in.
-    pub schedule: crate::schedule::Schedule,
     /// Root of the persistent workspace where repositories stay cloned across
     /// turns.
     pub workspace: PathBuf,
@@ -462,26 +436,18 @@ mod tests {
 
     /// `ALL` is the one place the set of forges is written down — the
     /// settings offer each in the dropdown and `workspace::clear_clones`
-    /// wipes the clones under each — and `from_slug` reads back off it, so a
-    /// kind left out of the list is a forge the web UI could never name back
-    /// to the runner. The JSON form is the same slug, so config.json and the
-    /// dropdown agree on the word.
+    /// wipes the clones under each. The JSON form is the same slug as `name`,
+    /// so config.json, the dropdown, and the sweep prompt agree on the word.
     #[test]
     fn every_forge_kind_round_trips_through_its_slug() {
         for kind in ForgeKind::ALL {
             let slug = kind.name();
-            assert_eq!(ForgeKind::from_slug(slug), Some(kind), "{slug}");
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{slug}\""));
             let back: ForgeKind = serde_json::from_str(&json).unwrap();
             assert_eq!(back, kind);
         }
         assert!(serde_json::from_str::<ForgeKind>("\"bitbucket\"").is_err());
-        // No duplicates, so a slug names exactly one kind.
-        let slugs: BTreeSet<&str> = ForgeKind::ALL.iter().map(|kind| kind.name()).collect();
-        assert_eq!(slugs.len(), ForgeKind::ALL.len());
-        assert_eq!(ForgeKind::from_slug("bitbucket"), None);
-        assert_eq!(ForgeKind::from_slug(""), None);
     }
 
     #[test]
