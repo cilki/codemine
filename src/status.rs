@@ -72,8 +72,8 @@ impl Savings {
     }
 }
 
-/// How a finished turn went, for display only; whether a turn counts toward
-/// the rate limit is decided separately in the turn runner.
+/// How a finished turn went: what its record shows, and what the main loop
+/// acts on — only a completed turn counts toward the rate limit.
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {

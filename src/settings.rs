@@ -324,7 +324,6 @@ impl Settings {
             model: self.model.clone(),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             max_open_prs: self.max_open_prs.map(|budget| budget as usize),
-            schedule: self.schedule,
             workspace: workspace.to_owned(),
         }
     }

@@ -53,14 +53,15 @@ pub enum Report {
     Idle(Idle),
     Ran {
         /// What the turn's log said about it, which the main loop acts on: a
-        /// completion counts toward the rate limit, a usage notice holds the
-        /// next turn, a proxy auth failure briefly gates turns, and a refused
-        /// model blocks them until another is picked. A turn that died
-        /// preparing its clone never wrote a log to read, and says nothing.
+        /// usage notice holds the next turn, a proxy auth failure briefly
+        /// gates turns, and a refused model blocks them until another is
+        /// picked. A turn that died preparing its clone never wrote a log to
+        /// read, and says nothing.
         verdict: Verdict,
-        /// The web UI cancelled the turn; the main loop skips the
-        /// between-turn sleep so the next one starts right away.
-        canceled: bool,
+        /// What the turn amounted to, as its record shows it: a completed
+        /// one counts toward the rate limit, and after a cancelled one the
+        /// main loop skips the between-turn sleep.
+        outcome: Outcome,
     },
 }
 
@@ -241,7 +242,7 @@ pub fn run(
         turn.finish(status, ledger, &tail, Outcome::Failed, spent, Vec::new());
         return Ok(Report::Ran {
             verdict: Verdict::default(),
-            canceled: false,
+            outcome: Outcome::Failed,
         });
     }
 
@@ -292,7 +293,7 @@ pub fn run(
     };
     turn.finish(status, ledger, &tail, outcome, spent, opened);
 
-    Ok(Report::Ran { verdict, canceled })
+    Ok(Report::Ran { verdict, outcome })
 }
 
 /// What a completed turn delivered: the PRs and issues the bot opened on the

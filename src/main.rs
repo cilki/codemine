@@ -41,7 +41,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Cli, Config, Forge, ForgeKind, USAGE};
 use crate::settings::{Problem, Settings, SettingsStore};
-use crate::status::{Activity, Shared, Status};
+use crate::status::{Activity, Outcome, Shared, Status};
 use crate::turn::{Draw, Idle, Report};
 
 fn main() -> Result<()> {
@@ -214,7 +214,7 @@ fn main() -> Result<()> {
         // out across the closed stretch the same as any idle time; a turn
         // already under way is left to finish, since the window gates when
         // turns start, not how long they may run.
-        let draw = match cfg.schedule.hold(schedule::local_second_of_day()) {
+        let draw = match settings.schedule.hold(schedule::local_second_of_day()) {
             _ if named => Draw::QueuedOnly,
             None => Draw::Any,
             Some(_) if !pending.is_empty() => {
@@ -298,7 +298,7 @@ fn main() -> Result<()> {
                 idle_draws = idle_draws.saturating_add(1);
                 sleep(&cli, None, &status, &pending, Some(idle_draws), edited);
             }
-            Ok(Report::Ran { verdict, canceled }) => {
+            Ok(Report::Ran { verdict, outcome }) => {
                 idle_draws = 0;
                 if blocked.cleared() {
                     info!("taking turns again");
@@ -315,7 +315,7 @@ fn main() -> Result<()> {
                     error!("opencode refused the configured model: {complaint}");
                     rejected_model = Some((cfg.model.clone(), complaint));
                 }
-                if verdict.completed {
+                if outcome == Outcome::Completed {
                     // Recorded with or without a limit, so one set later
                     // counts what actually ran; only logged under one.
                     let now = status::epoch_now();
@@ -334,7 +334,7 @@ fn main() -> Result<()> {
                 // the button's promise — but a usage-limit backoff still
                 // holds, since retrying early just burns the next turn on the
                 // same limit.
-                if !canceled || verdict.usage_limit.is_some() {
+                if outcome != Outcome::Canceled || verdict.usage_limit.is_some() {
                     sleep(&cli, verdict.usage_limit, &status, &pending, None, edited);
                 }
             }
