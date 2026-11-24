@@ -52,37 +52,33 @@ pub enum State {
 }
 
 /// A PR or issue a turn opened, as the turn's record names it.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
 pub struct Opened {
     pub kind: Kind,
     pub number: u64,
     pub url: String,
 }
 
-/// One delivery as the file keeps it.
+/// One delivery as the file keeps it: what the summary counts it under and
+/// what settling it needs. The page links a delivery from its turn's record,
+/// and what a turn spent is in its task's tally, so neither is kept here.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 struct Delivery {
     forge: ForgeKind,
     repo: String,
     task: String,
-    #[serde(flatten)]
-    opened: Opened,
-    /// Epoch seconds the turn that opened it started.
-    turn_started: u64,
-    /// What that turn spent, summed the way the page sums a turn.
-    tokens: u64,
+    kind: Kind,
+    number: u64,
     state: State,
     /// When the forge was last asked about it, which paces the rechecks.
     checked: u64,
-    /// When it was found merged or closed; None while it is open.
-    settled: Option<u64>,
 }
 
 impl Delivery {
     /// The page's key for it: the forge, repository, kind and number, since
     /// GitLab numbers its issues and merge requests apart.
     fn key(&self) -> String {
-        key(self.forge, &self.repo, self.opened.kind, self.opened.number)
+        key(self.forge, &self.repo, self.kind, self.number)
     }
 }
 
@@ -190,12 +186,10 @@ impl Deliveries {
                 forge,
                 repo: repo.to_owned(),
                 task: task.to_owned(),
-                opened: opened.clone(),
-                turn_started: started,
-                tokens,
+                kind: opened.kind,
+                number: opened.number,
                 state: State::Open,
                 checked: started,
-                settled: None,
             });
         }
         self.save(&ledger);
@@ -222,7 +216,7 @@ impl Deliveries {
             .iter()
             .filter(|d| d.forge == forge && d.state == State::Open)
             .filter(|d| d.checked + RECHECK_SECS <= now)
-            .map(|d| (d.repo.clone(), d.opened.kind, d.opened.number))
+            .map(|d| (d.repo.clone(), d.kind, d.number))
             .collect();
         if due.is_empty() {
             return;
@@ -247,7 +241,6 @@ impl Deliveries {
                 Ok(state) => {
                     info!("{key} is now {state:?}");
                     delivery.state = state;
-                    delivery.settled = Some(now);
                 }
                 Err(err) => warn!("failed to ask what became of {key}: {err:#}"),
             }
@@ -291,7 +284,7 @@ fn summary(ledger: &Ledger) -> Vec<TaskSummary> {
     }
     for d in &ledger.deliveries {
         let line = lines.entry(&d.task).or_default();
-        match (d.opened.kind, d.state) {
+        match (d.kind, d.state) {
             (Kind::Pr, state) => {
                 line.prs += 1;
                 match state {
@@ -328,12 +321,7 @@ pub fn opened_in(
     kind: Option<Kind>,
 ) -> Vec<Opened> {
     rows.iter()
-        .filter(|row| {
-            row["user"]["login"]
-                .as_str()
-                .or_else(|| row["author"]["username"].as_str())
-                == Some(login)
-        })
+        .filter(|row| crate::precheck::authored_by(row, login))
         .filter(|row| {
             row["created_at"]
                 .as_str()

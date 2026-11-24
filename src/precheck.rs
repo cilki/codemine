@@ -329,10 +329,10 @@ pub fn gitea_json(forge: &Forge, path: &str) -> Result<serde_json::Value> {
     serde_json::from_str(&body).context("gitea api returned unexpected output")
 }
 
-/// Whether the PR was authored by `login`, under either forge spelling of
-/// the author field (`user.login` on Gitea and GitHub, `author.username` on
-/// GitLab).
-fn authored_by(pr: &serde_json::Value, login: &str) -> bool {
+/// Whether the PR or issue was authored by `login`, under either forge
+/// spelling of the author field (`user.login` on Gitea and GitHub,
+/// `author.username` on GitLab).
+pub fn authored_by(pr: &serde_json::Value, login: &str) -> bool {
     pr["user"]["login"]
         .as_str()
         .or_else(|| pr["author"]["username"].as_str())
