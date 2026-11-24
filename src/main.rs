@@ -854,7 +854,7 @@ fn sleep(
     if limited {
         info!(
             "usage: limit reached; sleeping until {}",
-            iso8601(until).unwrap_or_else(|| until.to_string())
+            deliveries::format_rfc3339(until)
         );
     }
     Status::update(status, |s| {
@@ -892,12 +892,6 @@ fn paused_as(limited: bool, idle: bool, until: u64) -> Activity {
         (false, true) => Activity::Idle { until },
         (false, false) => Activity::Sleeping { until },
     }
-}
-
-fn iso8601(epoch: u64) -> Option<String> {
-    let stdout =
-        child::output(Command::new("date").args(["-d", &format!("@{epoch}"), "-Iseconds"])).ok()?;
-    Some(String::from_utf8_lossy(&stdout).trim().to_owned())
 }
 
 #[cfg(test)]

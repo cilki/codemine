@@ -736,7 +736,7 @@ fn list_rows(forge: &Forge) -> Result<Vec<serde_json::Value>> {
 }
 
 /// The last `limit` bytes of the file, lossily decoded.
-pub fn read_tail(file: &mut std::fs::File, limit: u64) -> Result<String> {
+fn read_tail(file: &mut std::fs::File, limit: u64) -> Result<String> {
     let len = file.metadata()?.len();
     file.seek(SeekFrom::Start(len.saturating_sub(limit)))?;
     let mut buf = Vec::new();

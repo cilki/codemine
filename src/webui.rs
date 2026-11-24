@@ -185,117 +185,107 @@ async fn api_deliveries(State(state): State<AppState>) -> Json<serde_json::Value
 /// framing.
 async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
-        let mut changes = state.status.subscribe();
-        // All start as None so the first pass always sends a full snapshot,
-        // even when the log tail is legitimately empty.
-        let (mut sent_status, mut sent_proxy, mut sent_forge) = (None, None, None);
-        // The newest turn's id, or None for an empty list, once sent.
-        let mut sent_turns: Option<Option<u64>> = None;
-        let mut sent_deliveries: Option<u64> = None;
-        let mut log_cursor = None;
-        #[cfg(feature = "hostinfo")]
-        let mut sent_host = None;
-        loop {
-            // Status is compared without the server timestamp, which moves on
-            // its own and would make every state look new, but sent with it;
-            // the host and proxy events compare and send the same JSON. The
-            // log carries its own memory of what the page has been told, so
-            // it can send what was appended rather than the window again.
-            let snapshot = status_json(&state.status, &state.pending);
-            let status = stamped(&snapshot);
-            let log = log_update(&state.status, &mut log_cursor);
-            #[cfg(feature = "hostinfo")]
-            let host = serde_json::to_string(&crate::host::snapshot(&state.workspace))
-                .unwrap_or_else(|_| "{}".into());
-            // Re-derived each tick, like the host snapshot: the main loop is
-            // inside a turn for hours at a time, so proxy health can't ride
-            // the status it owns. The probe makes a blocking request (behind
-            // a short cache), so it runs off this current-thread runtime.
-            let settings = state.settings.snapshot().0;
-            // The forge's reachability, for the dot on its card. Never
-            // blocks: the probe runs on a thread of its own.
-            let forge = serde_json::to_string(&crate::identity::health(&settings))
-                .unwrap_or_else(|_| "{}".into());
-            let proxy_settings = settings.proxy;
-            let proxy = tokio::task::spawn_blocking(move || {
-                serde_json::to_string(&crate::proxy::health(&proxy_settings))
-                    .unwrap_or_else(|_| "null".into())
-            })
-            .await
-            .unwrap_or_else(|_| "null".into());
-            // The history rides an event of its own so a status that only
-            // moved its token sample doesn't drag 44 KB of finished turns
-            // along with it, and goes out ahead of the status so the page's
-            // first status event already has rows to render beside it. The
-            // newest turn's id is what decides whether to send, rather than
-            // the JSON the others compare: building those 44 KB every tick
-            // just to find them unchanged is the cost this is here to avoid.
-            // A turn joins the list at the front and ids never repeat within
-            // the process (`turn::next_id`), so the front id moves exactly
-            // when the list does; ageing out only trims the back.
-            let revision = state.status.lock().turns.front().map(|turn| turn.id);
-            if sent_turns != Some(revision) {
-                if send(&tx, "turns", &turns_json(&state.status))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                sent_turns = Some(revision);
-            }
-            // Likewise what turns delivered, which moves when a turn ends
-            // or an hourly recheck finds a PR merged or closed.
-            let revision = state.deliveries.revision();
-            if sent_deliveries != Some(revision) {
-                let view = state.deliveries.view().to_string();
-                if send(&tx, "deliveries", &view).await.is_err() {
-                    return;
-                }
-                sent_deliveries = Some(revision);
-            }
-            #[cfg_attr(not(feature = "hostinfo"), allow(unused_mut))]
-            let mut channels = vec![
-                ("status", &snapshot, &status, &mut sent_status),
-                ("proxy", &proxy, &proxy, &mut sent_proxy),
-                ("forge", &forge, &forge, &mut sent_forge),
-            ];
-            #[cfg(feature = "hostinfo")]
-            channels.push(("host", &host, &host, &mut sent_host));
-            for (name, key, payload, sent) in channels {
-                if sent.as_ref() == Some(key) {
-                    continue;
-                }
-                if send(&tx, name, payload).await.is_err() {
-                    return;
-                }
-                *sent = Some(key.clone());
-            }
-            if let Some((name, text)) = log {
-                let data = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
-                if send(&tx, name, &data).await.is_err() {
-                    return;
-                }
-            }
-            // Wake on the next state change, or on the log timer.
-            tokio::select! {
-                _ = changes.changed() => {}
-                _ = tokio::time::sleep(LOG_INTERVAL) => {}
-            }
-        }
-    });
+    tokio::spawn(pump(state, tx));
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
-/// Queue one event; an error means the page hung up and the task is done.
-async fn send(
-    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-    name: &str,
-    data: &str,
-) -> Result<(), ()> {
+type Events = tokio::sync::mpsc::Sender<Result<Event, Infallible>>;
+
+/// Feed one page's event stream until it hangs up, which is the only way
+/// this returns.
+async fn pump(state: AppState, tx: Events) -> Option<()> {
+    let mut changes = state.status.subscribe();
+    // All start as None so the first pass always sends a full snapshot,
+    // even when the log tail is legitimately empty.
+    let (mut sent_status, mut sent_proxy, mut sent_forge) = (None, None, None);
+    // The newest turn's id, or None for an empty list, once sent.
+    let mut sent_turns: Option<Option<u64>> = None;
+    let mut sent_deliveries: Option<u64> = None;
+    let mut log_cursor = None;
+    #[cfg(feature = "hostinfo")]
+    let mut sent_host = None;
+    loop {
+        // Status is compared without the server timestamp, which moves on
+        // its own and would make every state look new, but sent with it;
+        // the host and proxy events compare and send the same JSON. The
+        // log carries its own memory of what the page has been told, so
+        // it can send what was appended rather than the window again.
+        let snapshot = status_json(&state.status, &state.pending);
+        let status = stamped(&snapshot);
+        let log = log_update(&state.status, &mut log_cursor);
+        #[cfg(feature = "hostinfo")]
+        let host = serde_json::to_string(&crate::host::snapshot(&state.workspace))
+            .unwrap_or_else(|_| "{}".into());
+        // Re-derived each tick, like the host snapshot: the main loop is
+        // inside a turn for hours at a time, so proxy health can't ride
+        // the status it owns. The probe makes a blocking request (behind
+        // a short cache), so it runs off this current-thread runtime.
+        let settings = state.settings.snapshot().0;
+        // The forge's reachability, for the dot on its card. Never
+        // blocks: the probe runs on a thread of its own.
+        let forge = serde_json::to_string(&crate::identity::health(&settings))
+            .unwrap_or_else(|_| "{}".into());
+        let proxy_settings = settings.proxy;
+        let proxy = tokio::task::spawn_blocking(move || {
+            serde_json::to_string(&crate::proxy::health(&proxy_settings))
+                .unwrap_or_else(|_| "null".into())
+        })
+        .await
+        .unwrap_or_else(|_| "null".into());
+        // The history rides an event of its own so a status that only
+        // moved its token sample doesn't drag 44 KB of finished turns
+        // along with it, and goes out ahead of the status so the page's
+        // first status event already has rows to render beside it. The
+        // newest turn's id is what decides whether to send, rather than
+        // the JSON the others compare: building those 44 KB every tick
+        // just to find them unchanged is the cost this is here to avoid.
+        // A turn joins the list at the front and ids never repeat within
+        // the process (`turn::next_id`), so the front id moves exactly
+        // when the list does; ageing out only trims the back.
+        let revision = state.status.lock().turns.front().map(|turn| turn.id);
+        if sent_turns != Some(revision) {
+            send(&tx, "turns", &turns_json(&state.status)).await?;
+            sent_turns = Some(revision);
+        }
+        // Likewise what turns delivered, which moves when a turn ends
+        // or an hourly recheck finds a PR merged or closed.
+        let revision = state.deliveries.revision();
+        if sent_deliveries != Some(revision) {
+            send(&tx, "deliveries", &state.deliveries.view().to_string()).await?;
+            sent_deliveries = Some(revision);
+        }
+        #[cfg_attr(not(feature = "hostinfo"), allow(unused_mut))]
+        let mut channels = vec![
+            ("status", &snapshot, &status, &mut sent_status),
+            ("proxy", &proxy, &proxy, &mut sent_proxy),
+            ("forge", &forge, &forge, &mut sent_forge),
+        ];
+        #[cfg(feature = "hostinfo")]
+        channels.push(("host", &host, &host, &mut sent_host));
+        for (name, key, payload, sent) in channels {
+            if sent.as_ref() == Some(key) {
+                continue;
+            }
+            send(&tx, name, payload).await?;
+            *sent = Some(key.clone());
+        }
+        if let Some((name, text)) = log {
+            let data = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
+            send(&tx, name, &data).await?;
+        }
+        // Wake on the next state change, or on the log timer.
+        tokio::select! {
+            _ = changes.changed() => {}
+            _ = tokio::time::sleep(LOG_INTERVAL) => {}
+        }
+    }
+}
+
+/// Queue one event; None means the page hung up and the stream is done.
+async fn send(tx: &Events, name: &str, data: &str) -> Option<()> {
     tx.send(Ok(Event::default().event(name).data(data)))
         .await
-        .map_err(|_| ())
+        .ok()
 }
 
 /// The status as JSON, which is what both its readers start from: the event
@@ -415,29 +405,26 @@ fn log_update(status: &Shared, cursor: &mut Option<LogCursor>) -> Option<(&'stat
         }
         _ => None,
     };
-    match appendable {
-        Some(offset) if offset == len => None,
-        Some(offset) => match appended(&mut file, offset) {
-            // A read that produced nothing usable (a lone continuation byte
-            // mid-write) leaves the cursor where it was for the next tick.
-            Ok((text, _)) if text.is_empty() => None,
-            Ok((text, reached)) => {
-                *cursor = Some(LogCursor::Live {
-                    path,
-                    offset: reached,
-                });
-                Some(("log-append", text))
-            }
-            Err(_) => None,
-        },
-        None => match crate::turn::read_tail(&mut file, LOG_WINDOW) {
-            Ok(tail) => {
-                *cursor = Some(LogCursor::Live { path, offset: len });
-                Some(("log", tail))
-            }
-            Err(_) => None,
-        },
+    // Either way the page is sent what lies past an offset, and told it has
+    // everything up to where that read stopped — not up to the length taken
+    // above, which bytes written since would have the next tick send twice.
+    let (name, from) = match appendable {
+        Some(offset) if offset == len => return None,
+        Some(offset) => ("log-append", offset),
+        None => ("log", len.saturating_sub(LOG_WINDOW)),
+    };
+    let (text, reached) = appended(&mut file, from).ok()?;
+    // An append that produced nothing usable (a lone continuation byte
+    // mid-write) leaves the cursor where it was for the next tick; a window
+    // is restated even when empty, so the page drops what it had.
+    if name == "log-append" && text.is_empty() {
+        return None;
     }
+    *cursor = Some(LogCursor::Live {
+        path,
+        offset: reached,
+    });
+    Some((name, text))
 }
 
 /// The text appended to `file` past `offset`, and the offset it was read up
@@ -455,8 +442,8 @@ fn appended(file: &mut std::fs::File, offset: u64) -> std::io::Result<(String, u
         Ok(_) => buf.len(),
         // `error_len` is None only for a sequence cut short by the end of
         // the buffer, which is the half-written character; anything else is
-        // a byte the log will never make valid, decoded lossily like the
-        // whole-window read does.
+        // a byte the log will never make valid (or a window that starts
+        // mid-character), decoded lossily.
         Err(err) if err.error_len().is_none() => err.valid_up_to(),
         Err(_) => buf.len(),
     };

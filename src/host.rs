@@ -172,30 +172,23 @@ fn chosen<L, K: PartialEq>(
     build: impl FnOnce() -> Option<(L, Option<usize>)>,
     reread: impl FnOnce(&mut L, usize),
 ) -> Option<(&L, usize)> {
-    // Decided before the slot is borrowed for the answer: a borrow taken in
-    // the match itself would have to outlive the insert in the other arm.
-    let stands = slot
-        .as_ref()
-        .is_some_and(|listed| listed.listed.elapsed() < LIST_TTL && listed.key == key);
-    let listed = match stands {
-        true => {
-            // Standing, so there is one in the slot.
-            let listed = slot.as_mut()?;
+    match slot {
+        Some(listed) if listed.listed.elapsed() < LIST_TTL && listed.key == key => {
             if let Some(index) = listed.chosen {
                 reread(&mut listed.list, index);
             }
-            listed
         }
-        false => {
+        _ => {
             let (list, chosen) = build()?;
-            slot.insert(Listed {
+            *slot = Some(Listed {
                 list,
                 chosen,
                 key,
                 listed: Instant::now(),
-            })
+            });
         }
-    };
+    }
+    let listed = slot.as_ref()?;
     Some((&listed.list, listed.chosen?))
 }
 

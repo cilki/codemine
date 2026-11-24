@@ -158,9 +158,9 @@ fn watch(store: SharedSettings, pending: SharedPending) -> ! {
                 if !std::mem::replace(&mut failing, true) {
                     warn!("failed to poll {} activity: {err:#}", kind.name());
                 }
-                // Carry the last poll forward, so old notifications don't
-                // read as fresh when the forge comes back.
-                seen.clone()
+                // Keep the last poll, so old notifications don't read as
+                // fresh when the forge comes back.
+                continue;
             }
         };
         for (kind, repo) in fresh(&seen, &current) {

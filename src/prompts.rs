@@ -140,24 +140,16 @@ pub fn sweep_prompt(
 fn without_codegraph_markers(source: &str, keep: bool) -> String {
     const OPEN: &str = "<!-- codegraph -->\n";
     const CLOSE: &str = "<!-- /codegraph -->\n";
-    let Some(start) = source.find(OPEN) else {
+    let Some((before, rest)) = source.split_once(OPEN) else {
         return source.to_owned();
     };
-    let Some(end) = source[start..].find(CLOSE).map(|at| start + at) else {
+    let Some((body, after)) = rest.split_once(CLOSE) else {
         return source.to_owned();
     };
-    let body = &source[start + OPEN.len()..end];
-    let mut after = &source[end + CLOSE.len()..];
-    if !keep {
-        after = after.strip_prefix('\n').unwrap_or(after);
+    match keep {
+        true => format!("{before}{body}{after}"),
+        false => format!("{before}{}", after.strip_prefix('\n').unwrap_or(after)),
     }
-    let mut out = String::with_capacity(source.len());
-    out.push_str(&source[..start]);
-    if keep {
-        out.push_str(body);
-    }
-    out.push_str(after);
-    out
 }
 
 /// A markdown file without its leading `---` front-matter block, if it has
