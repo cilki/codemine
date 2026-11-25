@@ -6,7 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
@@ -17,9 +17,7 @@ use crate::config::{Config, Forge, ForgeKind};
 use crate::deliveries::{CLOCK_SLACK_SECS, Deliveries, Opened};
 use crate::precheck;
 use crate::scan::{Verdict, last_lines};
-use crate::status::{
-    Activity, Outcome, Savings, Shared, Status, TokenUsage, TurnRecord, epoch_now,
-};
+use crate::status::{Activity, Outcome, Savings, Shared, Status, TokenUsage, TurnRecord};
 use crate::workspace;
 
 /// What a pass may draw from. The schedule's window gates automatic turns —
@@ -88,10 +86,8 @@ struct Turn<'a> {
     /// The turn's identifier: what its log is named after and what the page
     /// asks for it by. See `next_id`.
     id: u64,
-    /// Epoch seconds, for the page to show.
-    started: u64,
-    /// The same moment by the wall clock, which the token scan needs: it asks
-    /// opencode for the messages recorded since.
+    /// When the turn began by the wall clock: what the page shows, and what
+    /// the token and rtk scans and the delivery listing count from.
     wall: SystemTime,
     /// ...and by a monotonic one, for the duration the record carries.
     clock: Instant,
@@ -100,6 +96,11 @@ struct Turn<'a> {
 impl Turn<'_> {
     fn forge_name(&self) -> &'static str {
         self.forge.kind.name()
+    }
+
+    /// The turn's start in epoch seconds.
+    fn started(&self) -> u64 {
+        self.wall.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
     }
 
     fn elapsed(&self) -> u64 {
@@ -119,7 +120,7 @@ impl Turn<'_> {
             paused: false,
             cancel_requested: false,
             id: self.id,
-            started: self.started,
+            started: self.started(),
             tokens: None,
             rtk: None,
         }
@@ -145,7 +146,7 @@ impl Turn<'_> {
             self.forge.kind,
             self.repo,
             self.task,
-            self.started,
+            self.started(),
             spent.tokens.as_ref(),
             &opened,
         );
@@ -154,7 +155,7 @@ impl Turn<'_> {
             repo: self.repo.to_owned(),
             forge: self.forge_name().into(),
             id: self.id,
-            started: self.started,
+            started: self.started(),
             duration_secs: self.elapsed(),
             outcome,
             tokens: spent.tokens,
@@ -217,7 +218,6 @@ pub fn run(
         notes: workspace::notes_path(&cfg.workspace, forge.kind.name(), repo, task),
         log_path,
         id,
-        started: epoch_now(),
         wall: SystemTime::now(),
         clock: Instant::now(),
     };
@@ -301,7 +301,7 @@ pub fn run(
 /// Best-effort: a forge that can't answer costs the turn its links and the
 /// summary its count, not the turn.
 fn delivered(turn: &Turn) -> Vec<Opened> {
-    let since = turn.started.saturating_sub(CLOCK_SLACK_SECS);
+    let since = turn.started().saturating_sub(CLOCK_SLACK_SECS);
     precheck::opened_since(turn.forge, turn.repo, since).unwrap_or_else(|err| {
         warn!(
             "failed to list what the turn opened on {}: {err:#}",

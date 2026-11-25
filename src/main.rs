@@ -31,7 +31,7 @@ mod workspace;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -689,13 +689,8 @@ fn apply_forge_auth(workspace: &Path, forge: &Forge) -> Result<()> {
     // them directly. Drop any previous login first, since `tea login add`
     // refuses to update an existing name.
     if forge.kind == ForgeKind::Gitea {
-        Command::new("tea")
-            .args(["login", "delete", "gitea"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .ok();
+        // Ignored: there is usually no previous login to delete.
+        drop(child::output(Command::new("tea").args(["login", "delete", "gitea"])));
         // The token goes in through tea's own environment variable rather
         // than `--token`, because `/proc/<pid>/cmdline` is world-readable:
         // an option carries the token to every local user for as long as
@@ -899,6 +894,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
 
     /// The config the runner hands every git it spawns, `opencode`'s
     /// included, via `GIT_CONFIG_GLOBAL`: it has to carry the credential

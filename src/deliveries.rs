@@ -136,21 +136,12 @@ pub struct Deliveries {
 }
 
 impl Deliveries {
+    /// Load the ledger from `path`; like the skip cache, a lost one is
+    /// logged and started afresh rather than failing startup.
     pub fn load(path: PathBuf) -> Deliveries {
-        let ledger = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
-                warn!("ignoring {}: {err}", path.display());
-                Ledger::default()
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ledger::default(),
-            Err(err) => {
-                warn!("failed to read {}: {err}", path.display());
-                Ledger::default()
-            }
-        };
         Deliveries {
+            ledger: Mutex::new(crate::workspace::read_json_or_default(&path)),
             path,
-            ledger: Mutex::new(ledger),
             revision: AtomicU64::new(0),
         }
     }

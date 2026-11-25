@@ -117,20 +117,9 @@ impl Cache {
     /// cache costs only a redundant turn, so an unreadable or malformed file
     /// is logged and dropped rather than failing startup.
     pub fn load(path: PathBuf) -> Cache {
-        let marks = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
-                warn!("ignoring {}: {err}", path.display());
-                BTreeMap::new()
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(err) => {
-                warn!("failed to read {}: {err}", path.display());
-                BTreeMap::new()
-            }
-        };
         Cache {
+            marks: Mutex::new(crate::workspace::read_json_or_default(&path)),
             path,
-            marks: Mutex::new(marks),
         }
     }
 

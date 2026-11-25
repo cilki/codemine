@@ -31,7 +31,8 @@ fn history_db() -> PathBuf {
 /// few hundred rows of numbers, with none of the patch text that made
 /// re-reading opencode's table expensive.
 pub struct Sampler {
-    since: SystemTime,
+    /// The turn's start, in epoch seconds: rtk stamps its rows to the second.
+    since: i64,
     /// The clone, as rtk records it: rtk canonicalizes the directory a
     /// command ran in, so the comparison has to be against the same form.
     dir: String,
@@ -46,7 +47,7 @@ impl Sampler {
     fn at(since: SystemTime, dir: &Path, db: PathBuf) -> Sampler {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
         Sampler {
-            since,
+            since: since.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64),
             dir: dir.to_string_lossy().into_owned(),
             db,
         }
@@ -56,7 +57,6 @@ impl Sampler {
     /// read. A turn rtk hasn't rewritten anything for yet reads as zero
     /// commands, which the page tells apart from no rtk at all.
     pub fn sample(&self) -> Option<Savings> {
-        let since = self.since.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
         // Opened read-only, and never created: a missing file is rtk not
         // being installed, not something to make on its behalf.
         let db = rusqlite::Connection::open_with_flags(
@@ -75,7 +75,7 @@ impl Sampler {
              FROM commands
              WHERE timestamp >= strftime('%Y-%m-%dT%H:%M:%S', ?1, 'unixepoch')
                AND (project_path = ?2 OR project_path GLOB ?3)",
-            rusqlite::params![since, self.dir, format!("{}/*", glob_escape(&self.dir))],
+            rusqlite::params![self.since, self.dir, format!("{}/*", glob_escape(&self.dir))],
             |row| {
                 let count = |i| row.get::<_, i64>(i).map(|n| n.max(0) as u64);
                 Ok(Savings {

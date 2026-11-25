@@ -165,6 +165,23 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Read a store the runner can rebuild from scratch: one that is missing,
+/// unreadable or malformed costs only what it remembered, so it is logged
+/// and read as the default rather than failing startup.
+pub fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            warn!("ignoring {}: {err}", path.display());
+            T::default()
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => T::default(),
+        Err(err) => {
+            warn!("failed to read {}: {err}", path.display());
+            T::default()
+        }
+    }
+}
+
 /// Atomically write `value` as pretty JSON, owner-only; see [`write_private`].
 pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     let mut json = serde_json::to_vec_pretty(value)?;

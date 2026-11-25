@@ -301,6 +301,12 @@ pub struct Cli {
     pub run: Option<(String, String)>,
 }
 
+/// The value a flag takes from the next argument, or the error naming what
+/// it needs.
+fn operand(args: &mut impl Iterator<Item = String>, flag: &str, what: &str) -> Result<String> {
+    args.next().ok_or_else(|| anyhow!("{flag} needs {what}\n{USAGE}"))
+}
+
 impl Cli {
     /// Parse argv; None means --help was requested and the caller should
     /// print `USAGE` instead of running.
@@ -316,32 +322,17 @@ impl Cli {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--listen needs an address\n{USAGE}"))?;
+                    let value = operand(&mut args, "--listen", "an address")?;
                     cli.listen = value
                         .parse()
                         .with_context(|| format!("--listen is not a socket address: {value}"))?;
                 }
                 "--workspace" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--workspace needs a directory\n{USAGE}"))?;
-                    cli.workspace = PathBuf::from(value);
+                    cli.workspace = operand(&mut args, "--workspace", "a directory")?.into();
                 }
                 "--once" => cli.once = true,
-                "--task" => {
-                    task = Some(
-                        args.next()
-                            .ok_or_else(|| anyhow!("--task needs a task name\n{USAGE}"))?,
-                    );
-                }
-                "--repo" => {
-                    repo = Some(
-                        args.next()
-                            .ok_or_else(|| anyhow!("--repo needs a repository\n{USAGE}"))?,
-                    );
-                }
+                "--task" => task = Some(operand(&mut args, "--task", "a task name")?),
+                "--repo" => repo = Some(operand(&mut args, "--repo", "a repository")?),
                 "--help" | "-h" => return Ok(None),
                 other => bail!("unknown argument: {other}\n{USAGE}"),
             }
