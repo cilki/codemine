@@ -254,7 +254,7 @@ fn main() -> Result<()> {
 
         // Ask what became of the PRs and issues earlier turns opened, the
         // ones not asked about within the hour; nothing at all most passes.
-        ledger.settle(&cfg.forge, cfg.delete_branches, status::epoch_now());
+        ledger.settle(&cfg.forge, status::epoch_now());
         match turn::run(&cfg, &opencode, &status, &pending, &cache, &ledger, draw) {
             // An off-hours pass whose queued activity turned out to be
             // handled already (or on a repository since disabled) says

@@ -345,12 +345,6 @@
           <input id="s-schedule-end" type="time" aria-label="window closes">
         </div>
       </div>
-      <div class="field" title="Checked hourly with the PR's state. A branch is kept if it lives in a fork, is the default or a protected branch, has new commits since the PR, or is the head of another open PR. The PR page can restore a deleted branch.">
-        <label class="check" for="s-delete-merged"><input type="checkbox" id="s-delete-merged">
-          Delete the head branch of the bot's merged PRs</label>
-        <label class="check" for="s-delete-closed"><input type="checkbox" id="s-delete-closed">
-          …and of its PRs closed without merging</label>
-      </div>
     </div>
     <div class="forge" id="proxy-card">
       <div class="forge-head">
@@ -1264,8 +1258,6 @@
     $("s-max-open-prs").value = s.max_open_prs ?? "";
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     renderSchedule(s.schedule);
-    $("s-delete-merged").checked = s.delete_branches.merged;
-    $("s-delete-closed").checked = s.delete_branches.closed;
     const f = s.forge;
     renderForgeKind(f.kind);
     const token = $("f-token");
@@ -1329,10 +1321,6 @@
         enabled: $("s-schedule-enabled").checked,
         start_minute: toMinutes($("s-schedule-start").value),
         end_minute: toMinutes($("s-schedule-end").value),
-      },
-      delete_branches: {
-        merged: $("s-delete-merged").checked,
-        closed: $("s-delete-closed").checked,
       },
       forge: {
         kind: $("f-kind").value,
