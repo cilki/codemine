@@ -275,6 +275,8 @@ pub struct Config {
     pub max_open_prs: Option<usize>,
     /// The daily window automatic turns may start in.
     pub schedule: crate::schedule::Schedule,
+    /// Which settled PRs of the bot's have their head branch deleted.
+    pub delete_branches: crate::settings::BranchCleanup,
     /// Root of the persistent workspace where repositories stay cloned across
     /// turns.
     pub workspace: PathBuf,

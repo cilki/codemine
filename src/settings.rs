@@ -40,6 +40,30 @@ pub struct Settings {
     /// The daily window automatic turns may start in; off by default. Turns
     /// the forge asks for start outside it too.
     pub schedule: Schedule,
+    /// Which of the bot's settled PRs have their head branch deleted when
+    /// the hourly recheck finds them settled; neither, by default.
+    pub delete_branches: BranchCleanup,
+}
+
+/// Whether the head branch of one of the bot's PRs is deleted once the PR
+/// is found merged, or closed without merging. Off on both counts unless the
+/// user ticks them, so an upgrade never deletes anything it wasn't asked to.
+#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct BranchCleanup {
+    pub merged: bool,
+    pub closed: bool,
+}
+
+impl BranchCleanup {
+    /// Whether a PR that settled as `state` has its branch deleted.
+    pub fn covers(&self, state: crate::deliveries::State) -> bool {
+        match state {
+            crate::deliveries::State::Merged => self.merged,
+            crate::deliveries::State::Closed => self.closed,
+            crate::deliveries::State::Open => false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -52,6 +76,7 @@ impl Default for Settings {
             max_open_prs: None,
             turn_timeout_secs: 21600,
             schedule: Schedule::default(),
+            delete_branches: BranchCleanup::default(),
         }
     }
 }
@@ -325,6 +350,7 @@ impl Settings {
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             max_open_prs: self.max_open_prs.map(|budget| budget as usize),
             schedule: self.schedule,
+            delete_branches: self.delete_branches,
             workspace: workspace.to_owned(),
         }
     }
@@ -815,6 +841,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(settings.rate_limit, Some(RateLimit { tasks: 3, hours: 1 }));
+    }
+
+    /// A config.json written before branch cleanup existed loads with it
+    /// off on both counts, so an upgrade deletes nothing by itself, and one
+    /// that names only one outcome leaves the other off.
+    #[test]
+    fn branch_cleanup_is_off_unless_asked_for() {
+        use crate::deliveries::State;
+        let settings: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(settings.delete_branches, BranchCleanup::default());
+        assert!(
+            [State::Open, State::Merged, State::Closed]
+                .iter()
+                .all(|state| !settings.delete_branches.covers(*state))
+        );
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "delete_branches": { "merged": true },
+        }))
+        .unwrap();
+        let cleanup = settings.delete_branches;
+        assert!(cleanup.covers(State::Merged));
+        assert!(!cleanup.covers(State::Closed) && !cleanup.covers(State::Open));
     }
 
     /// CPU and I/O priority used to be settings; they belong to the service

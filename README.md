@@ -185,6 +185,16 @@ figures are served at `GET /api/deliveries`. They live in `deliveries.json` in
 the workspace and survive restarts, unlike the turn list. Anything the bot's
 account opens on the repository during a turn counts as that turn's.
 
+Every PR a turn opens leaves a branch behind. Two settings, both off by
+default, have **codemine** delete the head branch when that hourly check finds
+the PR merged, or closed without merging. The branch is deleted once, when the
+PR is first found settled, and is kept if it lives in a fork, is the default or
+a protected branch, has commits the PR doesn't have, or is the head of another
+open PR. A failed deletion is logged and not retried. The PR page can still
+restore a deleted branch, because the forge keeps the PR's commits under its
+own ref. Only PRs recorded in `deliveries.json` are covered. Branches of PRs
+that settled before then are left alone.
+
 #### Skip caching
 
 A turn that reports nothing to do remembers the state it answered for, and the

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::{Forge, ForgeKind};
+use crate::settings::BranchCleanup;
 use crate::status::TokenUsage;
 
 /// How often a delivery that is still open is asked about again. A PR is
@@ -57,6 +58,25 @@ pub struct Opened {
     pub kind: Kind,
     pub number: u64,
     pub url: String,
+}
+
+/// The branch a PR was opened from, as the forge's answer for the PR names
+/// it: what a settled PR's branch is checked against before it is deleted.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Head {
+    pub branch: String,
+    /// The PR's last head commit; a branch that has moved past it since is
+    /// somebody's live work.
+    pub sha: String,
+    /// Whether the branch lives in the PR's own repository, not a fork.
+    pub same_repo: bool,
+}
+
+/// What the forge says became of one delivery, and for a PR, its head.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Answer {
+    pub state: State,
+    pub head: Option<Head>,
 }
 
 /// One delivery as the file keeps it: what the summary counts it under and
@@ -199,17 +219,29 @@ impl Deliveries {
     /// about in the last `RECHECK_SECS`. Settled ones are never asked about
     /// again. A failed request is tried again after the same pause rather
     /// than on every pass, so a deleted repository costs one request an hour.
-    pub fn settle(&self, forge: &Forge, now: u64) {
-        self.settle_with(forge.kind, now, |repo, kind, number| {
-            crate::precheck::delivery_state(forge, repo, kind, number)
-        });
+    ///
+    /// A PR found merged or closed has its head branch deleted when
+    /// `cleanup` covers that outcome, once, at the pass that settles it; see
+    /// [`crate::precheck::delete_head_branch`] for what keeps a branch. A
+    /// failed deletion is logged and not tried again: it never holds the
+    /// delivery open.
+    pub fn settle(&self, forge: &Forge, cleanup: BranchCleanup, now: u64) {
+        self.settle_with(
+            forge.kind,
+            now,
+            cleanup,
+            |repo, kind, number| crate::precheck::delivery_state(forge, repo, kind, number),
+            |repo, head| crate::precheck::delete_head_branch(forge, repo, head),
+        );
     }
 
     fn settle_with(
         &self,
         forge: ForgeKind,
         now: u64,
-        mut ask: impl FnMut(&str, Kind, u64) -> anyhow::Result<State>,
+        cleanup: BranchCleanup,
+        mut ask: impl FnMut(&str, Kind, u64) -> anyhow::Result<Answer>,
+        mut delete: impl FnMut(&str, &Head) -> anyhow::Result<Option<String>>,
     ) {
         let due: Vec<(String, Kind, u64)> = crate::sync::lock(&self.ledger)
             .deliveries
@@ -226,8 +258,24 @@ impl Deliveries {
         let answers: Vec<_> = due
             .into_iter()
             .map(|(repo, kind, number)| {
-                let answer = ask(&repo, kind, number);
-                (key(forge, &repo, kind, number), answer)
+                let key = key(forge, &repo, kind, number);
+                let answer = ask(&repo, kind, number).map(|answer| {
+                    // Only due deliveries were asked about, and only open
+                    // ones are due, so any settled answer is the transition.
+                    let settled = kind == Kind::Pr && cleanup.covers(answer.state);
+                    if let Some(head) = answer.head.as_ref().filter(|_| settled) {
+                        let branch = &head.branch;
+                        match delete(&repo, head) {
+                            Ok(None) => {
+                                info!("deleted branch {branch} of {key} ({:?})", answer.state)
+                            }
+                            Ok(Some(why)) => info!("kept branch {branch} of {key}: {why}"),
+                            Err(err) => warn!("failed to delete branch {branch} of {key}: {err:#}"),
+                        }
+                    }
+                    answer.state
+                });
+                (key, answer)
             })
             .collect();
         let mut ledger = crate::sync::lock(&self.ledger);
@@ -346,21 +394,52 @@ pub fn opened_in(
 }
 
 /// What a forge's answer for one PR or issue says became of it: Gitea's and
-/// GitHub's issue endpoint (which answers for PRs too, with a `pull_request`
-/// member saying whether it merged) or GitLab's merge request or issue. None
-/// for an answer of no shape these know.
+/// GitHub's PR endpoint (which says whether it merged at the top level), or
+/// their issue endpoint (which answers for PRs too, with a `pull_request`
+/// member saying so), or GitLab's merge request or issue. None for an answer
+/// of no shape these know.
 pub fn state_of(item: &serde_json::Value) -> Option<State> {
-    let pr = &item["pull_request"];
+    let merged = |of: &serde_json::Value| {
+        of["merged"].as_bool() == Some(true) || of["merged_at"].is_string()
+    };
     match item["state"].as_str()? {
         // GitLab's `locked` is a merge request in the middle of merging.
         "open" | "opened" | "locked" => Some(State::Open),
         "merged" => Some(State::Merged),
-        "closed" if pr["merged"].as_bool() == Some(true) || pr["merged_at"].is_string() => {
-            Some(State::Merged)
-        }
+        "closed" if merged(item) || merged(&item["pull_request"]) => Some(State::Merged),
         "closed" => Some(State::Closed),
         _ => None,
     }
+}
+
+/// The head branch a forge's answer for one PR names: `head.ref` and
+/// `head.sha` on Gitea's and GitHub's PR endpoint, `source_branch` and `sha`
+/// on a GitLab merge request. The branch is the PR's own repository's when
+/// the head and base repositories are the same one — a fork's, or one whose
+/// repository is gone (`head.repo` null), is not. None for an answer that
+/// names no head, such as an issue's.
+pub fn head_of(item: &serde_json::Value) -> Option<Head> {
+    let (branch, sha, same_repo) = match item["source_branch"].as_str() {
+        Some(branch) => {
+            let source = item["source_project_id"].as_u64();
+            (
+                branch,
+                item["sha"].as_str()?,
+                source.is_some() && source == item["target_project_id"].as_u64(),
+            )
+        }
+        None => {
+            let head = &item["head"];
+            let repo = head["repo"]["id"].as_u64();
+            let same = repo.is_some() && repo == item["base"]["repo"]["id"].as_u64();
+            (head["ref"].as_str()?, head["sha"].as_str()?, same)
+        }
+    };
+    Some(Head {
+        branch: branch.to_owned(),
+        sha: sha.to_owned(),
+        same_repo,
+    })
 }
 
 /// Epoch seconds as RFC 3339 in UTC, which every forge's `since` and
@@ -464,6 +543,142 @@ mod tests {
             cache_read: input,
             ..Default::default()
         }
+    }
+
+    impl Deliveries {
+        /// Settle on bare states, with branch cleanup off: a deletion asked
+        /// for here is a bug.
+        fn settle_states(
+            &self,
+            forge: ForgeKind,
+            now: u64,
+            mut ask: impl FnMut(&str, Kind, u64) -> anyhow::Result<State>,
+        ) {
+            self.settle_with(
+                forge,
+                now,
+                BranchCleanup::default(),
+                |repo, kind, number| {
+                    ask(repo, kind, number).map(|state| Answer { state, head: None })
+                },
+                |_, head| panic!("asked to delete {head:?} with cleanup off"),
+            );
+        }
+    }
+
+    fn head(branch: &str) -> Head {
+        Head {
+            branch: branch.into(),
+            sha: format!("{branch}-tip"),
+            same_repo: true,
+        }
+    }
+
+    /// A settled PR's branch is handed to `delete` once, at the pass that
+    /// settles it, and only for an outcome the cleanup covers: a closed PR
+    /// only with its own setting, an issue never, an open PR never. A failed
+    /// or refused deletion still settles the delivery and isn't retried.
+    #[test]
+    fn a_settled_prs_branch_is_deleted_once_for_the_outcomes_asked_for() {
+        let run = |cleanup: BranchCleanup| {
+            let (_dir, ledger) = ledger();
+            let issue = Opened {
+                kind: Kind::Issue,
+                ..pr(5)
+            };
+            ledger.record_turn(
+                ForgeKind::Gitea,
+                "me/repo",
+                "docs",
+                0,
+                None,
+                &[pr(1), pr(2), pr(3), pr(4), issue],
+            );
+            let ask = |_: &str, kind: Kind, number: u64| {
+                Ok(Answer {
+                    state: match number {
+                        1 | 3 | 5 => State::Merged,
+                        2 => State::Closed,
+                        _ => State::Open,
+                    },
+                    // The issue answers with a head too, to show that its
+                    // kind, not the answer's shape, keeps it out.
+                    head: Some(head(&format!("{kind:?}-{number}"))),
+                })
+            };
+            let deleted = RefCell::new(Vec::new());
+            let delete = |repo: &str, head: &Head| {
+                assert_eq!(repo, "me/repo");
+                deleted.borrow_mut().push(head.branch.clone());
+                match head.branch.as_str() {
+                    "Pr-3" => anyhow::bail!("forge refused"),
+                    _ => Ok(None),
+                }
+            };
+            ledger.settle_with(ForgeKind::Gitea, RECHECK_SECS, cleanup, ask, delete);
+            // Asked again later: the settled ones aren't, so nothing more
+            // is deleted, the failed one included.
+            ledger.settle_with(ForgeKind::Gitea, 2 * RECHECK_SECS, cleanup, ask, delete);
+            let view = ledger.view();
+            assert_eq!(view["states"]["gitea:me/repo:pr:3"], "merged");
+            assert_eq!(view["states"]["gitea:me/repo:pr:4"], "open");
+            deleted.into_inner()
+        };
+        let merged = BranchCleanup {
+            merged: true,
+            closed: false,
+        };
+        assert_eq!(run(merged), ["Pr-1", "Pr-3"]);
+        let both = BranchCleanup {
+            merged: true,
+            closed: true,
+        };
+        assert_eq!(run(both), ["Pr-1", "Pr-2", "Pr-3"]);
+        let closed = BranchCleanup {
+            merged: false,
+            closed: true,
+        };
+        assert_eq!(run(closed), ["Pr-2"]);
+    }
+
+    /// Each forge's PR answer names its head, and tells the PR's own
+    /// repository's branch from a fork's or a deleted repository's.
+    #[test]
+    fn each_forges_pr_answer_names_its_head() {
+        let pull = |head_repo: serde_json::Value| {
+            json!({"state": "closed", "merged": true,
+                   "head": {"ref": "topic", "sha": "abc", "repo": head_repo},
+                   "base": {"ref": "main", "repo": {"id": 7}}})
+        };
+        let own = head_of(&pull(json!({"id": 7}))).unwrap();
+        assert_eq!(
+            own,
+            Head {
+                branch: "topic".into(),
+                sha: "abc".into(),
+                same_repo: true
+            }
+        );
+        assert!(!head_of(&pull(json!({"id": 8}))).unwrap().same_repo);
+        assert!(!head_of(&pull(json!(null))).unwrap().same_repo);
+        // The PR endpoint says it merged at the top level.
+        assert_eq!(state_of(&pull(json!({"id": 7}))), Some(State::Merged));
+
+        let mr = |source: u64| {
+            json!({"state": "merged", "source_branch": "topic", "sha": "def",
+                   "source_project_id": source, "target_project_id": 3})
+        };
+        let own = head_of(&mr(3)).unwrap();
+        assert_eq!(
+            (own.branch.as_str(), own.sha.as_str(), own.same_repo),
+            ("topic", "def", true)
+        );
+        assert!(!head_of(&mr(4)).unwrap().same_repo);
+
+        assert_eq!(
+            head_of(&json!({"state": "closed", "pull_request": null})),
+            None
+        );
     }
 
     /// Only what the bot opened since the turn started is the turn's: an
@@ -570,21 +785,21 @@ mod tests {
                 _ => anyhow::bail!("forge down"),
             }
         };
-        ledger.settle_with(ForgeKind::Gitea, 1000 + RECHECK_SECS - 1, answer);
+        ledger.settle_states(ForgeKind::Gitea, 1000 + RECHECK_SECS - 1, answer);
         assert!(asked.borrow().is_empty(), "asked before the pause was up");
 
         let now = 1000 + RECHECK_SECS;
-        ledger.settle_with(ForgeKind::Gitea, now, answer);
+        ledger.settle_states(ForgeKind::Gitea, now, answer);
         assert_eq!(*asked.borrow(), [1, 2, 3]);
 
         asked.borrow_mut().clear();
-        ledger.settle_with(ForgeKind::Gitea, now + 60, answer);
+        ledger.settle_states(ForgeKind::Gitea, now + 60, answer);
         assert!(
             asked.borrow().is_empty(),
             "a checked delivery was asked again at once"
         );
 
-        ledger.settle_with(ForgeKind::Gitea, now + RECHECK_SECS, answer);
+        ledger.settle_states(ForgeKind::Gitea, now + RECHECK_SECS, answer);
         assert_eq!(
             *asked.borrow(),
             [2, 3],
@@ -643,7 +858,7 @@ mod tests {
         // Found again by a later turn inside the clock slack: still the
         // first turn's, and counted once.
         ledger.record_turn(ForgeKind::Gitea, "me/repo", "benchmark", 0, None, &[pr(3)]);
-        ledger.settle_with(ForgeKind::Gitea, RECHECK_SECS, |_, _, number| {
+        ledger.settle_states(ForgeKind::Gitea, RECHECK_SECS, |_, _, number| {
             Ok(match number {
                 1 => State::Merged,
                 3 | 10 => State::Closed,
