@@ -17,15 +17,29 @@ use reqwest::header::HeaderValue;
 /// is a status, not an error, so callers can tell "the forge said 404" from
 /// "the forge never answered".
 pub fn get(url: &str, header: Option<(&str, &str)>, timeout_secs: u64) -> Result<(u16, String)> {
+    send(reqwest::Method::GET, url, header, timeout_secs)
+}
+
+/// DELETE `url`, the same way [`get`] asks: an error status is a status.
+pub fn delete(url: &str, header: Option<(&str, &str)>, timeout_secs: u64) -> Result<(u16, String)> {
+    send(reqwest::Method::DELETE, url, header, timeout_secs)
+}
+
+fn send(
+    method: reqwest::Method,
+    url: &str,
+    header: Option<(&str, &str)>,
+    timeout_secs: u64,
+) -> Result<(u16, String)> {
     let mut request = client()?
-        .get(url)
+        .request(method.clone(), url)
         .timeout(Duration::from_secs(timeout_secs));
     if let Some((name, value)) = header {
         request = request.header(name, secret(name, value)?);
     }
     let response = request
         .send()
-        .with_context(|| format!("failed to GET {url}"))?;
+        .with_context(|| format!("failed to {method} {url}"))?;
     let status = response.status().as_u16();
     // Read as bytes rather than as text: both bodies are JSON, which is
     // UTF-8 by definition, so there is no charset to negotiate and a body

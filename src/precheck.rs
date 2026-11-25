@@ -285,26 +285,174 @@ pub fn opened_since(
     Ok(opened)
 }
 
-/// What became of one PR or issue the bot opened. Gitea's and GitHub's
-/// issue endpoint answers for a PR as well and says whether it merged, so
-/// one path serves both kinds there; GitLab keeps the two apart.
+/// What became of one PR or issue the bot opened, and for a PR its head
+/// branch. Each forge has a PR endpoint that answers both in one request;
+/// an issue is asked about on the issue endpoint and has no head.
 pub fn delivery_state(
     forge: &Forge,
     repo: &str,
     kind: crate::deliveries::Kind,
     number: u64,
-) -> Result<crate::deliveries::State> {
-    let listing = match kind {
-        crate::deliveries::Kind::Pr => "merge_requests",
-        crate::deliveries::Kind::Issue => "issues",
+) -> Result<crate::deliveries::Answer> {
+    let (pulls, listing) = match kind {
+        crate::deliveries::Kind::Pr => ("pulls", "merge_requests"),
+        crate::deliveries::Kind::Issue => ("issues", "issues"),
     };
     let item = forge_json(
         forge,
-        &format!("repos/{repo}/issues/{number}"),
-        &format!("repos/{repo}/issues/{number}"),
+        &format!("repos/{repo}/{pulls}/{number}"),
+        &format!("repos/{repo}/{pulls}/{number}"),
         &format!("projects/{}/{listing}/{number}", project(repo)),
     )?;
-    crate::deliveries::state_of(&item).context("the forge's answer named no state")
+    Ok(crate::deliveries::Answer {
+        state: crate::deliveries::state_of(&item).context("the forge's answer named no state")?,
+        head: match kind {
+            crate::deliveries::Kind::Pr => crate::deliveries::head_of(&item),
+            crate::deliveries::Kind::Issue => None,
+        },
+    })
+}
+
+/// Delete the head branch of one of the bot's settled PRs, unless something
+/// says the branch is still somebody's: Ok(None) once it is deleted,
+/// Ok(Some(why)) for a branch kept. It is kept when it lives in a fork, is
+/// the repository's default branch or a protected one, has moved past the
+/// PR's last head commit, or is the head of another open PR. Even a deleted
+/// branch's commits stay on the forge under the PR's own ref
+/// (`refs/pull/<n>/head`, `refs/merge-requests/<iid>/head`), so the PR page
+/// can restore it.
+pub fn delete_head_branch(
+    forge: &Forge,
+    repo: &str,
+    head: &crate::deliveries::Head,
+) -> Result<Option<String>> {
+    if !head.same_repo {
+        return Ok(Some("it lives in a fork".into()));
+    }
+    let name = segment(&head.branch, true);
+    let branch = forge_json(
+        forge,
+        &format!("repos/{repo}/branches/{name}"),
+        &format!("repos/{repo}/branches/{name}"),
+        &format!(
+            "projects/{}/repository/branches/{}",
+            project(repo),
+            segment(&head.branch, false)
+        ),
+    )
+    .context("failed to look the branch up (already deleted?)")?;
+    let meta = forge_json(
+        forge,
+        &format!("repos/{repo}"),
+        &format!("repos/{repo}"),
+        &format!("projects/{}", project(repo)),
+    )?;
+    let open = open_prs(forge, repo)?;
+    if let Some(why) = keep_branch(head, &branch, meta["default_branch"].as_str(), &open) {
+        return Ok(Some(why));
+    }
+    match forge.kind {
+        ForgeKind::Gitea => {
+            let url = format!("{}/api/v1/repos/{repo}/branches/{name}", forge.url);
+            let auth = format!("token {}", forge.token);
+            let (status, body) = crate::http::delete(
+                &url,
+                Some(("Authorization", auth.as_str())),
+                API_TIMEOUT_SECS,
+            )?;
+            if !(200..300).contains(&status) {
+                bail!("the gitea api answered HTTP {status} for {url}: {body}");
+            }
+        }
+        ForgeKind::Github => {
+            api_delete(forge, "gh", &format!("repos/{repo}/git/refs/heads/{name}"))?;
+        }
+        ForgeKind::Gitlab => {
+            let path = format!(
+                "projects/{}/repository/branches/{}",
+                project(repo),
+                segment(&head.branch, false)
+            );
+            api_delete(forge, "glab", &path)?;
+        }
+    }
+    Ok(None)
+}
+
+/// Why a settled PR's head branch must stay, read off the forge's answer for
+/// the branch, the repository's default branch, and its open PRs; None when
+/// nothing does. Fails closed: a branch whose protection or tip the answer
+/// doesn't state, or a repository that names no default branch, is kept.
+fn keep_branch(
+    head: &crate::deliveries::Head,
+    branch: &serde_json::Value,
+    default_branch: Option<&str>,
+    open: &[serde_json::Value],
+) -> Option<String> {
+    let name = &head.branch;
+    if !head.same_repo {
+        return Some("it lives in a fork".into());
+    }
+    match default_branch {
+        Some(default) if default == name => return Some("it is the default branch".into()),
+        Some(_) => {}
+        None => return Some("the repository names no default branch".into()),
+    }
+    if branch["protected"].as_bool() != Some(false) {
+        return Some("it is protected".into());
+    }
+    // Gitea and GitLab name the tip commit `id`, GitHub `sha`.
+    let commit = &branch["commit"];
+    let tip = commit["id"].as_str().or_else(|| commit["sha"].as_str());
+    if tip != Some(head.sha.as_str()) {
+        return Some(format!(
+            "it has moved past the PR's head {} to {}",
+            head.sha,
+            tip.unwrap_or("an unknown commit")
+        ));
+    }
+    let heads = |pr: &serde_json::Value| {
+        pr["head"]["ref"]
+            .as_str()
+            .or_else(|| pr["source_branch"].as_str())
+            == Some(name)
+    };
+    if let Some(pr) = open.iter().find(|pr| heads(pr)) {
+        let number = pr["number"].as_u64().or_else(|| pr["iid"].as_u64());
+        return Some(format!(
+            "it is also the head of open PR #{}",
+            number.map_or("?".into(), |n| n.to_string())
+        ));
+    }
+    None
+}
+
+/// A branch name made safe to put in an API path. GitHub and Gitea route a
+/// branch name with its slashes as they are, GitLab wants the whole name as
+/// one encoded segment.
+fn segment(name: &str, keep_slashes: bool) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b'/' if keep_slashes => out.push('/'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// One DELETE via the gh/glab `api` subcommand. Both answer 204 with no
+/// body, so there is nothing to parse; a refusal is a failed exit.
+fn api_delete(forge: &Forge, program: &str, path: &str) -> Result<()> {
+    crate::child::output(
+        Command::new(program)
+            .args(["api", "-X", "DELETE", path])
+            .envs(forge.env()),
+    )?;
+    Ok(())
 }
 
 /// One GET via the gh/glab `api` subcommand, parsed as JSON. Unlike
@@ -629,6 +777,64 @@ mod tests {
                 .map(str::to_owned)
                 .into()
         );
+    }
+
+    /// A settled PR's branch is deleted only when nothing says it is still
+    /// somebody's, read off each forge's spelling of the branch and of the
+    /// open PRs; a field the answer leaves out keeps the branch.
+    #[test]
+    fn a_settled_prs_branch_is_kept_whenever_it_may_still_be_somebodys() {
+        use crate::deliveries::Head;
+        let head = Head {
+            branch: "topic".into(),
+            sha: "abc".into(),
+            same_repo: true,
+        };
+        // Gitea and GitLab name the tip `commit.id`, GitHub `commit.sha`.
+        let gitea = json!({"name": "topic", "protected": false, "commit": {"id": "abc"}});
+        let github = json!({"name": "topic", "protected": false, "commit": {"sha": "abc"}});
+        let others = [
+            json!({"number": 9, "head": {"ref": "other"}}),
+            json!({"iid": 10, "source_branch": "another"}),
+        ];
+        for branch in [&gitea, &github] {
+            assert_eq!(keep_branch(&head, branch, Some("main"), &others), None);
+        }
+
+        let kept = |head: &Head,
+                    branch: &serde_json::Value,
+                    default: Option<&str>,
+                    open: &[serde_json::Value]| {
+            keep_branch(head, branch, default, open).expect("the branch was not kept")
+        };
+        let fork = Head {
+            same_repo: false,
+            ..head.clone()
+        };
+        assert!(kept(&fork, &gitea, Some("main"), &[]).contains("fork"));
+        assert!(kept(&head, &gitea, Some("topic"), &[]).contains("default"));
+        assert!(kept(&head, &gitea, None, &[]).contains("default"));
+        for protected in [json!(true), json!(null)] {
+            let mut branch = gitea.clone();
+            branch["protected"] = protected;
+            assert!(kept(&head, &branch, Some("main"), &[]).contains("protected"));
+        }
+        let moved = json!({"protected": false, "commit": {"id": "def"}});
+        assert!(kept(&head, &moved, Some("main"), &[]).contains("moved past"));
+        let tipless = json!({"protected": false});
+        assert!(kept(&head, &tipless, Some("main"), &[]).contains("moved past"));
+        let reused = [json!({"number": 12, "head": {"ref": "topic"}})];
+        assert!(kept(&head, &gitea, Some("main"), &reused).contains("#12"));
+        let reused = [json!({"iid": 4, "source_branch": "topic"})];
+        assert!(kept(&head, &gitea, Some("main"), &reused).contains("#4"));
+    }
+
+    #[test]
+    fn a_branch_name_is_encoded_for_an_api_path() {
+        assert_eq!(segment("fix/a b", true), "fix/a%20b");
+        assert_eq!(segment("fix/a b", false), "fix%2Fa%20b");
+        assert_eq!(segment("v1.2_x-y~z", false), "v1.2_x-y~z");
+        assert_eq!(segment("a#b?c", true), "a%23b%3Fc");
     }
 
     #[test]
