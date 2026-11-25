@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::{Forge, ForgeKind};
-use crate::settings::BranchCleanup;
 use crate::status::TokenUsage;
 
 /// How often a delivery that is still open is asked about again. A PR is
@@ -220,16 +219,14 @@ impl Deliveries {
     /// again. A failed request is tried again after the same pause rather
     /// than on every pass, so a deleted repository costs one request an hour.
     ///
-    /// A PR found merged or closed has its head branch deleted when
-    /// `cleanup` covers that outcome, once, at the pass that settles it; see
-    /// [`crate::precheck::delete_head_branch`] for what keeps a branch. A
-    /// failed deletion is logged and not tried again: it never holds the
-    /// delivery open.
-    pub fn settle(&self, forge: &Forge, cleanup: BranchCleanup, now: u64) {
+    /// A PR found merged or closed has its head branch deleted, once, at the
+    /// pass that settles it; see [`crate::precheck::delete_head_branch`] for
+    /// what keeps a branch. A failed deletion is logged and not tried again:
+    /// it never holds the delivery open.
+    pub fn settle(&self, forge: &Forge, now: u64) {
         self.settle_with(
             forge.kind,
             now,
-            cleanup,
             |repo, kind, number| crate::precheck::delivery_state(forge, repo, kind, number),
             |repo, head| crate::precheck::delete_head_branch(forge, repo, head),
         );
@@ -239,7 +236,6 @@ impl Deliveries {
         &self,
         forge: ForgeKind,
         now: u64,
-        cleanup: BranchCleanup,
         mut ask: impl FnMut(&str, Kind, u64) -> anyhow::Result<Answer>,
         mut delete: impl FnMut(&str, &Head) -> anyhow::Result<Option<String>>,
     ) {
@@ -262,7 +258,7 @@ impl Deliveries {
                 let answer = ask(&repo, kind, number).map(|answer| {
                     // Only due deliveries were asked about, and only open
                     // ones are due, so any settled answer is the transition.
-                    let settled = kind == Kind::Pr && cleanup.covers(answer.state);
+                    let settled = kind == Kind::Pr && answer.state != State::Open;
                     if let Some(head) = answer.head.as_ref().filter(|_| settled) {
                         let branch = &head.branch;
                         match delete(&repo, head) {
@@ -546,8 +542,8 @@ mod tests {
     }
 
     impl Deliveries {
-        /// Settle on bare states, with branch cleanup off: a deletion asked
-        /// for here is a bug.
+        /// Settle on bare states: answers that name no head, so a deletion
+        /// asked for here is a bug.
         fn settle_states(
             &self,
             forge: ForgeKind,
@@ -557,11 +553,10 @@ mod tests {
             self.settle_with(
                 forge,
                 now,
-                BranchCleanup::default(),
                 |repo, kind, number| {
                     ask(repo, kind, number).map(|state| Answer { state, head: None })
                 },
-                |_, head| panic!("asked to delete {head:?} with cleanup off"),
+                |_, head| panic!("asked to delete {head:?} with no head named"),
             );
         }
     }
@@ -575,70 +570,53 @@ mod tests {
     }
 
     /// A settled PR's branch is handed to `delete` once, at the pass that
-    /// settles it, and only for an outcome the cleanup covers: a closed PR
-    /// only with its own setting, an issue never, an open PR never. A failed
-    /// or refused deletion still settles the delivery and isn't retried.
+    /// settles it, whether it merged or closed unmerged: an issue never, an
+    /// open PR never. A failed or refused deletion still settles the
+    /// delivery and isn't retried.
     #[test]
-    fn a_settled_prs_branch_is_deleted_once_for_the_outcomes_asked_for() {
-        let run = |cleanup: BranchCleanup| {
-            let (_dir, ledger) = ledger();
-            let issue = Opened {
-                kind: Kind::Issue,
-                ..pr(5)
-            };
-            ledger.record_turn(
-                ForgeKind::Gitea,
-                "me/repo",
-                "docs",
-                0,
-                None,
-                &[pr(1), pr(2), pr(3), pr(4), issue],
-            );
-            let ask = |_: &str, kind: Kind, number: u64| {
-                Ok(Answer {
-                    state: match number {
-                        1 | 3 | 5 => State::Merged,
-                        2 => State::Closed,
-                        _ => State::Open,
-                    },
-                    // The issue answers with a head too, to show that its
-                    // kind, not the answer's shape, keeps it out.
-                    head: Some(head(&format!("{kind:?}-{number}"))),
-                })
-            };
-            let deleted = RefCell::new(Vec::new());
-            let delete = |repo: &str, head: &Head| {
-                assert_eq!(repo, "me/repo");
-                deleted.borrow_mut().push(head.branch.clone());
-                match head.branch.as_str() {
-                    "Pr-3" => anyhow::bail!("forge refused"),
-                    _ => Ok(None),
-                }
-            };
-            ledger.settle_with(ForgeKind::Gitea, RECHECK_SECS, cleanup, ask, delete);
-            // Asked again later: the settled ones aren't, so nothing more
-            // is deleted, the failed one included.
-            ledger.settle_with(ForgeKind::Gitea, 2 * RECHECK_SECS, cleanup, ask, delete);
-            let view = ledger.view();
-            assert_eq!(view["states"]["gitea:me/repo:pr:3"], "merged");
-            assert_eq!(view["states"]["gitea:me/repo:pr:4"], "open");
-            deleted.into_inner()
+    fn a_settled_prs_branch_is_deleted_once() {
+        let (_dir, ledger) = ledger();
+        let issue = Opened {
+            kind: Kind::Issue,
+            ..pr(5)
         };
-        let merged = BranchCleanup {
-            merged: true,
-            closed: false,
+        ledger.record_turn(
+            ForgeKind::Gitea,
+            "me/repo",
+            "docs",
+            0,
+            None,
+            &[pr(1), pr(2), pr(3), pr(4), issue],
+        );
+        let ask = |_: &str, kind: Kind, number: u64| {
+            Ok(Answer {
+                state: match number {
+                    1 | 3 | 5 => State::Merged,
+                    2 => State::Closed,
+                    _ => State::Open,
+                },
+                // The issue answers with a head too, to show that its kind,
+                // not the answer's shape, keeps it out.
+                head: Some(head(&format!("{kind:?}-{number}"))),
+            })
         };
-        assert_eq!(run(merged), ["Pr-1", "Pr-3"]);
-        let both = BranchCleanup {
-            merged: true,
-            closed: true,
+        let deleted = RefCell::new(Vec::new());
+        let delete = |repo: &str, head: &Head| {
+            assert_eq!(repo, "me/repo");
+            deleted.borrow_mut().push(head.branch.clone());
+            match head.branch.as_str() {
+                "Pr-3" => anyhow::bail!("forge refused"),
+                _ => Ok(None),
+            }
         };
-        assert_eq!(run(both), ["Pr-1", "Pr-2", "Pr-3"]);
-        let closed = BranchCleanup {
-            merged: false,
-            closed: true,
-        };
-        assert_eq!(run(closed), ["Pr-2"]);
+        ledger.settle_with(ForgeKind::Gitea, RECHECK_SECS, ask, delete);
+        // Asked again later: the settled ones aren't, so nothing more is
+        // deleted, the failed one included.
+        ledger.settle_with(ForgeKind::Gitea, 2 * RECHECK_SECS, ask, delete);
+        let view = ledger.view();
+        assert_eq!(view["states"]["gitea:me/repo:pr:3"], "merged");
+        assert_eq!(view["states"]["gitea:me/repo:pr:4"], "open");
+        assert_eq!(deleted.into_inner(), ["Pr-1", "Pr-2", "Pr-3"]);
     }
 
     /// Each forge's PR answer names its head, and tells the PR's own
