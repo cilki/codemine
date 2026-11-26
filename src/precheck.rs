@@ -76,7 +76,8 @@ pub fn forge_json(
     gitlab: &str,
 ) -> Result<serde_json::Value> {
     let body = forge_call(forge, Method::GET, gitea, github, gitlab)?;
-    json(&body, forge.kind.name())
+    serde_json::from_slice(&body)
+        .with_context(|| format!("{} api returned unexpected output", forge.kind.name()))
 }
 
 /// The body of one request against a forge's API, through whichever
@@ -95,9 +96,34 @@ fn forge_call(
     }
 }
 
+/// One page of a forge listing, through [`forge_json`]. An answer that isn't
+/// an array is an error, so every caller fails closed on it instead of
+/// reading it as an empty page.
+pub fn forge_rows(
+    forge: &Forge,
+    gitea: &str,
+    github: &str,
+    gitlab: &str,
+) -> Result<Vec<serde_json::Value>> {
+    match forge_json(forge, gitea, github, gitlab)? {
+        serde_json::Value::Array(rows) => Ok(rows),
+        _ => bail!("{} returned something other than a listing", forge.kind.name()),
+    }
+}
+
 /// GitLab identifies a project by its URL-encoded path.
 fn project(repo: &str) -> String {
-    repo.replace('/', "%2F")
+    crate::http::encode(repo, false)
+}
+
+/// The resolved login of the bot's account. Unresolved is an error rather
+/// than an empty string: it would silently match no author and no reviewer
+/// at all, where bailing routes through the callers' fail-closed arm.
+fn login(forge: &Forge) -> Result<&str> {
+    match forge.login.as_str() {
+        "" => bail!("the {} login is unresolved", forge.kind.name()),
+        login => Ok(login),
+    }
 }
 
 /// The commit the repository's default branch points at. Every forge's
@@ -130,16 +156,12 @@ fn first_sha(commits: &serde_json::Value) -> Option<String> {
 /// about — so a draw fetches it once per repository and answers both
 /// questions off it rather than making the identical request twice.
 ///
-/// An unresolved login is an error rather than an empty page: it would
-/// silently match no author and no reviewer at all, where bailing routes
-/// through the probes' fail-closed arm. So is a listing that isn't an array,
-/// since a forge that answered with something else never said the bot has
-/// nothing waiting.
+/// An unresolved login is an error rather than an empty page, as is a
+/// listing that isn't an array: a forge that answered with something else
+/// never said the bot has nothing waiting.
 pub fn open_prs(forge: &Forge, repo: &str) -> Result<Vec<serde_json::Value>> {
-    if forge.login.is_empty() {
-        bail!("the {} login is unresolved", forge.kind.name());
-    }
-    let listing = forge_json(
+    login(forge)?;
+    forge_rows(
         forge,
         // Gitea's listing carries `mergeable`, which also reads false while
         // its conflict check is still running and for draft PRs; the worst
@@ -157,17 +179,7 @@ pub fn open_prs(forge: &Forge, repo: &str) -> Result<Vec<serde_json::Value>> {
             "projects/{}/merge_requests?state=opened&per_page={PR_LIMIT}&with_merge_status_recheck=true",
             project(repo)
         ),
-    )?;
-    pulls(listing)
-}
-
-/// The entries of a PR listing. Not an array at all is an error, so both
-/// probes fail closed on it instead of reading it as an empty page.
-fn pulls(listing: serde_json::Value) -> Result<Vec<serde_json::Value>> {
-    match listing {
-        serde_json::Value::Array(prs) => Ok(prs),
-        _ => bail!("expected an array of pulls"),
-    }
+    )
 }
 
 /// How many of the PRs on the page [`open_prs`] fetched are the bot's own,
@@ -199,7 +211,7 @@ pub fn conflicting_prs(
             ForgeKind::Github => match pr["number"].as_u64() {
                 Some(number) => {
                     let path = format!("repos/{repo}/pulls/{number}");
-                    Some(api_json(forge, "gh", &path)?)
+                    Some(forge_json(forge, &path, &path, &path)?)
                 }
                 // A listed PR with no number can't be fetched or keyed, so
                 // it is dropped here as `pr_key` would have dropped it.
@@ -242,7 +254,7 @@ pub fn review_requests(
                 continue;
             };
             let path = format!("projects/{}/merge_requests/{iid}/reviewers", project(repo));
-            if !unreviewed_by(&api_json(forge, "glab", &path)?, &forge.login) {
+            if !unreviewed_by(&forge_json(forge, &path, &path, &path)?, &forge.login) {
                 continue;
             }
         }
@@ -266,10 +278,7 @@ pub fn opened_since(
     since: u64,
 ) -> Result<Vec<crate::deliveries::Opened>> {
     use crate::deliveries::{Kind, format_rfc3339, opened_in};
-    if forge.login.is_empty() {
-        bail!("the {} login is unresolved", forge.kind.name());
-    }
-    let (login, after) = (&forge.login, format_rfc3339(since));
+    let (login, after) = (login(forge)?, format_rfc3339(since));
     // Gitea's and GitHub's issue listing holds their PRs too, each marked as
     // one; GitLab keeps one kind per listing.
     let listings: &[_] = match forge.kind {
@@ -281,7 +290,7 @@ pub fn opened_since(
     };
     let mut opened = Vec::new();
     for &(listing, kind) in listings {
-        let rows = pulls(forge_json(
+        let rows = forge_rows(
             forge,
             &format!(
                 "repos/{repo}/issues?state=all&created_by={login}&since={after}&limit={PR_LIMIT}"
@@ -293,7 +302,7 @@ pub fn opened_since(
                 "projects/{}/{listing}?state=all&author_username={login}&created_after={after}&per_page={PR_LIMIT}",
                 project(repo)
             ),
-        )?)?;
+        )?;
         opened.extend(opened_in(&rows, login, since, kind));
     }
     Ok(opened)
@@ -343,12 +352,14 @@ pub fn delete_head_branch(
     if !head.same_repo {
         return Ok(Some("it lives in a fork".into()));
     }
-    let name = segment(&head.branch, true);
+    // GitHub and Gitea route a branch name with its slashes as they are,
+    // GitLab wants the whole name as one encoded segment.
+    let name = crate::http::encode(&head.branch, true);
     let branch_path = format!("repos/{repo}/branches/{name}");
     let gitlab_path = format!(
         "projects/{}/repository/branches/{}",
         project(repo),
-        segment(&head.branch, false)
+        crate::http::encode(&head.branch, false)
     );
     let branch = forge_json(forge, &branch_path, &branch_path, &gitlab_path)
         .context("failed to look the branch up (already deleted?)")?;
@@ -384,9 +395,6 @@ fn keep_branch(
     open: &[serde_json::Value],
 ) -> Option<String> {
     let name = &head.branch;
-    if !head.same_repo {
-        return Some("it lives in a fork".into());
-    }
     match default_branch {
         Some(default) if default == name => return Some("it is the default branch".into()),
         Some(_) => {}
@@ -421,23 +429,6 @@ fn keep_branch(
     None
 }
 
-/// A branch name made safe to put in an API path. GitHub and Gitea route a
-/// branch name with its slashes as they are, GitLab wants the whole name as
-/// one encoded segment.
-fn segment(name: &str, keep_slashes: bool) -> String {
-    let mut out = String::with_capacity(name.len());
-    for byte in name.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
-            }
-            b'/' if keep_slashes => out.push('/'),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 /// One request via the gh/glab `api` subcommand, which share the same
 /// shape; a refusal is a failed exit.
 fn api_call(forge: &Forge, program: &str, method: Method, path: &str) -> Result<Vec<u8>> {
@@ -446,16 +437,6 @@ fn api_call(forge: &Forge, program: &str, method: Method, path: &str) -> Result<
             .args(["api", "-X", method.as_str(), path])
             .envs(forge.env()),
     )
-}
-
-/// One GET via the gh/glab `api` subcommand, parsed as JSON. Unlike
-/// `turn::list_rows` there is no pagination: one page decides the answer.
-fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Value> {
-    json(&api_call(forge, program, Method::GET, path)?, program)
-}
-
-fn json(body: &[u8], from: &str) -> Result<serde_json::Value> {
-    serde_json::from_slice(body).with_context(|| format!("{from} api returned unexpected output"))
 }
 
 /// How long one Gitea API request may take. Without a cap a forge that
@@ -562,17 +543,6 @@ mod tests {
         assert!(!conflicting(&json!({})));
     }
 
-    /// A listing that is not an array is an error, not an empty page: both
-    /// probes fail closed, where reading it as "nothing waiting" would both
-    /// hand the draw a wrong answer and let a skip be remembered against it.
-    #[test]
-    fn a_listing_that_is_not_an_array_is_an_error() {
-        assert!(pulls(json!([])).unwrap().is_empty());
-        assert_eq!(pulls(json!([{"number": 1}])).unwrap().len(), 1);
-        assert!(pulls(json!({"message": "oops"})).is_err());
-        assert!(pulls(json!(null)).is_err());
-    }
-
     /// An unresolved login matches no author and no reviewer, so asking at
     /// all would answer "nothing waiting" for every repository. Both probes
     /// read the one listing, so this is the one place it is checked.
@@ -622,7 +592,7 @@ mod tests {
     /// to — and a PR nobody asked it about is left alone.
     #[test]
     fn requested_prs_keeps_every_pr_the_bot_is_asked_about() {
-        let prs = pulls(json!([
+        let prs = json!([
             {"number": 1, "user": {"login": "someone"}, "requested_reviewers": [{"login": "bot"}], "head": {"sha": "aaa"}},
             {"number": 2, "user": {"login": "bot"}, "requested_reviewers": [{"login": "bot"}], "head": {"sha": "bbb"}},
             {"number": 3, "user": {"login": "someone"}, "requested_reviewers": [], "head": {"sha": "ccc"}},
@@ -631,10 +601,9 @@ mod tests {
             // or made to fail the whole probe.
             {"requested_reviewers": [{"login": "bot"}], "head": {"sha": "fff"}},
             {"iid": 4, "author": {"username": "someone"}, "reviewers": [{"username": "bot"}], "sha": "ddd"},
-        ]))
-        .unwrap();
+        ]);
         assert_eq!(
-            review_requests(&gitea("bot"), "me/repo", &prs).unwrap(),
+            review_requests(&gitea("bot"), "me/repo", prs.as_array().unwrap()).unwrap(),
             ["1@aaa", "2@bbb", "4@ddd"]
         );
         assert!(
@@ -669,16 +638,15 @@ mod tests {
     /// stable across fetches.
     #[test]
     fn only_the_bots_conflicting_prs_are_keyed() {
-        let prs = pulls(json!([
+        let prs = json!([
             {"number": 15, "user": {"login": "bot"}, "mergeable": false, "head": {"sha": "eee"}},
             {"number": 1, "user": {"login": "bot"}, "mergeable": true, "head": {"sha": "aaa"}},
             {"number": 2, "user": {"login": "someone"}, "mergeable": false, "head": {"sha": "bbb"}},
             {"user": {"login": "bot"}, "mergeable": false, "head": {"sha": "ddd"}},
             {"number": 12, "user": {"login": "bot"}, "mergeable": false, "head": {"sha": "ccc"}},
-        ]))
-        .unwrap();
+        ]);
         assert_eq!(
-            conflicting_prs(&gitea("bot"), "me/repo", &prs).unwrap(),
+            conflicting_prs(&gitea("bot"), "me/repo", prs.as_array().unwrap()).unwrap(),
             ["12@ccc", "15@eee"]
         );
     }
@@ -803,11 +771,6 @@ mod tests {
                     open: &[serde_json::Value]| {
             keep_branch(head, branch, default, open).expect("the branch was not kept")
         };
-        let fork = Head {
-            same_repo: false,
-            ..head.clone()
-        };
-        assert!(kept(&fork, &gitea, Some("main"), &[]).contains("fork"));
         assert!(kept(&head, &gitea, Some("topic"), &[]).contains("default"));
         assert!(kept(&head, &gitea, None, &[]).contains("default"));
         for protected in [json!(true), json!(null)] {
@@ -823,14 +786,6 @@ mod tests {
         assert!(kept(&head, &gitea, Some("main"), &reused).contains("#12"));
         let reused = [json!({"iid": 4, "source_branch": "topic"})];
         assert!(kept(&head, &gitea, Some("main"), &reused).contains("#4"));
-    }
-
-    #[test]
-    fn a_branch_name_is_encoded_for_an_api_path() {
-        assert_eq!(segment("fix/a b", true), "fix/a%20b");
-        assert_eq!(segment("fix/a b", false), "fix%2Fa%20b");
-        assert_eq!(segment("v1.2_x-y~z", false), "v1.2_x-y~z");
-        assert_eq!(segment("a#b?c", true), "a%23b%3Fc");
     }
 
     #[test]

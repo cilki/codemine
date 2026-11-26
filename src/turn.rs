@@ -8,7 +8,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 use wait_timeout::ChildExt;
 
@@ -719,19 +719,12 @@ fn paginate<R>(mut page: impl FnMut(usize) -> Result<Vec<R>>) -> Result<Vec<R>> 
 /// `list_repos` reads the flag on every row either way.
 fn list_rows(forge: &Forge) -> Result<Vec<serde_json::Value>> {
     paginate(|page| {
-        let listing = precheck::forge_json(
+        precheck::forge_rows(
             forge,
             &format!("user/repos?limit={PAGE_SIZE}&page={page}"),
             &format!("user/repos?per_page={PAGE_SIZE}&page={page}"),
             &format!("projects?membership=true&archived=false&per_page={PAGE_SIZE}&page={page}"),
-        )?;
-        match listing {
-            serde_json::Value::Array(rows) => Ok(rows),
-            _ => bail!(
-                "{} returned an unexpected repository listing",
-                forge.kind.name()
-            ),
-        }
+        )
     })
 }
 

@@ -47,6 +47,26 @@ pub fn send(
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
+/// Percent-encode text the runner didn't choose — a repository path, a
+/// branch name, a credential — for one place in a URL. Everything outside
+/// the unreserved set goes, `/` included unless `keep_slashes`, which is more
+/// than any one spot strictly reserves: the point is that whatever reads the
+/// URL decodes it back to exactly the bytes it was given, so what the value
+/// may contain stops being a question anyone has to answer.
+pub fn encode(value: &str, keep_slashes: bool) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b'/' if keep_slashes => out.push('/'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// The shared client. Built once: a blocking client owns a connection pool
 /// and the thread the runtime lives on, and the proxy probe runs on the
 /// event stream's tick.
@@ -91,4 +111,15 @@ fn secret(name: &str, value: &str) -> Result<HeaderValue> {
     // would otherwise carry across a redirect.
     value.set_sensitive(true);
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn encoding_keeps_only_unreserved_bytes() {
+        assert_eq!(super::encode("fix/a b", true), "fix/a%20b");
+        assert_eq!(super::encode("fix/a b", false), "fix%2Fa%20b");
+        assert_eq!(super::encode("v1.2_x-y~z", false), "v1.2_x-y~z");
+        assert_eq!(super::encode("a#b?c", true), "a%23b%3Fc");
+    }
 }

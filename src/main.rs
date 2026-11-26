@@ -774,30 +774,12 @@ fn credential_line(forge: &Forge) -> String {
             "://",
             &format!(
                 "://{}:{}@",
-                encode_userinfo(forge.credential_user()),
-                encode_userinfo(&forge.token)
+                http::encode(forge.credential_user(), false),
+                http::encode(&forge.token, false)
             ),
             1,
         )
     )
-}
-
-/// Percent-encode one userinfo component of a URL. Everything outside the
-/// unreserved set goes, which is more than the format strictly reserves: the
-/// point is that git decodes the component back to exactly the bytes it was
-/// given, so what the value may contain stops being a question anyone has to
-/// answer.
-fn encode_userinfo(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
 }
 
 /// The longest a usage-limit notice may hold the runner. The epoch it names
