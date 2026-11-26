@@ -213,6 +213,12 @@ figures are served at `GET /api/deliveries`. They live in `deliveries.json` in
 the workspace and survive restarts, unlike the turn list. Anything the bot's
 account opens on the repository during a turn counts as that turn's.
 
+Each of those PRs and issues also gets a **turn receipt**: a comment the runner
+posts (not the agent) with the model, how long the turn ran, the tokens it
+spent, and what rtk saved it, so whoever decides on the change sees its cost
+next to it. A PR or issue gets one receipt, from the turn that opened it.
+Untick **Post turn receipts on what turns open** in the settings to stop them.
+
 Every PR a turn opens leaves a branch behind. **codemine** deletes the head
 branch when that hourly check finds the PR merged, or closed without merging.
 The branch is deleted once, when the

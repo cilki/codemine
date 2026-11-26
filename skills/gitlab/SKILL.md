@@ -59,7 +59,6 @@ glab repo list --member --per-page 100
    ```sh
    glab mr create --source-branch <short-topic> --title "<title>" --description "$(cat <body-file>)" --yes
    ```
-6. Include how long the session took and how many tokens were consumed in the MR description
 
 If a push is rejected, do not work around it — not with another credential,
 not by pushing somewhere else; a push the runner's own credentials cannot make

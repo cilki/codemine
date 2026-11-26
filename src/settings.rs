@@ -49,6 +49,11 @@ pub struct Settings {
     /// the comment's repository, the way **run now** does. Off by default:
     /// turning it on lets anyone with write access spend turns.
     pub forge_commands: bool,
+    /// Whether the runner comments on each PR and issue a turn opens with
+    /// what the turn measured: the model, how long it ran, and the tokens it
+    /// spent (see `crate::receipt`). On by default, and missing from configs
+    /// written before it existed, which load with it on.
+    pub post_receipts: bool,
 }
 
 impl Default for Settings {
@@ -63,6 +68,7 @@ impl Default for Settings {
             schedule: Schedule::default(),
             sign_commits: false,
             forge_commands: false,
+            post_receipts: true,
         }
     }
 }
@@ -335,6 +341,7 @@ impl Settings {
             model: self.model.clone(),
             turn_timeout: Duration::from_secs(self.turn_timeout_secs),
             max_open_prs: self.max_open_prs.map(|budget| budget as usize),
+            post_receipts: self.post_receipts,
             workspace: workspace.to_owned(),
         }
     }
@@ -815,6 +822,17 @@ mod tests {
         assert_eq!(settings.rate_limit, None);
         let value = serde_json::to_value(&settings).unwrap();
         assert!(value.get("hourly_limit").is_none());
+    }
+
+    /// Receipts are on by default, including for a config.json written before
+    /// the setting existed, and stay off once someone turns them off.
+    #[test]
+    fn receipts_default_on_and_an_explicit_off_sticks() {
+        let old: Settings = serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
+        assert!(old.post_receipts);
+        let off: Settings =
+            serde_json::from_value(serde_json::json!({"post_receipts": false})).unwrap();
+        assert!(!off.post_receipts);
     }
 
     /// A limit without a window is a limit per hour.

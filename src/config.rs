@@ -249,6 +249,9 @@ pub struct Config {
     pub turn_timeout: Duration,
     /// The open-PR budget per repository; see `Settings::max_open_prs`.
     pub max_open_prs: Option<usize>,
+    /// Whether each PR and issue a completed turn opens gets the turn's
+    /// receipt as a comment; see `Settings::post_receipts`.
+    pub post_receipts: bool,
     /// Root of the persistent workspace where repositories stay cloned across
     /// turns.
     pub workspace: PathBuf,

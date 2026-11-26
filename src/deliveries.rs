@@ -171,7 +171,8 @@ impl Deliveries {
 
     /// Count a finished turn against its task, and keep what it opened. A
     /// delivery already on record — one an earlier turn opened inside the
-    /// clock slack — stays that turn's.
+    /// clock slack — stays that turn's. Returns the deliveries that are this
+    /// turn's, which are the ones that get its receipt.
     pub fn record_turn(
         &self,
         forge: ForgeKind,
@@ -180,18 +181,20 @@ impl Deliveries {
         started: u64,
         tokens: Option<&TokenUsage>,
         opened: &[Opened],
-    ) {
+    ) -> Vec<Opened> {
         let tokens = tokens.map_or(0, total);
         let mut ledger = crate::sync::lock(&self.ledger);
         let tally = ledger.tasks.entry(task.to_owned()).or_default();
         tally.turns += 1;
         tally.tokens += tokens;
+        let mut own = Vec::new();
         for opened in opened {
             let fresh = key(forge, repo, opened.kind, opened.number);
             if ledger.deliveries.iter().any(|d| d.key() == fresh) {
                 continue;
             }
             info!("{task} on {repo} opened {fresh}");
+            own.push(opened.clone());
             ledger.deliveries.push(Delivery {
                 forge,
                 repo: repo.to_owned(),
@@ -203,6 +206,7 @@ impl Deliveries {
             });
         }
         self.save(&ledger);
+        own
     }
 
     /// Ask the forge about every open delivery on it that hasn't been asked
@@ -823,10 +827,13 @@ mod tests {
             Some(&tokens(10)),
             &[issue],
         );
-        ledger.record_turn(ForgeKind::Gitea, "me/repo", "benchmark", 0, None, &[pr(3)]);
+        let first = ledger.record_turn(ForgeKind::Gitea, "me/repo", "benchmark", 0, None, &[pr(3)]);
+        assert_eq!(first, [pr(3)]);
         // Found again by a later turn inside the clock slack: still the
-        // first turn's, and counted once.
-        ledger.record_turn(ForgeKind::Gitea, "me/repo", "benchmark", 0, None, &[pr(3)]);
+        // first turn's, counted once, and not handed back as the later
+        // turn's — so it never gets a second receipt.
+        let again = ledger.record_turn(ForgeKind::Gitea, "me/repo", "benchmark", 0, None, &[pr(3)]);
+        assert!(again.is_empty(), "{again:?}");
         ledger.settle_states(ForgeKind::Gitea, RECHECK_SECS, |_, _, number| {
             Ok(match number {
                 1 => State::Merged,

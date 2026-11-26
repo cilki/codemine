@@ -58,7 +58,6 @@ gh api user/repos --paginate --jq '.[].full_name'
    ```sh
    gh pr create --head <short-topic> --title "<title>" --body-file <body-file>
    ```
-6. Include how long the session took and how many tokens were consumed in the PR description
 
 If a push is rejected, do not work around it — not with another credential,
 not by pushing somewhere else; a push the runner's own credentials cannot make
