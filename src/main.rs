@@ -14,6 +14,7 @@ mod events;
 #[cfg(feature = "hostinfo")]
 mod host;
 mod http;
+mod humans;
 mod identity;
 mod ledger;
 mod opencode;

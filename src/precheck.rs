@@ -25,7 +25,8 @@ pub const PR_LIMIT: usize = 20;
 /// the rest get their turn, as one pass over every remaining pair in an
 /// order drawn by `weigh`: a pair is placed ahead of another with the odds
 /// their weights give it, so a heavier pair is more likely — never certain —
-/// to go first. `check` waves most of them straight through, but a pair the
+/// to go first. The caller's weights favour a repository a person has been
+/// active on lately (`humans`). `check` waves most of them straight through, but a pair the
 /// skip cache has already answered for is passed over instead of drawn. The
 /// cache applies to the gated pass too — every gated task is probed out of
 /// the same state its memory is keyed on — so a gated task can no longer
@@ -52,7 +53,11 @@ pub fn draw<'a>(
     };
     let mut gated_pairs = candidates(true);
     fastrand::shuffle(&mut gated_pairs);
-    let ungated = weighted_order(candidates(false), |(task, repo)| weigh(task, repo));
+    // Weighed only once the gated pass comes up empty: a weight can cost a
+    // forge request (see `humans`), which a draw that ends on gated work
+    // never needs.
+    let ungated = std::iter::once(())
+        .flat_map(|()| weighted_order(candidates(false), |(task, repo)| weigh(task, repo)));
     for (task, repo) in gated_pairs.into_iter().chain(ungated) {
         if check(task, repo) {
             return Some((task, repo));
@@ -802,6 +807,26 @@ mod tests {
         // Expected one in four; the bounds are many standard deviations
         // out, so the test is about the shape of the draw and not its seed.
         assert!((40..=220).contains(&light_first), "{light_first}");
+    }
+
+    /// A draw that lands on gated work never weighs anything: a weight can
+    /// cost a forge request, which that draw has no use for.
+    #[test]
+    fn gated_work_is_drawn_without_weighing() {
+        let (forge, pool) = Forge::sweep(&["me/one", "me/two"], &["docs", "rebase"]);
+        let weighed = std::cell::Cell::new(0);
+        let (task, _) = draw(
+            &forge,
+            &pool,
+            |task, _| task == "rebase",
+            |_, _| {
+                weighed.set(weighed.get() + 1);
+                1.0
+            },
+        )
+        .unwrap();
+        assert_eq!(task, "rebase");
+        assert_eq!(weighed.get(), 0);
     }
 
     /// The gated pass is not weighted: every gated pair is probed before

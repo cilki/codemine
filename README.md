@@ -277,7 +277,7 @@ every later turn the tokens to read it. Delete a file to make the agent forget w
 
 #### Drawing turns
 
-Each pass first probes the tasks that answer to the forge — `feedback`,
+Each pass first probes the tasks that answer to the forge — `respond`,
 `rebase`, `review` — on every repository, and the first with work gets the
 turn. Only when none has is a turn drawn from the rest, and that draw is
 weighted rather than uniform: a (task, repository) pair is favoured the longer
@@ -286,6 +286,14 @@ completed rather than skipped. A pair that has never run outranks one that
 just did; one that keeps skipping sinks, without ever dropping out. The history
 behind the weights lives in `ledger.json` in the workspace, beside the skip
 cache, and survives restarts.
+
+On top of that, repositories people are working on come first. The draw reads
+each repository's activity feed (a push, an issue, a comment, a merge — by
+anyone but the bot's own account or a `[bot]` app) and multiplies the weight of
+every pair on a repository by up to ten for activity this moment, fading to no
+boost three days later. A feed is read at most once every ten minutes per
+repository, and only when no forge-driven task had work; a feed that can't be
+read gives no boost.
 
 #### Custom tasks
 

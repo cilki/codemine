@@ -449,7 +449,7 @@ pub fn format_rfc3339(epoch: u64) -> String {
 
 /// An RFC 3339 timestamp as epoch seconds, the way the forges write them:
 /// `2026-11-22T19:50:00Z`, with a fraction (GitLab) or an offset (Gitea).
-fn parse_rfc3339(s: &str) -> Option<u64> {
+pub fn parse_rfc3339(s: &str) -> Option<u64> {
     fn num(s: &str, range: std::ops::Range<usize>) -> Option<i64> {
         let part = s.get(range)?;
         part.bytes()

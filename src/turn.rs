@@ -154,7 +154,13 @@ impl Turn<'_> {
         spent: Spent,
         opened: Vec<Opened>,
     ) -> Vec<Opened> {
-        weights.record(self.task, self.forge.kind, self.repo, self.started(), outcome);
+        weights.record(
+            self.task,
+            self.forge.kind,
+            self.repo,
+            self.started(),
+            outcome,
+        );
         let own = ledger.record_turn(
             self.forge.kind,
             self.repo,
@@ -248,7 +254,10 @@ pub fn run(
         draw,
         |task, repo| probe.has_work(task, repo),
         |task, repo| probe.actionable(task, repo),
-        |task, repo| weights.weight(task, forge.kind, repo, now),
+        |task, repo| {
+            let seen = crate::humans::last_seen(forge, repo);
+            weights.weight(task, forge.kind, repo, now) * crate::humans::boost(seen, now)
+        },
     );
     let Some((task, repo, focus)) = picked else {
         return Ok(Report::Idle(Idle::NothingToDo));
