@@ -83,11 +83,54 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<(
     crate::workspace::write_json(path, &after)
 }
 
+/// The tasks a turn of `task` may take on as part of its own work: every
+/// task in the pool that `enabled` says is ticked for the repository, less
+/// `task` itself and the tasks the forge's activity queues (`review` and
+/// `respond`), which get turns of their own the moment that activity lands.
+/// The rest wait for the random draw, so a `respond` turn that recognizes one
+/// of their jobs in a comment or an assigned issue does it rather than
+/// leaving it for a draw that may be days away.
+pub fn other_tasks(task: &str, enabled: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    tasks()
+        .iter()
+        .map(|t| t.slug.as_str())
+        .filter(|slug| *slug != task && !crate::events::QUEUED_TASKS.contains(slug))
+        .filter(|slug| enabled(slug))
+        .collect()
+}
+
+/// The `$6` a prompt carries: the other tasks as a list of code spans, or
+/// `none`, so the sentence around it reads either way.
+fn task_list(slugs: &[&str]) -> String {
+    if slugs.is_empty() {
+        return "none".to_owned();
+    }
+    slugs
+        .iter()
+        .map(|slug| format!("`{slug}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What fills in the sweep prompt's `$1`–`$6`, in that order.
+pub struct Assignment<'a> {
+    pub task: &'a str,
+    pub repo: &'a str,
+    /// The forge's slug, which is also the name of its skill.
+    pub forge: &'a str,
+    /// The clone the agent must work in.
+    pub dir: &'a Path,
+    /// The notes file earlier turns of this task on this repository left:
+    /// see `workspace::notes_path`.
+    pub notes: &'a Path,
+    /// The tasks the turn may take on as part of its own: see
+    /// [`other_tasks`].
+    pub others: &'a [&'a str],
+}
+
 /// The sweep prompt for one turn: `SWEEP`, with the user's own tasks merged
 /// into its task sections and its cache lines dropped, without its front matter, with
-/// `$1`–`$5` replaced by the task, the repository, the forge, the clone the
-/// agent must work in, and the notes file earlier turns of this task on this
-/// repository left (see `workspace::notes_path`), and the paragraph between
+/// `$1`–`$6` replaced by the turn's [`Assignment`], and the paragraph between
 /// the `codegraph` markers kept only when the tool it recommends is there to
 /// use — `install_mcp` wires `codegraph_explore` in on the same condition,
 /// and a prompt that prefers a tool the session doesn't have is a prompt the
@@ -99,18 +142,22 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<(
 /// [`focus_section`]), added after the replacement so nothing in the comment
 /// is expanded either.
 pub fn sweep_prompt(
-    task: &str,
-    repo: &str,
-    forge: &str,
-    dir: &Path,
-    notes: &Path,
+    turn: &Assignment,
     codegraph: bool,
     focus: Option<&crate::events::Focus>,
 ) -> String {
     let source = sweep().rendered.as_str();
-    let dir = dir.display().to_string();
-    let notes = notes.display().to_string();
-    let args = [task, repo, forge, dir.as_str(), notes.as_str()];
+    let dir = turn.dir.display().to_string();
+    let notes = turn.notes.display().to_string();
+    let others = task_list(turn.others);
+    let args = [
+        turn.task,
+        turn.repo,
+        turn.forge,
+        dir.as_str(),
+        notes.as_str(),
+        others.as_str(),
+    ];
     let mut prompt = String::with_capacity(source.len());
     let source = without_codegraph_markers(strip_front_matter(source), codegraph);
     let mut rest = source.as_str();
@@ -633,7 +680,7 @@ mod tests {
             "- Handle a TODO comment in the code or a TODO list item from the \
              project's AGENTS.md"
         );
-        assert_eq!(by_slug("respond").lines().count(), 3);
+        assert_eq!(by_slug("respond").lines().count(), 4);
         // Nested bullets keep their indentation.
         assert!(
             by_slug("bump").contains("\n  - Only make a PR"),
@@ -836,11 +883,14 @@ mod tests {
     #[test]
     fn sweep_prompt_fills_in_the_turn() {
         let prompt = sweep_prompt(
-            "rebase",
-            "cilki/$2-repo",
-            "gitea",
-            Path::new("/work/some dir/repo"),
-            Path::new("/work/notes/gitea/cilki/$2-repo/rebase.md"),
+            &Assignment {
+                task: "rebase",
+                repo: "cilki/$2-repo",
+                forge: "gitea",
+                dir: Path::new("/work/some dir/repo"),
+                notes: Path::new("/work/notes/gitea/cilki/$2-repo/rebase.md"),
+                others: &["docs", "investor"],
+            },
             true,
             None,
         );
@@ -861,7 +911,8 @@ mod tests {
         assert!(prompt.contains(
             "leave notes for the next one at\n`/work/notes/gitea/cilki/$2-repo/rebase.md`"
         ));
-        for placeholder in ["$1", "$3", "$4", "$5"] {
+        assert!(prompt.contains("enabled on this repository: `docs`, `investor`."));
+        for placeholder in ["$1", "$3", "$4", "$5", "$6"] {
             assert!(
                 !prompt.contains(placeholder),
                 "{placeholder} left in the prompt"
@@ -870,6 +921,32 @@ mod tests {
         // Everything after the front matter survives, task sections included.
         assert!(prompt.contains("## \"rebase\""));
         assert!(prompt.ends_with("rediscovering this.\n"));
+    }
+
+    /// A `respond` turn is told which other ticked tasks it may take on:
+    /// never itself, never the tasks the forge's activity queues turns of
+    /// their own for, never one the repository hasn't ticked, and `none`
+    /// when that leaves nothing, so the sentence still reads.
+    #[test]
+    fn a_turn_is_offered_the_other_ticked_tasks_that_wait_for_the_draw() {
+        let ticked = ["respond", "review", "rebase", "docs", "nope"];
+        let others = other_tasks("respond", |slug| ticked.contains(&slug));
+        assert_eq!(others, ["rebase", "docs"]);
+        assert!(other_tasks("respond", |slug| ["respond", "review"].contains(&slug)).is_empty());
+
+        let prompt = sweep_prompt(
+            &Assignment {
+                task: "respond",
+                repo: "me/repo",
+                forge: "gitea",
+                dir: Path::new("/r"),
+                notes: Path::new("/n/respond.md"),
+                others: &[],
+            },
+            true,
+            None,
+        );
+        assert!(prompt.contains("enabled on this repository: none."), "{prompt}");
     }
 
     /// A turn a forge comment asked for ends on that comment, quoted as it
@@ -883,20 +960,26 @@ mod tests {
         };
         let notes = Path::new("/n/docs.md");
         let plain = sweep_prompt(
-            "docs",
-            "me/repo",
-            "gitea",
-            Path::new("/r"),
-            notes,
+            &Assignment {
+                task: "docs",
+                repo: "me/repo",
+                forge: "gitea",
+                dir: Path::new("/r"),
+                notes,
+                others: &[],
+            },
             true,
             None,
         );
         let asked = sweep_prompt(
-            "docs",
-            "me/repo",
-            "gitea",
-            Path::new("/r"),
-            notes,
+            &Assignment {
+                task: "docs",
+                repo: "me/repo",
+                forge: "gitea",
+                dir: Path::new("/r"),
+                notes,
+                others: &[],
+            },
             true,
             Some(&focus),
         );
@@ -912,11 +995,14 @@ mod tests {
             ..focus
         };
         let asked = sweep_prompt(
-            "docs",
-            "me/repo",
-            "gitea",
-            Path::new("/r"),
-            notes,
+            &Assignment {
+                task: "docs",
+                repo: "me/repo",
+                forge: "gitea",
+                dir: Path::new("/r"),
+                notes,
+                others: &[],
+            },
             true,
             Some(&bare),
         );
@@ -933,20 +1019,26 @@ mod tests {
     fn sweep_prompt_recommends_codegraph_only_when_it_is_there() {
         let notes = Path::new("/n/docs.md");
         let with = sweep_prompt(
-            "docs",
-            "me/repo",
-            "gitea",
-            Path::new("/r"),
-            notes,
+            &Assignment {
+                task: "docs",
+                repo: "me/repo",
+                forge: "gitea",
+                dir: Path::new("/r"),
+                notes,
+                others: &[],
+            },
             true,
             None,
         );
         let without = sweep_prompt(
-            "docs",
-            "me/repo",
-            "gitea",
-            Path::new("/r"),
-            notes,
+            &Assignment {
+                task: "docs",
+                repo: "me/repo",
+                forge: "gitea",
+                dir: Path::new("/r"),
+                notes,
+                others: &[],
+            },
             false,
             None,
         );

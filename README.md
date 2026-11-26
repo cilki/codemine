@@ -15,7 +15,9 @@ PRs and helpful issues.
 Each "turn" does one of the following on a repo:
 
 - `respond`: responds to reviewer comments on its open PRs, and opens a PR for
-  an issue it's assigned.
+  an issue it's assigned. When a comment or issue asks for another task's job,
+  it does that work on the spot, provided the task is ticked for the repository
+  and isn't `review` (which gets a turn of its own as soon as it's asked for).
 - `rebase`: rebases its own open PR branches that have merge conflicts with
   their base branch, resolving the conflicts and force-pushing — or closes the
   PR and deletes the branch when the change has gone obsolete.

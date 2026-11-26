@@ -81,6 +81,12 @@ the user decide what to do.
 
 - Respond to reviewer comments on your open PRs
 - If you are assigned an issue, create a PR to address it
+- When a comment, an assigned issue or a notification asks for work that is
+  another task's job, do it in this turn by that task's instructions if it is
+  one of the other tasks enabled on this repository: $6. That is part of this
+  task, not a switch away from it, so don't leave it for a later turn of that
+  task; mark its notification read once it is done. For a task not on that
+  list, reply saying which task it would take and that it isn't enabled here
 - A request to review a PR — someone else's or one of your own — is the `review`
   task's, not yours: leave it, and leave its notification unread
 

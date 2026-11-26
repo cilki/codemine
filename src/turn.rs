@@ -469,11 +469,16 @@ fn spawn_agent(
         .args(["--model", &cfg.model])
         // One argument, so a clone path with spaces in it stays whole.
         .arg(crate::prompts::sweep_prompt(
-            turn.task,
-            turn.repo,
-            turn.forge_name(),
-            &turn.dir,
-            &turn.notes,
+            &crate::prompts::Assignment {
+                task: turn.task,
+                repo: turn.repo,
+                forge: turn.forge_name(),
+                dir: &turn.dir,
+                notes: &turn.notes,
+                others: &crate::prompts::other_tasks(turn.task, |task| {
+                    turn.forge.runs(task, turn.repo)
+                }),
+            },
             crate::workspace::codegraph_available(),
             turn.focus.as_ref(),
         ))
