@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -233,6 +233,15 @@ pub fn run(
     // turn, not the runner.
     if let Err(err) = workspace::prepare(&cfg.workspace, forge, repo, &turn.dir, &log) {
         let elapsed = turn.elapsed();
+        // The log is all the web UI shows of the turn, and git's own output
+        // stops wherever git was stopped — a timed-out clone ends at
+        // `Cloning into ...` — so the reason goes in after it.
+        if let Err(write) = note(
+            &mut log,
+            &format!("failed to prepare {repo} after {elapsed}s: {err:#}"),
+        ) {
+            warn!("failed to write to the turn log: {write:#}");
+        }
         let tail = read_tail(&mut log, 64 * 1024)?;
         warn!(
             "failed to prepare {repo} in {elapsed}s: {err:#}\n{}",
@@ -728,6 +737,26 @@ fn list_rows(forge: &Forge) -> Result<Vec<serde_json::Value>> {
     })
 }
 
+/// Append a line of the runner's own to the turn log, after whatever its
+/// children wrote there, on a line of its own even when the last of that
+/// output (a progress meter, a killed process) stopped mid-line.
+fn note(log: &mut File, message: &str) -> Result<()> {
+    let len = log.seek(SeekFrom::End(0))?;
+    let mut line = String::new();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        log.seek(SeekFrom::End(-1))?;
+        log.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            line.push('\n');
+        }
+    }
+    line.push_str(&format!("codemine: {message}\n"));
+    log.seek(SeekFrom::End(0))?;
+    log.write_all(line.as_bytes())?;
+    Ok(())
+}
+
 /// The last `limit` bytes of the file, lossily decoded.
 fn read_tail(file: &mut std::fs::File, limit: u64) -> Result<String> {
     let len = file.metadata()?.len();
@@ -739,14 +768,15 @@ fn read_tail(file: &mut std::fs::File, limit: u64) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::os::unix::process::ExitStatusExt;
 
     use anyhow::{Result, bail};
     use serde_json::json;
 
     use super::{
-        Draw, ExitStatus, Outcome, PAGE_SIZE, Verdict, listed_repo, open_log, outcome_of, paginate,
-        pick, safe_repo_path,
+        Draw, ExitStatus, Outcome, PAGE_SIZE, Verdict, listed_repo, note, open_log, outcome_of,
+        paginate, pick, read_tail, safe_repo_path,
     };
     use crate::config::{Forge, ForgeKind};
     use crate::events::Pending;
@@ -996,6 +1026,28 @@ mod tests {
         }
         assert_eq!(mode(&logs), 0o700, "{:o}", mode(&logs));
         assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
+    }
+
+    /// A failed preparation says why at the end of the turn log, on a line
+    /// of its own: a clone killed by the timeout used to leave the log at
+    /// `Cloning into ...` with nothing after it, and the turn just Failed.
+    #[test]
+    fn the_runner_notes_land_after_what_the_children_wrote() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (path, mut log) = open_log(&workspace.path().join("logs"), 1_700_000_001).unwrap();
+        // An empty log gets no leading blank line.
+        note(&mut log, "first").unwrap();
+        // A child holding a descriptor of its own, cut off mid-line.
+        let mut child = log.try_clone().unwrap();
+        child.write_all(b"Cloning into 'x'...").unwrap();
+        note(&mut log, "git timed out after 1800s").unwrap();
+
+        let tail = read_tail(&mut log, 1024).unwrap();
+        assert_eq!(
+            tail,
+            "codemine: first\nCloning into 'x'...\ncodemine: git timed out after 1800s\n"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), tail);
     }
 
     /// A repository name is a path component and a URL segment, so anything

@@ -20,6 +20,16 @@ use wait_timeout::ChildExt;
 use crate::config::{Forge, ForgeKind};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(600);
+/// The first clone of a big repository is slow: nixpkgs outlasted
+/// [`GIT_TIMEOUT`] still at `Cloning into ...`. Even a partial clone carries
+/// every commit and tree, which the forge has to count before it sends any.
+const CLONE_TIMEOUT: Duration = Duration::from_secs(1800);
+/// What a clone leaves on the forge until something asks for it: every
+/// file's content except at the commits checked out. The history (commits
+/// and trees) is all still there, so `log`, `merge-base` and branch work are
+/// unaffected; an old blob — `log -p`, `blame`, checking out an old commit —
+/// is fetched from `origin` the first time it is read.
+const CLONE_FILTER: &str = "blob:none";
 const CODEGRAPH_SYNC_TIMEOUT: Duration = Duration::from_secs(600);
 /// The first index of a big repository is slow.
 const CODEGRAPH_INIT_TIMEOUT: Duration = Duration::from_secs(1800);
@@ -291,6 +301,11 @@ fn clone_url(forge: &Forge, repo: &str) -> String {
 }
 
 /// Clone into `dir`, first clearing any half-created or broken leftovers.
+///
+/// The clone is a partial one (see [`CLONE_FILTER`]): a repository the size
+/// of nixpkgs is mostly old file contents no turn reads, and a full clone of
+/// it outlasted the timeout. A forge that doesn't serve filters says so and
+/// sends a full clone instead, so this costs nothing there.
 fn reclone(workspace: &Path, url: &str, dir: &Path, log: &File) -> Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)
@@ -299,8 +314,10 @@ fn reclone(workspace: &Path, url: &str, dir: &Path, log: &File) -> Result<()> {
     let parent = dir.parent().expect("repo dirs have parents");
     private_dir(parent)?;
     run_logged(
-        git_in(workspace, parent).args(["clone", url]).arg(dir),
-        GIT_TIMEOUT,
+        git_in(workspace, parent)
+            .args(["clone", &format!("--filter={CLONE_FILTER}"), url])
+            .arg(dir),
+        CLONE_TIMEOUT,
         log,
     )
 }
@@ -415,7 +432,9 @@ fn kept_config(name: &str) -> bool {
 /// So the file is replaced rather than overridden. What the runner needs of
 /// it, it writes: this clone is not bare, it keeps reflogs, and its one
 /// remote is the forge URL the repository was cloned from — which is also
-/// what stops the clone from redirecting the runner's own fetch. Everything
+/// what stops the clone from redirecting the runner's own fetch — and the
+/// one it fetches missing objects from, the clone being a partial one (see
+/// [`reclone`]). Everything
 /// else is dropped, `include.path` included, which is what makes the
 /// rebuilt file the whole of what git will read.
 fn reset_local_config(workspace: &Path, dir: &Path, url: &str) -> Result<()> {
@@ -441,12 +460,21 @@ fn reset_local_config(workspace: &Path, dir: &Path, url: &str) -> Result<()> {
 
 /// The rebuilt config as git config text: the runner's own keys plus the
 /// carried-over ones, grouped under one header per section.
+///
+/// The promisor keys are what `git clone --filter` wrote, and they are the
+/// runner's to restate rather than the clone's to keep: dropped, the clone
+/// would be missing objects with no remote it may fetch them from, and every
+/// later read of an old blob — the runner's `checkout` included — would fail.
+/// Written unconditionally, since every clone is made with the filter; on one
+/// the forge sent whole they are harmless.
 fn config_text(url: &str, kept: &[(String, String)]) -> String {
     let own = [
         ("core.bare", "false"),
         ("core.logallrefupdates", "true"),
         ("remote.origin.url", url),
         ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.partialclonefilter", CLONE_FILTER),
     ];
     let mut sections: BTreeMap<String, String> = BTreeMap::new();
     let entries = own
@@ -918,6 +946,64 @@ mod tests {
             ],
         );
         (origin, clone)
+    }
+
+    /// A big repository is cloned without its history's file contents, and
+    /// stays a working partial clone through the config rebuild: the
+    /// promisor keys are what let git fetch an old blob when something reads
+    /// it, and without them every such read — and the runner's own checkout
+    /// of a commit it has no blobs for — would fail on a missing object.
+    #[test]
+    fn a_partial_clone_survives_the_rebuild() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-b", "main"]);
+        git(&origin, &["config", "uploadpack.allowFilter", "true"]);
+        for version in ["one", "two", "three"] {
+            std::fs::write(origin.join("file"), version).unwrap();
+            git(&origin, &["add", "."]);
+            git(&origin, &["commit", "-m", version]);
+        }
+        // file:// rather than a bare path: git clones a local path by
+        // copying the object store, which no filter applies to.
+        let url = format!("file://{}", origin.display());
+        let clone = root.path().join("forge/owner/repo");
+        let log = tempfile::tempfile().unwrap();
+        reclone(root.path(), &url, &clone, &log).unwrap();
+
+        let missing = |dir: &Path| {
+            git_stdout(
+                root.path(),
+                dir,
+                &["rev-list", "--objects", "--all", "--missing=print"],
+            )
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with('?'))
+            .count()
+        };
+        assert_eq!(missing(&clone), 2, "the old blobs were cloned");
+
+        // Upstream moves on, and the next turn's update brings it forward
+        // through the rebuilt config.
+        std::fs::write(origin.join("file"), "four").unwrap();
+        git(&origin, &["commit", "-am", "four"]);
+        update(root.path(), &url, &clone, &log).unwrap();
+        assert_eq!(head_of(&clone, "main"), head_of(&origin, "main"));
+        assert_eq!(std::fs::read_to_string(clone.join("file")).unwrap(), "four");
+        let get = |key: &str| {
+            git_stdout(root.path(), &clone, &["config", "--local", "--get", key])
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(get("remote.origin.promisor"), "true");
+        assert_eq!(get("remote.origin.partialclonefilter"), CLONE_FILTER);
+
+        // An old blob is still there to be read, fetched on demand.
+        let old = git_stdout(root.path(), &clone, &["show", "main~3:file"]).unwrap();
+        assert_eq!(old, "one");
     }
 
     /// A repository's submodules are part of the tree the agent is handed.
@@ -1477,6 +1563,8 @@ mod tests {
         };
         assert_eq!(get("remote.origin.url"), url_of(&origin));
         assert_eq!(get("core.bare"), "false");
+        assert_eq!(get("remote.origin.promisor"), "true");
+        assert_eq!(get("remote.origin.partialclonefilter"), CLONE_FILTER);
         assert_eq!(
             get(&format!("branch.{branch}.merge")),
             format!("refs/heads/{branch}")
