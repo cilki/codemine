@@ -335,7 +335,7 @@ fn pool(forge: &Forge) -> Result<Vec<String>> {
 /// precondition fails.
 ///
 /// Fresh forge activity comes next: the watcher saw a comment or a
-/// review request land, so that repository gets a feedback or review turn
+/// review request land, so that repository gets a respond or review turn
 /// ahead of the random draw. Entries that no longer check out (repository
 /// disabled or gone, the forge since switched, the activity already handled,
 /// the tasks since turned off for the repository) are dropped rather than
@@ -752,12 +752,12 @@ mod tests {
     use crate::events::Pending;
 
     /// Fresh activity is drawn whether or not the window is open, and
-    /// `review` asks before `feedback`.
+    /// `review` asks before `respond`.
     #[test]
     fn a_queued_repository_is_drawn_inside_and_outside_the_window() {
         for draw in [Draw::Any, Draw::QueuedOnly] {
             let (forge, pool) =
-                Forge::sweep(&["me/one", "me/two"], &["review", "feedback", "rebase"]);
+                Forge::sweep(&["me/one", "me/two"], &["review", "respond", "rebase"]);
             let pending = Pending::new();
             pending.push(ForgeKind::Github, "me/two".into());
             let picked = pick(&forge, &pool, &pending, draw, |_, _| true, |_, _| true);
@@ -770,7 +770,7 @@ mod tests {
     /// queued the pass draws nothing, and probes nothing either.
     #[test]
     fn off_hours_takes_no_automatic_turn() {
-        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback", "rebase"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "respond", "rebase"]);
         let pending = Pending::new();
         let probed = std::cell::Cell::new(0);
         let picked = pick(
@@ -793,7 +793,7 @@ mod tests {
     /// is not consulted. Inside the window it is.
     #[test]
     fn a_handled_queue_entry_falls_through_to_the_draw_only_inside_the_window() {
-        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback", "rebase"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "respond", "rebase"]);
         let queued_only = |task: &str, _: &str| crate::events::QUEUED_TASKS.contains(&task);
 
         let pending = Pending::new();
@@ -831,7 +831,7 @@ mod tests {
     /// forge since switched, or the repository left the pool.
     #[test]
     fn stale_queue_entries_are_dropped() {
-        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "respond"]);
         let pending = Pending::new();
         pending.push(ForgeKind::Gitea, "me/repo".into());
         pending.push(ForgeKind::Github, "me/gone".into());
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     fn a_requested_pair_goes_first_whatever_the_memory_says() {
         for draw in [Draw::Any, Draw::QueuedOnly] {
-            let (forge, pool) = Forge::sweep(&["me/one", "me/two"], &["review", "feedback"]);
+            let (forge, pool) = Forge::sweep(&["me/one", "me/two"], &["review", "respond"]);
             let pending = Pending::new();
             pending.push(ForgeKind::Github, "me/one".into());
             pending.request(request("me/two", "docs"));
@@ -878,7 +878,7 @@ mod tests {
     /// is dropped, leaving the rest of the pick to go on.
     #[test]
     fn a_request_that_cannot_run_is_dropped() {
-        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "feedback"]);
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review", "respond"]);
         let pending = Pending::new();
         pending.request(request("me/repo", "rebase"));
         pending.request(request("me/gone", "docs"));

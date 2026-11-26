@@ -85,6 +85,7 @@ pub struct Answer {
 struct Delivery {
     forge: ForgeKind,
     repo: String,
+    #[serde(deserialize_with = "current_slug")]
     task: String,
     kind: Kind,
     number: u64,
@@ -117,9 +118,34 @@ struct Tally {
     tokens: u64,
 }
 
+/// A task slug read back from the file, under the name the task goes by now.
+fn current_slug<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let slug = String::deserialize(deserializer)?;
+    Ok(crate::prompts::current_slug(&slug).to_owned())
+}
+
+/// The per-task tallies read back from the file, each under the name its
+/// task goes by now; a task's tallies from before and after a rename are
+/// added up.
+fn current_tallies<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, Tally>, D::Error> {
+    let mut tallies = BTreeMap::<String, Tally>::new();
+    for (slug, tally) in BTreeMap::<String, Tally>::deserialize(deserializer)? {
+        let sum = tallies
+            .entry(crate::prompts::current_slug(&slug).to_owned())
+            .or_default();
+        sum.turns += tally.turns;
+        sum.tokens += tally.tokens;
+    }
+    Ok(tallies)
+}
+
 #[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
 struct Ledger {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "current_tallies")]
     tasks: BTreeMap<String, Tally>,
     #[serde(default)]
     deliveries: Vec<Delivery>,
@@ -900,6 +926,29 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         let reloaded = Deliveries::load(path);
         assert_eq!(reloaded.view(), json!({"states": {}, "summary": []}));
+    }
+
+    /// A ledger written while `respond` was called `feedback` reads back
+    /// under the new name, with the turns from before and after the rename
+    /// on one line of the summary.
+    #[test]
+    fn a_tasks_history_follows_it_through_a_rename() {
+        let ledger: Ledger = serde_json::from_value(json!({
+            "tasks": {
+                "feedback": {"turns": 2, "tokens": 10},
+                "respond": {"turns": 1, "tokens": 5},
+            },
+            "deliveries": [{
+                "forge": "gitea", "repo": "me/repo", "task": "feedback",
+                "kind": "pr", "number": 3, "state": "open", "checked": 0,
+            }],
+        }))
+        .unwrap();
+        assert_eq!(
+            ledger.tasks.into_iter().collect::<Vec<_>>(),
+            [("respond".to_owned(), Tally { turns: 3, tokens: 15 })]
+        );
+        assert_eq!(ledger.deliveries[0].task, "respond");
     }
 
     #[test]

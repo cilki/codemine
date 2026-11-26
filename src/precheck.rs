@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn draw_probes_every_repository() {
         let (forge, pool) =
-            Forge::sweep(&["me/one", "me/two", "me/three"], &["feedback", "rebase"]);
+            Forge::sweep(&["me/one", "me/two", "me/three"], &["respond", "rebase"]);
         let seen = std::cell::RefCell::new(BTreeSet::new());
         assert!(
             draw(&forge, &pool, |task, repo| {

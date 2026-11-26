@@ -492,9 +492,11 @@ fn directive<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 /// back out for the prompt. A custom section for a slug the command defines
 /// appends to its instructions, and replaces its cache basis or delivery when
 /// it declares one of its own; a section for any other slug is a new task, after the
-/// built-in ones. Anything in the file outside a task section is ignored.
+/// built-in ones. A section under a slug a built-in task was renamed from
+/// extends that task. Anything in the file outside a task section is ignored.
 fn merge(mut sweep: Sweep, custom: &str) -> Result<Sweep> {
-    for task in parse_sweep(custom)?.tasks {
+    for mut task in parse_sweep(custom)?.tasks {
+        task.slug = current_slug(&task.slug).to_owned();
         if let Some(existing) = sweep.tasks.iter_mut().find(|t| t.slug == task.slug) {
             if !task.body.is_empty() {
                 if !existing.body.is_empty() {
@@ -563,8 +565,26 @@ fn describe(body: &str) -> String {
     bullets.join("\n")
 }
 
-/// The task the sweep command defines under this slug, if any.
+/// Slugs built-in tasks used to go by, each with the one it goes by now.
+/// Whatever the runner reads back that a user or an earlier version wrote —
+/// the repository picks in config.json, the deliveries ledger, a custom task
+/// file, a run-now request — is read through [`current_slug`], so a rename
+/// carries their picks and history over instead of silently dropping them.
+const RENAMED: &[(&str, &str)] = &[("feedback", "respond")];
+
+/// The slug a task goes by now: `slug` itself unless a built-in task was
+/// renamed from it.
+pub fn current_slug(slug: &str) -> &str {
+    RENAMED
+        .iter()
+        .find(|(old, _)| *old == slug)
+        .map_or(slug, |(_, new)| new)
+}
+
+/// The task the sweep command defines under this slug, if any; a slug a
+/// task was renamed from finds it under its new one.
 pub fn task(slug: &str) -> Option<&'static Task> {
+    let slug = current_slug(slug);
     tasks().iter().find(|task| task.slug == slug)
 }
 
@@ -595,7 +615,7 @@ mod tests {
             "- Handle a TODO comment in the code or a TODO list item from the \
              project's AGENTS.md"
         );
-        assert_eq!(by_slug("feedback").lines().count(), 3);
+        assert_eq!(by_slug("respond").lines().count(), 3);
         // Nested bullets keep their indentation.
         assert!(
             by_slug("bump").contains("\n  - Only make a PR"),
@@ -653,6 +673,22 @@ mod tests {
         let docs = merged("## \"docs\"\n- Also the wiki\n").unwrap();
         let docs = docs.tasks.iter().find(|t| t.slug == "docs").unwrap();
         assert_eq!(docs.basis, Some(Basis::Head));
+    }
+
+    /// A renamed task answers to its old slug — a custom section, a run-now
+    /// request or `--task` written before the rename still reaches it — and
+    /// is only ever handed out under its new one.
+    #[test]
+    fn a_renamed_task_answers_to_its_old_slug() {
+        assert_eq!(current_slug("feedback"), "respond");
+        assert_eq!(current_slug("docs"), "docs");
+        assert_eq!(task("feedback").unwrap().slug, "respond");
+        assert!(!tasks().iter().any(|task| task.slug == "feedback"));
+        let pool = merged("## \"feedback\"\n- Also answer on the mailing list\n").unwrap();
+        assert_eq!(pool.tasks.len(), tasks().len());
+        let respond = pool.tasks.iter().find(|t| t.slug == "respond").unwrap();
+        assert!(respond.body.ends_with("- Also answer on the mailing list"));
+        assert!(!pool.rendered.contains("## \"feedback\""));
     }
 
     #[test]

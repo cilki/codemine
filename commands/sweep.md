@@ -76,7 +76,7 @@ or a line starting with exactly `TASK SKIPPED` otherwise. Never claim
 If the task is too complicated for a single PR, open an issue instead and let
 the user decide what to do.
 
-## "feedback"
+## "respond"
 <!-- cache: feed -->
 
 - Respond to reviewer comments on your open PRs
@@ -128,7 +128,7 @@ the user decide what to do.
   `path:line` and keep the others on their lines
 - A review is comments and a verdict only. Never push to, rebase, close, or
   merge the PR under review — not even your own; fixing what you found is the
-  `feedback` task's job — and never claim you ran something you didn't
+  `respond` task's job — and never claim you ran something you didn't
 - Clear the review request's notification once the review is submitted, as the
   `$3` skill describes
 

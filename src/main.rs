@@ -81,7 +81,7 @@ fn main() -> Result<()> {
     // every turn, since a turn can leave the file pointing elsewhere.
     prompts::install_provider(&prompts::opencode_config_dir(), &store.snapshot().0.proxy)?;
     // A task that came up empty remembers the state it answered for — the
-    // tree's commit, or the notification feed for `feedback` — so it isn't
+    // tree's commit, or the notification feed for `respond` — so it isn't
     // drawn again until that moves.
     let cache = cache::Cache::load(cli.workspace.join("skips.json"));
     // The PRs and issues turns opened and what became of them, with every
@@ -123,7 +123,7 @@ fn main() -> Result<()> {
         .spawn(move || drop(config::models(&warm_against)))?;
 
     // Watch the forge for activity: a comment on a PR or issue queues that
-    // repository for a feedback turn ahead of the draw, ends the between-turn
+    // repository for a respond turn ahead of the draw, ends the between-turn
     // sleep early, and starts a turn outside the schedule's window, which
     // holds only the automatic turns.
     events::spawn(store.clone(), pending.clone())?;

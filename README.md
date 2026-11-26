@@ -14,7 +14,7 @@ PRs and helpful issues.
 
 Each "turn" does one of the following on a repo:
 
-- `feedback`: responds to reviewer comments on its open PRs, and opens a PR for
+- `respond`: responds to reviewer comments on its open PRs, and opens a PR for
   an issue it's assigned.
 - `rebase`: rebases its own open PR branches that have merge conflicts with
   their base branch, resolving the conflicts and force-pushing — or closes the
@@ -137,7 +137,7 @@ slow rate, widen the window: one task every two hours is 1 per 2h.
 A rate limit can't tell whether you've been merging what the bot opens. For
 that, set an open-PR budget (1 to 20): while the bot has that many open PRs of
 its own on a repository, the tasks that would open another aren't drawn there.
-`feedback`, `rebase` and `review` keep running, since they work on the PRs
+`respond`, `rebase` and `review` keep running, since they work on the PRs
 already open, and so does `feature`, which only files issues. Merge or close a
 PR and the held-back tasks are drawn again. A custom task that only files
 issues can say so with a `<!-- delivers: issue -->` line under its heading.
@@ -217,9 +217,9 @@ counts as the state is whatever the task reads:
 - `simplify`, `benchmark`, `docs`, `coverage`, `mutation`, and `audit` answer
   out of the code alone, so they remember the default-branch commit they last
   found nothing at.
-- `feedback` answers out of the forge's notification feed, so it remembers the
+- `respond` answers out of the forge's notification feed, so it remembers the
   newest unread thread it read. The feed doubles as the task's precondition: a
-  repository with nothing unread on it isn't drawn for `feedback` at all.
+  repository with nothing unread on it isn't drawn for `respond` at all.
 - `rebase` answers out of the bot's own open PRs, so it remembers the set of
   conflicting ones. That set is its precondition too — no conflicting PR of its
   own, no turn.

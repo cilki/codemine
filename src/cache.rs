@@ -5,7 +5,7 @@
 //! moves. (`audit` also asks the ecosystem's advisory database, which moves
 //! on its own; but it moves over days, and the alternative was the same
 //! repository audited twice at the same commit twelve minutes apart.)
-//! `feedback` reads the forge's notification feed, so its answer holds until
+//! `respond` reads the forge's notification feed, so its answer holds until
 //! a thread newer than the ones it already read arrives. `rebase` reads the
 //! forge's view of the bot's own open PRs, so its answer holds until one of
 //! those branches or the conflict set moves. `review` reads the forge's view
@@ -41,7 +41,7 @@ pub enum Basis {
     /// nothing else, so its answer holds until the code moves.
     Head,
     /// The newest unread thread on the repository's notification feed. This
-    /// is what `feedback` answers out of, and it needs remembering as much as
+    /// is what `respond` answers out of, and it needs remembering as much as
     /// the tree does: the feed is also the task's precondition probe, so one
     /// stale thread nobody marks read keeps the probe true forever. Gated
     /// tasks are probed first and the first with work wins the draw, so that
@@ -255,7 +255,7 @@ impl<'a> Probe<'a> {
             // A task that answers out of the feed has nothing to answer when
             // the repository has nothing unread, so its basis doubles as its
             // precondition. The feed is read once per forge for the memory's
-            // sake anyway, so probing `feedback` across the whole pool costs
+            // sake anyway, so probing `respond` across the whole pool costs
             // the one request it already made rather than one per repository.
             // Fail-open: an unreadable feed draws the task and at worst
             // skips again.
@@ -486,7 +486,7 @@ mod tests {
     }
 
     /// Each task is remembered against whatever it reads: the tree-only ones
-    /// against the tree, `feedback` against the notification feed, `rebase`
+    /// against the tree, `respond` against the notification feed, `rebase`
     /// against the bot's conflicting PRs, `review` against the PRs it is
     /// asked to review. The tasks that can become actionable with nothing
     /// observable moving keep no memory at all.
@@ -503,7 +503,7 @@ mod tests {
         for task in head {
             assert_eq!(basis(task), Some(Basis::Head), "{task}");
         }
-        assert_eq!(basis("feedback"), Some(Basis::Feed));
+        assert_eq!(basis("respond"), Some(Basis::Feed));
         assert_eq!(basis("rebase"), Some(Basis::Prs));
         assert_eq!(basis("review"), Some(Basis::Reviews));
         for task in unremembered {
@@ -513,7 +513,7 @@ mod tests {
         let declared: BTreeSet<&str> = head
             .into_iter()
             .chain(unremembered)
-            .chain(["feedback", "rebase", "review"])
+            .chain(["respond", "rebase", "review"])
             .collect();
         for task in &declared {
             assert!(crate::prompts::defines(task), "{task} is gone");
@@ -527,26 +527,26 @@ mod tests {
         }
     }
 
-    /// A `feedback` skip is keyed on the feed, not the tree: it stands while
+    /// A `respond` skip is keyed on the feed, not the tree: it stands while
     /// the feed sits still, and a thread newer than the one it answered for
     /// draws the task again. Without this one stale notification keeps the
-    /// precheck true and `feedback` — probed first, so first to win the draw
+    /// precheck true and `respond` — probed first, so first to win the draw
     /// — is drawn every single turn until somebody marks it read.
     #[test]
     fn a_feedback_skip_stands_until_a_newer_thread_arrives() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
         cache.remember(
-            "feedback",
+            "respond",
             ForgeKind::Github,
             "me/repo",
             "2026-10-01T02:00:00Z",
         );
 
         let unchanged = [("me/repo", "2026-10-01T02:00:00Z")];
-        assert!(feed_probe(&cache, &unchanged).remembered("feedback", "me/repo"));
+        assert!(feed_probe(&cache, &unchanged).remembered("respond", "me/repo"));
         let newer = [("me/repo", "2026-10-01T03:00:00Z")];
-        assert!(!feed_probe(&cache, &newer).remembered("feedback", "me/repo"));
+        assert!(!feed_probe(&cache, &newer).remembered("respond", "me/repo"));
     }
 
     /// A stamp moving backward is a thread being read or cleared rather than
@@ -556,13 +556,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
         cache.remember(
-            "feedback",
+            "respond",
             ForgeKind::Github,
             "me/repo",
             "2026-10-01T02:00:00Z",
         );
         let older = [("me/repo", "2026-10-01T01:00:00Z")];
-        assert!(feed_probe(&cache, &older).remembered("feedback", "me/repo"));
+        assert!(feed_probe(&cache, &older).remembered("respond", "me/repo"));
     }
 
     /// A feed with nothing on the repository fails open like an unreadable
@@ -573,17 +573,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
         cache.remember(
-            "feedback",
+            "respond",
             ForgeKind::Github,
             "me/repo",
             "2026-10-01T02:00:00Z",
         );
         let elsewhere = [("me/other", "2026-10-01T03:00:00Z")];
-        assert!(!feed_probe(&cache, &elsewhere).remembered("feedback", "me/repo"));
-        assert!(!feed_probe(&cache, &[]).remembered("feedback", "me/repo"));
+        assert!(!feed_probe(&cache, &elsewhere).remembered("respond", "me/repo"));
+        assert!(!feed_probe(&cache, &[]).remembered("respond", "me/repo"));
     }
 
-    /// `feedback`'s precondition is answered out of the same feed its memory
+    /// `respond`'s precondition is answered out of the same feed its memory
     /// is keyed on, with no mark involved: a repository with something unread
     /// is drawn, one with nothing on the feed is passed over, and a feed that
     /// couldn't be read fails open.
@@ -592,16 +592,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
         let feed = [("me/repo", "2026-10-01T02:00:00Z")];
-        assert!(feed_probe(&cache, &feed).actionable("feedback", "me/repo"));
-        assert!(!feed_probe(&cache, &feed).actionable("feedback", "me/other"));
-        assert!(!feed_probe(&cache, &[]).actionable("feedback", "me/repo"));
+        assert!(feed_probe(&cache, &feed).actionable("respond", "me/repo"));
+        assert!(!feed_probe(&cache, &feed).actionable("respond", "me/other"));
+        assert!(!feed_probe(&cache, &[]).actionable("respond", "me/repo"));
 
         let unreadable = Probe::new(&cache, &GITHUB);
         unreadable.unread.set(None).unwrap();
-        assert!(unreadable.actionable("feedback", "me/repo"));
+        assert!(unreadable.actionable("respond", "me/repo"));
     }
 
-    /// The memory outranks the precondition: a thread `feedback` has already
+    /// The memory outranks the precondition: a thread `respond` has already
     /// answered for keeps it out of the draw even though the feed still names
     /// the repository.
     #[test]
@@ -609,9 +609,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(&root);
         let stamp = "2026-10-01T02:00:00Z";
-        cache.remember("feedback", ForgeKind::Github, "me/repo", stamp);
+        cache.remember("respond", ForgeKind::Github, "me/repo", stamp);
         let probe = feed_probe(&cache, &[("me/repo", stamp)]);
-        assert!(!probe.actionable("feedback", "me/repo"));
+        assert!(!probe.actionable("respond", "me/repo"));
     }
 
     /// `rebase` is drawn only when the bot has an open conflicting PR, and

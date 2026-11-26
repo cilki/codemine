@@ -1,6 +1,6 @@
 //! Forge activity watching: a background thread polls the configured
 //! forge's account-wide feed and queues repositories with fresh activity, so
-//! a comment on a PR or issue gets a feedback turn, and a review request a
+//! a comment on a PR or issue gets a respond turn, and a review request a
 //! review turn, ahead of the random draw — immediately when the runner is
 //! between turns (the sleep cuts itself short), or as the very next turn
 //! when one is already running.
@@ -8,7 +8,7 @@
 //! Polling rather than webhooks on purpose: webhooks would need the runner
 //! to be reachable from the forge and a hook registered on every
 //! repository, while the feed is readable with the token the runner
-//! already holds. The feed is the same signal the feedback precheck reads,
+//! already holds. The feed is the same signal the respond precheck reads,
 //! and a queued repository is still put through each task's own precheck
 //! before it is drawn, so an event can never queue work a turn wouldn't
 //! have found.
@@ -29,12 +29,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The tasks fresh activity can lead to, in the order a queued repository is
 /// offered to them: a review request is `review`'s, a comment on the bot's
-/// own PR or an assignment is `feedback`'s. Both arrive
+/// own PR or an assignment is `respond`'s. Both arrive
 /// on the same feed, so the watcher can't tell which until the tasks' own
 /// prechecks do — and `review` asks first because its precheck is exact
-/// (the request set), where `feedback`'s is satisfied by any unread thread
+/// (the request set), where `respond`'s is satisfied by any unread thread
 /// and would claim a review request only to skip on it.
-pub const QUEUED_TASKS: [&str; 2] = ["review", "feedback"];
+pub const QUEUED_TASKS: [&str; 2] = ["review", "respond"];
 
 /// Work queued to jump the next draw: repositories with fresh forge
 /// activity, and the (task, repository) pairs the user asked to run now.
@@ -196,7 +196,7 @@ fn fresh(
 ///
 /// The single reading of "this repository has feedback waiting" in the
 /// runner: the watcher polls it for repositories to queue, and `cache::Probe`
-/// both gates `feedback` on it and remembers a skip against the stamp it
+/// both gates `respond` on it and remembers a skip against the stamp it
 /// answered for. A review request lands on the same feed, which is how
 /// `review` gets queued too; its own precheck then confirms the request.
 pub fn unread(forge: &Forge) -> Result<BTreeMap<String, String>> {
