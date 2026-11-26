@@ -156,20 +156,7 @@ pub struct ForgeSettings {
 #[serde(default)]
 pub struct RepoSettings {
     pub enabled: bool,
-    /// Read under the slugs the tasks go by now, so a pick made before a
-    /// task was renamed stays picked.
-    #[serde(deserialize_with = "current_slugs")]
     pub tasks: BTreeSet<String>,
-}
-
-fn current_slugs<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<BTreeSet<String>, D::Error> {
-    let slugs = BTreeSet::<String>::deserialize(deserializer)?;
-    Ok(slugs
-        .iter()
-        .map(|slug| crate::prompts::current_slug(slug).to_owned())
-        .collect())
 }
 
 impl ForgeSettings {
@@ -766,20 +753,6 @@ mod tests {
         );
         let back: Settings = serde_json::from_value(value).unwrap();
         assert_eq!(back.forge.repos, settings.forge.repos);
-    }
-
-    /// A config.json written while `respond` was called `feedback` keeps the
-    /// task picked, instead of dropping a pick the sweep command no longer
-    /// defines under that name.
-    #[test]
-    fn a_pick_made_under_a_tasks_old_name_stays_picked() {
-        let back: Settings = serde_json::from_value(serde_json::json!({
-            "forge": {"repos": {"owner/repo": {"enabled": true, "tasks": ["feedback", "docs"]}}}
-        }))
-        .unwrap();
-        let tasks = &back.forge.repos["owner/repo"].tasks;
-        assert_eq!(tasks.iter().collect::<Vec<_>>(), ["docs", "respond"]);
-        assert!(back.forge.runnable_repos()["owner/repo"].contains("respond"));
     }
 
     #[test]
