@@ -6,6 +6,7 @@
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use reqwest::Method;
 use tracing::{debug, info};
 
 use crate::cache::gated;
@@ -74,10 +75,23 @@ pub fn forge_json(
     github: &str,
     gitlab: &str,
 ) -> Result<serde_json::Value> {
+    let body = forge_call(forge, Method::GET, gitea, github, gitlab)?;
+    json(&body, forge.kind.name())
+}
+
+/// The body of one request against a forge's API, through whichever
+/// transport speaks it; only the forge's own path is used.
+fn forge_call(
+    forge: &Forge,
+    method: Method,
+    gitea: &str,
+    github: &str,
+    gitlab: &str,
+) -> Result<Vec<u8>> {
     match forge.kind {
-        ForgeKind::Gitea => gitea_json(forge, gitea),
-        ForgeKind::Github => api_json(forge, "gh", github),
-        ForgeKind::Gitlab => api_json(forge, "glab", gitlab),
+        ForgeKind::Gitea => gitea_call(forge, method, gitea),
+        ForgeKind::Github => api_call(forge, "gh", method, github),
+        ForgeKind::Gitlab => api_call(forge, "glab", method, gitlab),
     }
 }
 
@@ -330,17 +344,14 @@ pub fn delete_head_branch(
         return Ok(Some("it lives in a fork".into()));
     }
     let name = segment(&head.branch, true);
-    let branch = forge_json(
-        forge,
-        &format!("repos/{repo}/branches/{name}"),
-        &format!("repos/{repo}/branches/{name}"),
-        &format!(
-            "projects/{}/repository/branches/{}",
-            project(repo),
-            segment(&head.branch, false)
-        ),
-    )
-    .context("failed to look the branch up (already deleted?)")?;
+    let branch_path = format!("repos/{repo}/branches/{name}");
+    let gitlab_path = format!(
+        "projects/{}/repository/branches/{}",
+        project(repo),
+        segment(&head.branch, false)
+    );
+    let branch = forge_json(forge, &branch_path, &branch_path, &gitlab_path)
+        .context("failed to look the branch up (already deleted?)")?;
     let meta = forge_json(
         forge,
         &format!("repos/{repo}"),
@@ -351,31 +362,14 @@ pub fn delete_head_branch(
     if let Some(why) = keep_branch(head, &branch, meta["default_branch"].as_str(), &open) {
         return Ok(Some(why));
     }
-    match forge.kind {
-        ForgeKind::Gitea => {
-            let url = format!("{}/api/v1/repos/{repo}/branches/{name}", forge.url);
-            let auth = format!("token {}", forge.token);
-            let (status, body) = crate::http::delete(
-                &url,
-                Some(("Authorization", auth.as_str())),
-                API_TIMEOUT_SECS,
-            )?;
-            if !(200..300).contains(&status) {
-                bail!("the gitea api answered HTTP {status} for {url}: {body}");
-            }
-        }
-        ForgeKind::Github => {
-            api_delete(forge, "gh", &format!("repos/{repo}/git/refs/heads/{name}"))?;
-        }
-        ForgeKind::Gitlab => {
-            let path = format!(
-                "projects/{}/repository/branches/{}",
-                project(repo),
-                segment(&head.branch, false)
-            );
-            api_delete(forge, "glab", &path)?;
-        }
-    }
+    // Every forge answers 204 with no body, so there is nothing to parse.
+    forge_call(
+        forge,
+        Method::DELETE,
+        &branch_path,
+        &format!("repos/{repo}/git/refs/heads/{name}"),
+        &gitlab_path,
+    )?;
     Ok(None)
 }
 
@@ -444,23 +438,24 @@ fn segment(name: &str, keep_slashes: bool) -> String {
     out
 }
 
-/// One DELETE via the gh/glab `api` subcommand. Both answer 204 with no
-/// body, so there is nothing to parse; a refusal is a failed exit.
-fn api_delete(forge: &Forge, program: &str, path: &str) -> Result<()> {
+/// One request via the gh/glab `api` subcommand, which share the same
+/// shape; a refusal is a failed exit.
+fn api_call(forge: &Forge, program: &str, method: Method, path: &str) -> Result<Vec<u8>> {
     crate::child::output(
         Command::new(program)
-            .args(["api", "-X", "DELETE", path])
+            .args(["api", "-X", method.as_str(), path])
             .envs(forge.env()),
-    )?;
-    Ok(())
+    )
 }
 
 /// One GET via the gh/glab `api` subcommand, parsed as JSON. Unlike
 /// `turn::list_rows` there is no pagination: one page decides the answer.
-pub fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Value> {
-    let stdout = crate::child::output(Command::new(program).args(["api", path]).envs(forge.env()))?;
-    serde_json::from_slice(&stdout)
-        .with_context(|| format!("{program} api returned unexpected output"))
+fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::Value> {
+    json(&api_call(forge, program, Method::GET, path)?, program)
+}
+
+fn json(body: &[u8], from: &str) -> Result<serde_json::Value> {
+    serde_json::from_slice(body).with_context(|| format!("{from} api returned unexpected output"))
 }
 
 /// How long one Gitea API request may take. Without a cap a forge that
@@ -469,20 +464,21 @@ pub fn api_json(forge: &Forge, program: &str, path: &str) -> Result<serde_json::
 /// runner would stop taking turns at all.
 const API_TIMEOUT_SECS: u64 = 30;
 
-/// One GET against the Gitea API; `tea` has no generic api subcommand, so it
-/// goes over HTTP directly like the proxy's management calls do.
-pub fn gitea_json(forge: &Forge, path: &str) -> Result<serde_json::Value> {
+/// One request against the Gitea API; `tea` has no generic api subcommand,
+/// so it goes over HTTP directly like the proxy's management calls do.
+fn gitea_call(forge: &Forge, method: Method, path: &str) -> Result<Vec<u8>> {
     let url = format!("{}/api/v1/{path}", forge.url);
     let auth = format!("token {}", forge.token);
-    let (status, body) = crate::http::get(
+    let (status, body) = crate::http::send(
+        method,
         &url,
         Some(("Authorization", auth.as_str())),
         API_TIMEOUT_SECS,
     )?;
     if !(200..300).contains(&status) {
-        bail!("the gitea api answered HTTP {status} for {url}");
+        bail!("the gitea api answered HTTP {status} for {url}: {body}");
     }
-    serde_json::from_str(&body).context("gitea api returned unexpected output")
+    Ok(body.into_bytes())
 }
 
 /// Whether the PR or issue was authored by `login`, under either forge
