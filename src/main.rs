@@ -6,6 +6,7 @@
 
 mod cache;
 mod child;
+mod commands;
 mod config;
 mod deliveries;
 mod emblem;
@@ -205,6 +206,7 @@ fn main() -> Result<()> {
                 kind: cfg.forge.kind,
                 repo,
                 task,
+                focus: None,
             });
         }
 

@@ -76,6 +76,8 @@ struct Turn<'a> {
     task: &'a str,
     forge: &'a Forge,
     repo: &'a str,
+    /// What the forge comment that asked for this turn wants it to look at.
+    focus: Option<crate::events::Focus>,
     /// The repository's persistent clone: the agent's working directory.
     dir: PathBuf,
     /// What earlier turns of the task on the repository left for this one,
@@ -205,7 +207,7 @@ pub fn run(
         |task, repo| probe.has_work(task, repo),
         |task, repo| probe.actionable(task, repo),
     );
-    let Some((task, repo)) = picked else {
+    let Some((task, repo, focus)) = picked else {
         return Ok(Report::Idle(Idle::NothingToDo));
     };
 
@@ -215,6 +217,7 @@ pub fn run(
         task,
         forge,
         repo,
+        focus,
         dir: workspace::repo_dir(&cfg.workspace, forge.kind.name(), repo),
         notes: workspace::notes_path(&cfg.workspace, forge.kind.name(), repo, task),
         log_path,
@@ -341,7 +344,8 @@ fn pool(forge: &Forge) -> Result<Vec<String>> {
 /// repository — only `ready`, the task's precondition, has to hold, so a
 /// `rebase` with no conflicting PR still isn't spent on. A request for a
 /// repository outside the pool is dropped with a warning, as is one whose
-/// precondition fails.
+/// precondition fails. A request that came from a forge comment carries what
+/// the comment asked the turn to look at, which comes back with the pair.
 ///
 /// Fresh forge activity comes next: the watcher saw a comment or a
 /// review request land, so that repository gets a respond or review turn
@@ -361,12 +365,14 @@ fn pick<'a>(
     draw: Draw,
     ready: impl Fn(&str, &str) -> bool,
     check: impl Fn(&str, &str) -> bool,
-) -> Option<(&'a str, &'a str)> {
+) -> Option<(&'a str, &'a str, Option<crate::events::Focus>)> {
     while let Some(request) = pending.pop_request() {
         if request.kind != forge.kind {
             continue;
         }
-        let crate::events::Request { task, repo, .. } = request;
+        let crate::events::Request {
+            task, repo, focus, ..
+        } = request;
         let Some(repo) = pool.iter().find(|name| **name == repo) else {
             warn!(
                 "run now: {repo} is not an enabled repository {} lists; dropping {task} on it",
@@ -378,8 +384,14 @@ fn pick<'a>(
             warn!("run now: {task} has nothing to act on in {repo}; dropping the request");
             continue;
         }
-        info!("run now: {task} on {repo}, as asked");
-        return Some((task, repo));
+        match &focus {
+            Some(focus) => info!(
+                "run now: {task} on {repo}, as @{} asked in {}",
+                focus.author, focus.url
+            ),
+            None => info!("run now: {task} on {repo}, as asked"),
+        }
+        return Some((task, repo, focus));
     }
     while let Some((kind, repo)) = pending.pop() {
         if kind != forge.kind {
@@ -391,12 +403,12 @@ fn pick<'a>(
         for task in crate::events::QUEUED_TASKS {
             if forge.runs(task, repo) && check(task, repo) {
                 info!("fresh activity on {repo}; drawing {task} on it first");
-                return Some((task, repo));
+                return Some((task, repo, None));
             }
         }
     }
     match draw {
-        Draw::Any => precheck::draw(forge, pool, check),
+        Draw::Any => precheck::draw(forge, pool, check).map(|(task, repo)| (task, repo, None)),
         Draw::QueuedOnly => None,
     }
 }
@@ -463,6 +475,7 @@ fn spawn_agent(
             &turn.dir,
             &turn.notes,
             crate::workspace::codegraph_available(),
+            turn.focus.as_ref(),
         ))
         // Own process group, so the timeout can take down the whole tree.
         .process_group(0)
@@ -791,7 +804,7 @@ mod tests {
             let pending = Pending::new();
             pending.push(ForgeKind::Github, "me/two".into());
             let picked = pick(&forge, &pool, &pending, draw, |_, _| true, |_, _| true);
-            assert_eq!(picked, Some(("review", "me/two")), "{draw:?}");
+            assert_eq!(picked, Some(("review", "me/two", None)), "{draw:?}");
             assert!(pending.is_empty());
         }
     }
@@ -853,7 +866,7 @@ mod tests {
                 !queued_only(task, repo)
             },
         );
-        assert_eq!(picked, Some(("rebase", "me/repo")));
+        assert_eq!(picked, Some(("rebase", "me/repo", None)));
         assert!(seen.borrow().iter().any(|task| task == "rebase"));
     }
 
@@ -882,6 +895,7 @@ mod tests {
             kind: ForgeKind::Github,
             repo: repo.into(),
             task,
+            focus: None,
         }
     }
 
@@ -896,11 +910,37 @@ mod tests {
             pending.push(ForgeKind::Github, "me/one".into());
             pending.request(request("me/two", "docs"));
             let picked = pick(&forge, &pool, &pending, draw, |_, _| true, |_, _| false);
-            assert_eq!(picked, Some(("docs", "me/two")), "{draw:?}");
+            assert_eq!(picked, Some(("docs", "me/two", None)), "{draw:?}");
             // The activity is still queued for the turn after.
             assert!(!pending.is_empty());
             assert_eq!(pending.pop(), Some((ForgeKind::Github, "me/one".into())));
         }
+    }
+
+    /// A request from a forge comment hands its focus on with the pair, so
+    /// the turn's prompt can say what was asked.
+    #[test]
+    fn a_requested_pair_carries_its_focus() {
+        let (forge, pool) = Forge::sweep(&["me/repo"], &["review"]);
+        let pending = Pending::new();
+        let focus = crate::events::Focus {
+            author: "me".into(),
+            url: "https://example.com/me/repo/issues/1#issuecomment-2".into(),
+            text: "the port".into(),
+        };
+        pending.request(crate::events::Request {
+            focus: Some(focus.clone()),
+            ..request("me/repo", "docs")
+        });
+        let picked = pick(
+            &forge,
+            &pool,
+            &pending,
+            Draw::Any,
+            |_, _| true,
+            |_, _| false,
+        );
+        assert_eq!(picked, Some(("docs", "me/repo", Some(focus))));
     }
 
     /// A request is still held to its task's precondition, and one that
@@ -921,7 +961,7 @@ mod tests {
         let picked = pick(&forge, &pool, &pending, Draw::QueuedOnly, ready, |_, _| {
             true
         });
-        assert_eq!(picked, Some(("review", "me/repo")));
+        assert_eq!(picked, Some(("review", "me/repo", None)));
         assert!(pending.is_empty());
     }
 

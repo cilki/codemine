@@ -353,6 +353,10 @@
           <input id="s-schedule-end" type="time" aria-label="window closes">
         </div>
       </div>
+      <div class="field" title="A comment that opens a line with @bot followed by a task's name (@bot docs — what to look at) queues that task on the comment's repository, like run now. Only comments from accounts with write access to the repository are taken, so anyone who can push can spend turns.">
+        <label class="check" for="s-forge-commands"><input type="checkbox" id="s-forge-commands">
+          Accept commands from the forge</label>
+      </div>
     </div>
     <div class="forge" id="proxy-card">
       <div class="forge-head">
@@ -1286,6 +1290,7 @@
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     renderSchedule(s.schedule);
     renderSigning(s);
+    $("s-forge-commands").checked = !!s.forge_commands;
     const f = s.forge;
     renderForgeKind(f.kind);
     const token = $("f-token");
@@ -1362,6 +1367,7 @@
         start_minute: toMinutes($("s-schedule-start").value),
         end_minute: toMinutes($("s-schedule-end").value),
       },
+      forge_commands: $("s-forge-commands").checked,
       forge: {
         kind: $("f-kind").value,
         // Empty means "keep the stored token"; the server never sends it

@@ -45,6 +45,10 @@ pub struct Settings {
     /// forge account, GitHub shows each signed commit as *Unverified*, which
     /// reads worse than no signature at all.
     pub sign_commits: bool,
+    /// Whether a comment that opens with `@<bot> <task>` queues that task on
+    /// the comment's repository, the way **run now** does. Off by default:
+    /// turning it on lets anyone with write access spend turns.
+    pub forge_commands: bool,
 }
 
 impl Default for Settings {
@@ -58,6 +62,7 @@ impl Default for Settings {
             turn_timeout_secs: 21600,
             schedule: Schedule::default(),
             sign_commits: false,
+            forge_commands: false,
         }
     }
 }

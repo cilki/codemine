@@ -75,24 +75,27 @@ pub fn forge_json(
     github: &str,
     gitlab: &str,
 ) -> Result<serde_json::Value> {
-    let body = forge_call(forge, Method::GET, gitea, github, gitlab)?;
+    let body = forge_call(forge, Method::GET, gitea, github, gitlab, &[])?;
     serde_json::from_slice(&body)
         .with_context(|| format!("{} api returned unexpected output", forge.kind.name()))
 }
 
 /// The body of one request against a forge's API, through whichever
-/// transport speaks it; only the forge's own path is used.
-fn forge_call(
+/// transport speaks it; only the forge's own path is used. `fields` are the
+/// request's string parameters: a JSON object on Gitea, `-f` fields to gh
+/// and glab.
+pub fn forge_call(
     forge: &Forge,
     method: Method,
     gitea: &str,
     github: &str,
     gitlab: &str,
+    fields: &[(&str, &str)],
 ) -> Result<Vec<u8>> {
     match forge.kind {
-        ForgeKind::Gitea => gitea_call(forge, method, gitea),
-        ForgeKind::Github => api_call(forge, "gh", method, github),
-        ForgeKind::Gitlab => api_call(forge, "glab", method, gitlab),
+        ForgeKind::Gitea => gitea_call(forge, method, gitea, fields),
+        ForgeKind::Github => api_call(forge, "gh", method, github, fields),
+        ForgeKind::Gitlab => api_call(forge, "glab", method, gitlab, fields),
     }
 }
 
@@ -112,7 +115,7 @@ pub fn forge_rows(
 }
 
 /// GitLab identifies a project by its URL-encoded path.
-fn project(repo: &str) -> String {
+pub fn project(repo: &str) -> String {
     crate::http::encode(repo, false)
 }
 
@@ -380,6 +383,7 @@ pub fn delete_head_branch(
         &branch_path,
         &format!("repos/{repo}/git/refs/heads/{name}"),
         &gitlab_path,
+        &[],
     )?;
     Ok(None)
 }
@@ -431,12 +435,19 @@ fn keep_branch(
 
 /// One request via the gh/glab `api` subcommand, which share the same
 /// shape; a refusal is a failed exit.
-fn api_call(forge: &Forge, program: &str, method: Method, path: &str) -> Result<Vec<u8>> {
-    crate::child::output(
-        Command::new(program)
-            .args(["api", "-X", method.as_str(), path])
-            .envs(forge.env()),
-    )
+fn api_call(
+    forge: &Forge,
+    program: &str,
+    method: Method,
+    path: &str,
+    fields: &[(&str, &str)],
+) -> Result<Vec<u8>> {
+    let mut command = Command::new(program);
+    command.args(["api", "-X", method.as_str(), path]);
+    for (key, value) in fields {
+        command.arg("-f").arg(format!("{key}={value}"));
+    }
+    crate::child::output(command.envs(forge.env()))
 }
 
 /// How long one Gitea API request may take. Without a cap a forge that
@@ -447,13 +458,26 @@ const API_TIMEOUT_SECS: u64 = 30;
 
 /// One request against the Gitea API; `tea` has no generic api subcommand,
 /// so it goes over HTTP directly like the proxy's management calls do.
-fn gitea_call(forge: &Forge, method: Method, path: &str) -> Result<Vec<u8>> {
+fn gitea_call(
+    forge: &Forge,
+    method: Method,
+    path: &str,
+    fields: &[(&str, &str)],
+) -> Result<Vec<u8>> {
     let url = format!("{}/api/v1/{path}", forge.url);
     let auth = format!("token {}", forge.token);
+    let payload = (!fields.is_empty()).then(|| {
+        let object = fields
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), serde_json::Value::from(*value)))
+            .collect();
+        serde_json::Value::Object(object)
+    });
     let (status, body) = crate::http::send(
         method,
         &url,
         Some(("Authorization", auth.as_str())),
+        payload.as_ref(),
         API_TIMEOUT_SECS,
     )?;
     if !(200..300).contains(&status) {

@@ -94,7 +94,10 @@ fn edit_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) -> Result<(
 /// agent has to read past.
 ///
 /// Replaced in a single pass, so a value that itself contains `$2` and the
-/// like is inserted as it is rather than expanded again.
+/// like is inserted as it is rather than expanded again. A turn a forge
+/// comment asked for gets a closing section quoting it (see
+/// [`focus_section`]), added after the replacement so nothing in the comment
+/// is expanded either.
 pub fn sweep_prompt(
     task: &str,
     repo: &str,
@@ -102,6 +105,7 @@ pub fn sweep_prompt(
     dir: &Path,
     notes: &Path,
     codegraph: bool,
+    focus: Option<&crate::events::Focus>,
 ) -> String {
     let source = sweep().rendered.as_str();
     let dir = dir.display().to_string();
@@ -130,7 +134,41 @@ pub fn sweep_prompt(
         }
     }
     prompt.push_str(rest);
+    if let Some(focus) = focus {
+        prompt.push_str(&focus_section(focus));
+    }
     prompt
+}
+
+/// The section that tells a turn a forge comment asked for it: who asked,
+/// where, and what they wrote, quoted line by line so the comment reads as
+/// the user's words rather than as more of the prompt.
+fn focus_section(focus: &crate::events::Focus) -> String {
+    let mut section = format!(
+        "\n# Requested on the forge\n\n\
+         @{} asked for this turn in {}.\n",
+        focus.author, focus.url
+    );
+    if focus.text.is_empty() {
+        section.push_str(
+            "\nThey gave no further detail, so choose your target as usual. Reference\n\
+             the issue or pull request they asked in from whatever you open.\n",
+        );
+        return section;
+    }
+    section.push_str("Their request, as they wrote it:\n\n");
+    for line in focus.text.lines() {
+        section.push_str(if line.is_empty() { ">" } else { "> " });
+        section.push_str(line);
+        section.push('\n');
+    }
+    section.push_str(
+        "\nWork on that rather than choosing your own target, within the task's\n\
+         rules. Reference the issue or pull request they asked in from whatever you\n\
+         open. If the request doesn't apply to this task or repository, say so in a\n\
+         comment there instead of skipping silently.\n",
+    );
+    section
 }
 
 /// The sweep command with its `<!-- codegraph -->` … `<!-- /codegraph -->`
@@ -804,6 +842,7 @@ mod tests {
             Path::new("/work/some dir/repo"),
             Path::new("/work/notes/gitea/cilki/$2-repo/rebase.md"),
             true,
+            None,
         );
         // No front matter: opencode would take it as part of the message.
         assert!(
@@ -833,6 +872,58 @@ mod tests {
         assert!(prompt.ends_with("rediscovering this.\n"));
     }
 
+    /// A turn a forge comment asked for ends on that comment, quoted as it
+    /// was written — placeholders included, which are not expanded.
+    #[test]
+    fn sweep_prompt_quotes_the_comment_that_asked_for_the_turn() {
+        let focus = crate::events::Focus {
+            author: "cilki".into(),
+            url: "https://git.example.com/cilki/repo/issues/3#issuecomment-9".into(),
+            text: "the README says $1\n\nand port 3000".into(),
+        };
+        let notes = Path::new("/n/docs.md");
+        let plain = sweep_prompt(
+            "docs",
+            "me/repo",
+            "gitea",
+            Path::new("/r"),
+            notes,
+            true,
+            None,
+        );
+        let asked = sweep_prompt(
+            "docs",
+            "me/repo",
+            "gitea",
+            Path::new("/r"),
+            notes,
+            true,
+            Some(&focus),
+        );
+        let section = asked.strip_prefix(plain.as_str()).expect("appended");
+        assert!(section.contains(
+            "@cilki asked for this turn in https://git.example.com/cilki/repo/issues/3#issuecomment-9."
+        ));
+        assert!(section.contains("> the README says $1\n>\n> and port 3000\n"));
+        assert!(section.contains("rather than choosing your own target"));
+
+        let bare = crate::events::Focus {
+            text: String::new(),
+            ..focus
+        };
+        let asked = sweep_prompt(
+            "docs",
+            "me/repo",
+            "gitea",
+            Path::new("/r"),
+            notes,
+            true,
+            Some(&bare),
+        );
+        assert!(asked.contains("no further detail"));
+        assert!(!asked.contains("\n> "));
+    }
+
     /// The codegraph paragraph is in the prompt exactly when the tool is:
     /// recommending `codegraph_explore` to a session that has no such tool
     /// is a paragraph the agent has to read past. The markers themselves
@@ -841,8 +932,24 @@ mod tests {
     #[test]
     fn sweep_prompt_recommends_codegraph_only_when_it_is_there() {
         let notes = Path::new("/n/docs.md");
-        let with = sweep_prompt("docs", "me/repo", "gitea", Path::new("/r"), notes, true);
-        let without = sweep_prompt("docs", "me/repo", "gitea", Path::new("/r"), notes, false);
+        let with = sweep_prompt(
+            "docs",
+            "me/repo",
+            "gitea",
+            Path::new("/r"),
+            notes,
+            true,
+            None,
+        );
+        let without = sweep_prompt(
+            "docs",
+            "me/repo",
+            "gitea",
+            Path::new("/r"),
+            notes,
+            false,
+            None,
+        );
         assert!(with.contains("Prefer the `codegraph_explore` tool"), "{with}");
         assert!(!without.contains("codegraph"), "{without}");
         for prompt in [&with, &without] {

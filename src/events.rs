@@ -12,6 +12,9 @@
 //! and a queued repository is still put through each task's own precheck
 //! before it is drawn, so an event can never queue work a turn wouldn't
 //! have found.
+//!
+//! With forge commands on, the same feed is also read for comments that ask
+//! the bot for a task by name; see `commands`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -62,6 +65,20 @@ pub struct Request {
     pub kind: ForgeKind,
     pub repo: String,
     pub task: &'static str,
+    /// What the user wants the turn to look at, when the request came from a
+    /// comment on the forge rather than from the web UI. Part of the
+    /// request's identity, so two different asks for the same pair both run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<Focus>,
+}
+
+/// The comment a forge command came from: who wrote it, where, and what it
+/// asked the turn to look at.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Focus {
+    pub author: String,
+    pub url: String,
+    pub text: String,
 }
 
 pub type SharedPending = Arc<Pending>;
@@ -129,30 +146,29 @@ fn watch(store: SharedSettings, pending: SharedPending) -> ! {
     // the poll is currently failing, so a persistent failure logs once
     // instead of every minute.
     let mut seen: BTreeMap<(ForgeKind, String), String> = BTreeMap::new();
+    // The same, per notification thread, for forge commands.
+    let mut threads: BTreeMap<String, String> = BTreeMap::new();
     let mut failing = false;
     loop {
         std::thread::sleep(POLL_INTERVAL);
         let (settings, _) = store.snapshot();
-        let Some(forge) = settings.runtime_forge() else {
+        let Some(mut forge) = settings.runtime_forge() else {
             continue;
         };
         // Activity only ever leads to the queued tasks' turns; with none of
         // them on for any repository there is nothing to queue. The turn
         // checks the repository's own picks again when it pops the entry.
-        if !QUEUED_TASKS.iter().any(|task| forge.runs_anywhere(task)) {
+        let queue_activity = QUEUED_TASKS.iter().any(|task| forge.runs_anywhere(task));
+        if !queue_activity && !settings.forge_commands {
             continue;
         }
         let kind = forge.kind;
-        let current: BTreeMap<(ForgeKind, String), String> = match unread(&forge) {
-            Ok(repos) => {
+        let mut feed = match feed(&forge) {
+            Ok(feed) => {
                 if std::mem::replace(&mut failing, false) {
                     info!("polling {} activity works again", kind.name());
                 }
-                repos
-                    .into_iter()
-                    .filter(|(repo, _)| forge.repos.contains_key(repo))
-                    .map(|(repo, stamp)| ((kind, repo), stamp))
-                    .collect()
+                feed
             }
             Err(err) => {
                 if !std::mem::replace(&mut failing, true) {
@@ -163,6 +179,19 @@ fn watch(store: SharedSettings, pending: SharedPending) -> ! {
                 continue;
             }
         };
+        // Commands first: a thread that carried one is cleared and taken off
+        // the feed, so it doesn't also queue its repository for feedback.
+        if settings.forge_commands {
+            crate::commands::take(&mut forge, &mut feed, &mut threads, &pending);
+        }
+        if !queue_activity {
+            continue;
+        }
+        let current: BTreeMap<(ForgeKind, String), String> = digest(kind, &feed)
+            .into_iter()
+            .filter(|(repo, _)| forge.repos.contains_key(repo))
+            .map(|(repo, stamp)| ((kind, repo), stamp))
+            .collect();
         for (kind, repo) in fresh(&seen, &current) {
             info!(
                 "activity on {} {repo}; queueing it for the next draw",
@@ -200,33 +229,48 @@ fn fresh(
 /// answered for. A review request lands on the same feed, which is how
 /// `review` gets queued too; its own precheck then confirms the request.
 pub fn unread(forge: &Forge) -> Result<BTreeMap<String, String>> {
-    let feed = crate::precheck::forge_json(forge, "notifications", "notifications", "todos")?;
-    Ok(match forge.kind {
-        ForgeKind::Gitlab => digest(&feed, &["project", "path_with_namespace"], "created_at"),
-        _ => digest(&feed, &["repository", "full_name"], "updated_at"),
-    })
+    Ok(digest(forge.kind, &feed(forge)?))
+}
+
+/// The forge's unread feed as it answers it: notification threads on Gitea
+/// and GitHub, pending todos on GitLab.
+fn feed(forge: &Forge) -> Result<serde_json::Value> {
+    crate::precheck::forge_json(forge, "notifications", "notifications", "todos")
 }
 
 /// Fold a feed into repository → newest stamp. The stamps are RFC 3339
 /// strings from one server and only ever compared to each other, so string
 /// order is time order; they are never parsed.
-fn digest(
-    feed: &serde_json::Value,
-    repo_path: &[&str; 2],
-    stamp_key: &str,
-) -> BTreeMap<String, String> {
+fn digest(kind: ForgeKind, feed: &serde_json::Value) -> BTreeMap<String, String> {
     let mut repos = BTreeMap::new();
     for item in feed.as_array().map(Vec::as_slice).unwrap_or_default() {
-        let Some(repo) = item[repo_path[0]][repo_path[1]].as_str() else {
+        let Some(repo) = repo_of(kind, item) else {
             continue;
         };
-        let stamp = item[stamp_key].as_str().unwrap_or_default();
+        let stamp = stamp(kind, item);
         let newest = repos.entry(repo.to_owned()).or_insert_with(String::new);
         if stamp > newest.as_str() {
             *newest = stamp.to_owned();
         }
     }
     repos
+}
+
+/// A feed entry's repository, under its forge's spelling.
+pub fn repo_of(kind: ForgeKind, entry: &serde_json::Value) -> Option<&str> {
+    match kind {
+        ForgeKind::Gitlab => entry["project"]["path_with_namespace"].as_str(),
+        _ => entry["repository"]["full_name"].as_str(),
+    }
+}
+
+/// A feed entry's stamp, under its forge's spelling.
+pub fn stamp(kind: ForgeKind, entry: &serde_json::Value) -> &str {
+    let key = match kind {
+        ForgeKind::Gitlab => "created_at",
+        _ => "updated_at",
+    };
+    entry[key].as_str().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -256,6 +300,7 @@ mod tests {
             kind: ForgeKind::Github,
             repo: "me/a".into(),
             task,
+            focus: None,
         };
         pending.request(request("docs"));
         pending.request(request("docs"));
@@ -266,6 +311,20 @@ mod tests {
         assert_eq!(pending.pop_request(), Some(request("docs")));
         assert_eq!(pending.pop_request(), Some(request("bump")));
         assert!(pending.is_empty());
+
+        // Two different comments asking for the same pair both run.
+        let asked = |url: &str| Request {
+            focus: Some(Focus {
+                author: "me".into(),
+                url: url.into(),
+                text: String::new(),
+            }),
+            ..request("docs")
+        };
+        pending.request(asked("#1"));
+        pending.request(asked("#2"));
+        pending.request(asked("#1"));
+        assert_eq!(pending.requests(), [asked("#1"), asked("#2")]);
     }
 
     #[test]
@@ -276,18 +335,18 @@ mod tests {
             {"repository": {"full_name": "me/b"}, "updated_at": "2026-09-26T00:00:00Z"},
             {"unrelated": true},
         ]);
-        let repos = digest(&feed, &["repository", "full_name"], "updated_at");
+        let repos = digest(ForgeKind::Gitea, &feed);
         assert_eq!(repos.len(), 2);
         assert_eq!(repos["me/a"], "2026-09-27T12:00:00Z");
         assert_eq!(repos["me/b"], "2026-09-26T00:00:00Z");
 
         let todos = json!([{"project": {"path_with_namespace": "me/c"}, "created_at": "2026-09-27T09:00:00Z"}]);
-        let repos = digest(&todos, &["project", "path_with_namespace"], "created_at");
+        let repos = digest(ForgeKind::Gitlab, &todos);
         assert_eq!(repos["me/c"], "2026-09-27T09:00:00Z");
 
         // An error payload instead of an array digests to nothing.
         let bad = json!({"message": "bad credentials"});
-        assert!(digest(&bad, &["repository", "full_name"], "updated_at").is_empty());
+        assert!(digest(ForgeKind::Github, &bad).is_empty());
     }
 
     #[test]

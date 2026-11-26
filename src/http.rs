@@ -17,15 +17,16 @@ use reqwest::header::HeaderValue;
 /// is a status, not an error, so callers can tell "the forge said 404" from
 /// "the forge never answered".
 pub fn get(url: &str, header: Option<(&str, &str)>, timeout_secs: u64) -> Result<(u16, String)> {
-    send(reqwest::Method::GET, url, header, timeout_secs)
+    send(reqwest::Method::GET, url, header, None, timeout_secs)
 }
 
-/// Send `method` to `url`, the same way [`get`] asks: an error status is a
-/// status.
+/// Send `method` to `url`, with `body` as its JSON payload if there is one,
+/// the same way [`get`] asks: an error status is a status.
 pub fn send(
     method: reqwest::Method,
     url: &str,
     header: Option<(&str, &str)>,
+    body: Option<&serde_json::Value>,
     timeout_secs: u64,
 ) -> Result<(u16, String)> {
     let mut request = client()?
@@ -33,6 +34,11 @@ pub fn send(
         .timeout(Duration::from_secs(timeout_secs));
     if let Some((name, value)) = header {
         request = request.header(name, secret(name, value)?);
+    }
+    if let Some(body) = body {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
     }
     let response = request
         .send()

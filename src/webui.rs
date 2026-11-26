@@ -637,6 +637,7 @@ async fn api_post_run(State(state): State<AppState>, Json(incoming): Json<RunNow
         kind: forge.kind,
         repo: incoming.repo,
         task: &task.slug,
+        focus: None,
     });
     // Nothing on the status moved, but the page's view of the queue did:
     // wake the event stream rather than leave it to the next tick.
@@ -1208,6 +1209,7 @@ mod tests {
             kind: crate::config::ForgeKind::Github,
             repo: "me/repo".into(),
             task: "docs",
+            focus: None,
         };
         assert_eq!(pending.requests(), [queued]);
         let value = body_json(&request(addr, "GET", "/api/status", ""));

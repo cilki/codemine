@@ -158,6 +158,23 @@ From the command line, `codemine --once --task docs --repo owner/name` runs
 exactly that turn and exits, which makes a change to a prompt or a skill easy
 to reproduce.
 
+With **Accept commands from the forge** ticked in the settings, you can also
+ask from an issue or PR comment, by starting a line with the bot's account and
+a task:
+
+    @codemine docs — the "Getting started" section still says port 3000
+    @codemine bump
+
+That queues the task on the comment's repository just like **run now**, and
+whatever follows the task's name (on that line and the lines after it) is passed
+to the turn as what to look at, together with a link back to the comment. The
+bot reacts with 👀 and marks the notification read once it has queued the
+turn. Only comments from accounts with write access to the repository are
+taken. The bot's own comments, quoted lines and code blocks are never read as
+commands, and a mention followed by anything that isn't a task's name is left
+for `feedback` as ordinary conversation. Commands arrive on the same
+notification feed the runner polls once a minute.
+
 #### Forge support
 
 **codemine** works with Gitea, GitHub, or GitLab — one at a time. Pick the forge,
