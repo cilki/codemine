@@ -19,6 +19,7 @@ mod opencode;
 mod precheck;
 mod prompts;
 mod proxy;
+mod receipt;
 mod savings;
 mod scan;
 mod schedule;

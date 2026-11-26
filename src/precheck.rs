@@ -110,7 +110,10 @@ pub fn forge_rows(
 ) -> Result<Vec<serde_json::Value>> {
     match forge_json(forge, gitea, github, gitlab)? {
         serde_json::Value::Array(rows) => Ok(rows),
-        _ => bail!("{} returned something other than a listing", forge.kind.name()),
+        _ => bail!(
+            "{} returned something other than a listing",
+            forge.kind.name()
+        ),
     }
 }
 
@@ -188,7 +191,9 @@ pub fn open_prs(forge: &Forge, repo: &str) -> Result<Vec<serde_json::Value>> {
 /// How many of the PRs on the page [`open_prs`] fetched are the bot's own,
 /// which is what the open-PR budget is measured in.
 pub fn own_prs(forge: &Forge, open: &[serde_json::Value]) -> usize {
-    open.iter().filter(|pr| authored_by(pr, &forge.login)).count()
+    open.iter()
+        .filter(|pr| authored_by(pr, &forge.login))
+        .count()
 }
 
 /// The bot's open PRs that conflict with their base branch, as sorted
@@ -337,6 +342,32 @@ pub fn delivery_state(
             crate::deliveries::Kind::Issue => None,
         },
     })
+}
+
+/// Leave `body` as a comment on one of the repository's PRs or issues. Gitea
+/// and GitHub comment on both through the issue endpoint; GitLab keeps notes
+/// on merge requests and issues apart, and numbers them apart too.
+pub fn comment(
+    forge: &Forge,
+    repo: &str,
+    kind: crate::deliveries::Kind,
+    number: u64,
+    body: &str,
+) -> Result<()> {
+    let listing = match kind {
+        crate::deliveries::Kind::Pr => "merge_requests",
+        crate::deliveries::Kind::Issue => "issues",
+    };
+    let path = format!("repos/{repo}/issues/{number}/comments");
+    forge_call(
+        forge,
+        Method::POST,
+        &path,
+        &path,
+        &format!("projects/{}/{listing}/{number}/notes", project(repo)),
+        &[("body", body)],
+    )?;
+    Ok(())
 }
 
 /// Delete the head branch of one of the bot's settled PRs, unless something
@@ -697,8 +728,7 @@ mod tests {
     /// Every (gated task, repo) pair is probed before giving up on them.
     #[test]
     fn draw_probes_every_repository() {
-        let (forge, pool) =
-            Forge::sweep(&["me/one", "me/two", "me/three"], &["respond", "rebase"]);
+        let (forge, pool) = Forge::sweep(&["me/one", "me/two", "me/three"], &["respond", "rebase"]);
         let seen = std::cell::RefCell::new(BTreeSet::new());
         assert!(
             draw(&forge, &pool, |task, repo| {
@@ -810,6 +840,87 @@ mod tests {
         assert!(kept(&head, &gitea, Some("main"), &reused).contains("#12"));
         let reused = [json!({"iid": 4, "source_branch": "topic"})];
         assert!(kept(&head, &gitea, Some("main"), &reused).contains("#4"));
+    }
+
+    /// A receipt reaches Gitea as a POST to the issue's comment endpoint —
+    /// PRs included, which Gitea comments on as issues — carrying the token
+    /// and the body as JSON; a refusal is an error the caller can log.
+    #[test]
+    fn a_gitea_comment_is_posted_to_the_issue_endpoint() {
+        use std::io::{Read, Write};
+        let serve = |status: &'static str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let request = std::thread::spawn(move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut seen = Vec::new();
+                let mut buf = [0; 4096];
+                // Headers, then as much body as Content-Length says.
+                loop {
+                    let n = conn.read(&mut buf).unwrap();
+                    seen.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&seen).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|v| v.parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if seen.len() >= end + 4 + length || n == 0 {
+                            break;
+                        }
+                    }
+                }
+                write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                )
+                .unwrap();
+                String::from_utf8(seen).unwrap()
+            });
+            (url, request)
+        };
+
+        let (url, request) = serve("201 Created");
+        let forge = Forge {
+            login: "bot".into(),
+            ..Forge::test(ForgeKind::Gitea, &url)
+        };
+        comment(
+            &forge,
+            "me/repo",
+            crate::deliveries::Kind::Pr,
+            7,
+            "cost: 3 tokens",
+        )
+        .unwrap();
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with("POST /api/v1/repos/me/repo/issues/7/comments HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: token tok"),
+            "{request}"
+        );
+        assert!(
+            request.ends_with(r#"{"body":"cost: 3 tokens"}"#),
+            "{request}"
+        );
+
+        let (url, request) = serve("403 Forbidden");
+        let forge = Forge {
+            login: "bot".into(),
+            ..Forge::test(ForgeKind::Gitea, &url)
+        };
+        let err = comment(&forge, "me/repo", crate::deliveries::Kind::Issue, 3, "x").unwrap_err();
+        assert!(format!("{err:#}").contains("403"), "{err:#}");
+        request.join().unwrap();
     }
 
     #[test]

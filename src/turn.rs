@@ -135,7 +135,9 @@ impl Turn<'_> {
     /// past preparing its clone.
     ///
     /// The turn is counted against its task in `ledger` too, with whatever
-    /// it `opened`, which is what the page's per-task summary adds up.
+    /// it `opened`, which is what the page's per-task summary adds up. What
+    /// comes back is the part of `opened` that is this turn's alone: the
+    /// rest an earlier turn already recorded inside the clock slack.
     fn finish(
         &self,
         status: &Shared,
@@ -144,8 +146,8 @@ impl Turn<'_> {
         outcome: Outcome,
         spent: Spent,
         opened: Vec<Opened>,
-    ) {
-        ledger.record_turn(
+    ) -> Vec<Opened> {
+        let own = ledger.record_turn(
             self.forge.kind,
             self.repo,
             self.task,
@@ -169,6 +171,33 @@ impl Turn<'_> {
             s.log_tail = last_lines(tail, 100).to_owned();
             s.record_turn(record, spent.rtk.as_ref());
         });
+        own
+    }
+
+    /// Comment the turn's receipt on each PR and issue it opened. Best-effort
+    /// like `delivered`: a forge that refuses the comment costs the receipt,
+    /// never the turn.
+    fn post_receipts(&self, model: &str, spent: &Spent, own: &[Opened]) {
+        if own.is_empty() {
+            return;
+        }
+        let body = crate::receipt::Receipt {
+            task: self.task,
+            repo: self.repo,
+            model,
+            started: self.started(),
+            duration_secs: self.elapsed(),
+            tokens: spent.tokens.as_ref(),
+            rtk: spent.rtk.as_ref(),
+        }
+        .render();
+        for opened in own {
+            if let Err(err) =
+                precheck::comment(self.forge, self.repo, opened.kind, opened.number, &body)
+            {
+                warn!("failed to post the turn receipt on {}: {err:#}", opened.url);
+            }
+        }
     }
 }
 
@@ -303,7 +332,10 @@ pub fn run(
         Outcome::Completed => delivered(&turn),
         _ => Vec::new(),
     };
-    turn.finish(status, ledger, &tail, outcome, spent, opened);
+    let own = turn.finish(status, ledger, &tail, outcome, spent.clone(), opened);
+    if cfg.post_receipts {
+        turn.post_receipts(&cfg.model, &spent, &own);
+    }
 
     Ok(Report::Ran { verdict, outcome })
 }
