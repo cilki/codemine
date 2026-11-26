@@ -166,6 +166,17 @@ default). Each repository has its own set of tasks, toggled by clicking the task
 labels in its row; the labels along the top turn a task on or off for every
 repository at once. A freshly ticked repository starts with every task on.
 
+#### Signed commits
+
+Tick **Sign commits** in the settings and every commit (and tag) a turn makes is
+signed with an SSH key **codemine** generates and keeps in the workspace, at
+`signing/id_ed25519`. The settings show its public half; register it on the
+forge account as a *signing* key so the commits show as verified and can land
+on branches that require signed commits. Signing is off by default because
+GitHub marks a signature it can't match to the account as *Unverified*. It
+needs `ssh-keygen` (OpenSSH) on the `PATH`; when signing can't work, turns are
+held and the settings say why.
+
 #### Web interface
 
 You can view and manage the **codemine** instance via a simple web UI on

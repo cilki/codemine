@@ -13,6 +13,8 @@ with pkgs;
   gnused
   findutils
   git
+  # ssh-keygen, which git calls to sign commits when signing is on.
+  openssh
   jq
   curl
   ripgrep

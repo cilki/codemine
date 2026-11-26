@@ -1415,6 +1415,39 @@ mod tests {
         }
     }
 
+    /// Commit signing is the global config's (`crate::signing`), and a clone
+    /// can't opt out of it: its own `commit.gpgsign = false` would ship
+    /// unsigned commits to a branch that requires signatures, and its
+    /// `gpg.ssh.program` is a command git runs on every commit. Neither may
+    /// survive the rebuild — nor may anything else that steers signing, so
+    /// adding `gpg.*` or `user.*` to `KEPT_CONFIG` fails here.
+    #[test]
+    fn the_rebuild_drops_what_would_steer_signing() {
+        let root = tempfile::tempdir().unwrap();
+        let (origin, clone) = origin_and_clone(root.path());
+        for (key, value) in [
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+            ("gpg.format", "openpgp"),
+            ("gpg.program", "/bin/false"),
+            ("gpg.ssh.program", "/bin/false"),
+            ("user.signingkey", "/elsewhere"),
+        ] {
+            git(&clone, &["config", key, value]);
+        }
+
+        let log = tempfile::tempfile().unwrap();
+        update(root.path(), &url_of(&origin), &clone, &log).unwrap();
+
+        let listed = git_stdout(root.path(), &clone, &["config", "--local", "--list"]).unwrap();
+        for key in ["commit.", "tag.", "gpg.", "user."] {
+            assert!(
+                !listed.contains(key),
+                "{key} survived the rebuild: {listed}"
+            );
+        }
+    }
+
     /// The rebuilt file has to read back as the values that went into it,
     /// whatever they contain: a `;` would otherwise start a comment, and a
     /// subsection is the one part of a key that may hold dots.

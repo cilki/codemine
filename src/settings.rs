@@ -40,6 +40,11 @@ pub struct Settings {
     /// The daily window automatic turns may start in; off by default. Turns
     /// the forge asks for start outside it too.
     pub schedule: Schedule,
+    /// Sign every commit turns make with the workspace's SSH key (see
+    /// `crate::signing`). Off by default: until the key is registered on the
+    /// forge account, GitHub shows each signed commit as *Unverified*, which
+    /// reads worse than no signature at all.
+    pub sign_commits: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +57,7 @@ impl Default for Settings {
             max_open_prs: None,
             turn_timeout_secs: 21600,
             schedule: Schedule::default(),
+            sign_commits: false,
         }
     }
 }

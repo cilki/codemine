@@ -251,6 +251,14 @@
   #settings-status.err { color: #e74c3c; }
   #proxy-card { margin: 16px 0; }
   #proxy-card.invalid { outline: 1px solid #e74c3c; outline-offset: 4px; }
+  #signing-card { margin: 16px 0; }
+  #signing-card.invalid { outline: 1px solid #e74c3c; outline-offset: 4px; }
+  #signing-public {
+    width: 100%; box-sizing: border-box; resize: none; font-family: monospace; font-size: 0.8em;
+    background: rgb(40, 44, 46); color: #e8eaed; border: 1px solid rgb(62, 68, 70); border-radius: 6px;
+  }
+  .signing-where { font-size: 0.85em; margin: 4px 0 0; padding-left: 20px; }
+  .err-text { color: #e74c3c; font-size: 0.85em; }
   /* A service's health — the proxy's, the forge's — as a dot beside the URL
      it was probed at; what the probe found is the dot's tooltip. */
   .health {
@@ -382,6 +390,25 @@
         <div class="repos" id="repos"><span class="muted">Not loaded.</span></div>
         <span class="muted" id="repos-note"></span>
       </div>
+    </div>
+    <div class="forge" id="signing-card">
+      <div class="forge-head">
+        <label class="check name" for="s-sign-commits"><input type="checkbox" id="s-sign-commits">
+          Sign commits</label>
+      </div>
+      <div class="muted">Turns sign every commit with an SSH key kept in the workspace. Register its public half
+        on the forge account as a signing key first: until then GitHub shows the commits as Unverified.</div>
+      <div id="signing-key" hidden>
+        <div class="field"><label for="signing-public">Public key
+            <button type="button" class="small" id="signing-copy">copy</button></label>
+          <textarea id="signing-public" rows="2" readonly></textarea></div>
+        <ul class="muted signing-where">
+          <li>Gitea: Settings → SSH / GPG Keys → Add Key, then Verify it</li>
+          <li>GitHub: Settings → SSH and GPG keys → New SSH key, key type Signing Key</li>
+          <li>GitLab: Preferences → SSH Keys, usage type Signing</li>
+        </ul>
+      </div>
+      <div class="err-text" id="signing-error" hidden></div>
     </div>
     <div id="settings-status"></div>
   </dialog>
@@ -1258,6 +1285,7 @@
     $("s-max-open-prs").value = s.max_open_prs ?? "";
     $("s-timeout").value = Math.max(1, Math.round(s.turn_timeout_secs / 60));
     renderSchedule(s.schedule);
+    renderSigning(s);
     const f = s.forge;
     renderForgeKind(f.kind);
     const token = $("f-token");
@@ -1271,6 +1299,17 @@
     // unreachable forge can't silently drop them.
     renderRepos([...repos.keys()].sort());
     autoLoadRepos(s);
+  }
+
+  // The key appears once signing is on: the server makes it on first ask,
+  // so the public half is there to register before the first signed commit.
+  function renderSigning(s) {
+    $("s-sign-commits").checked = s.sign_commits;
+    const key = s.signing_key;
+    $("signing-key").hidden = !key?.public;
+    $("signing-public").value = key?.public ?? "";
+    $("signing-error").hidden = !key?.error;
+    $("signing-error").textContent = key?.error ? "no signing key: " + key.error : "";
   }
 
   async function loadSettings() {
@@ -1317,6 +1356,7 @@
       rate_limit: tasks === null ? null : { tasks, hours: hours ?? 1 },
       max_open_prs: maxOpenPrs,
       turn_timeout_secs: minutes === null ? 0 : minutes * 60,
+      sign_commits: $("s-sign-commits").checked,
       schedule: {
         enabled: $("s-schedule-enabled").checked,
         start_minute: toMinutes($("s-schedule-start").value),
@@ -1374,6 +1414,8 @@
       status.textContent = "saved — applies from the next turn";
       // A save can make the forge newly listable (token stored, URL set).
       autoLoadRepos(returned);
+      // Turning signing on is what makes the key; show it at once.
+      renderSigning(returned);
     } catch (err) {
       status.className = "err";
       status.textContent = String(err.message || err);
@@ -1464,6 +1506,8 @@
   // The auto-load only runs once per forge, so a listing fetched when the
   // page opened goes stale; the button re-fetches it on demand.
   $("repos-refresh").onclick = loadRepos;
+  $("signing-copy").onclick = () =>
+    navigator.clipboard?.writeText($("signing-public").value);
   // Delegated, so the repo checkboxes built later are covered too. Typing
   // debounces; committed choices save at once. Secret fields (the forge
   // token, proxy keys) are left to `change` alone, so a partial secret is

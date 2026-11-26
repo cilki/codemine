@@ -22,6 +22,7 @@ mod savings;
 mod scan;
 mod schedule;
 mod settings;
+mod signing;
 mod status;
 mod sync;
 mod turn;
@@ -513,6 +514,12 @@ fn runnable(
                 format!("failed to apply forge auth: {err:#}"),
             )]
         })?;
+        apply_signing(workspace, &config::home(), settings.sign_commits).map_err(|err| {
+            vec![Problem::new(
+                "signing-card",
+                format!("commits can't be signed: {err:#}"),
+            )]
+        })?;
         *applied_generation = Some(generation);
     }
     Ok(cfg)
@@ -633,7 +640,9 @@ fn setup(cli: &mut Cli) -> Result<File> {
     // no longer enabled. Nothing is running in them yet.
     workspace::clear_clones(&cli.workspace)?;
 
-    let gitconfig = install_git_config(&cli.workspace, &config::home())?;
+    // Unsigned until the settings are read: `runnable` rewrites the file
+    // with whatever they say before the first turn.
+    let gitconfig = install_git_config(&cli.workspace, &config::home(), false)?;
     // SAFETY: setup() runs before the web UI and agent threads exist, so no
     // other thread can be touching the environment.
     unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &gitconfig) };
@@ -646,8 +655,10 @@ fn setup(cli: &mut Cli) -> Result<File> {
 /// credential helper. Every git the runner spawns, opencode's included,
 /// inherits the variable. The real global config is chained in with
 /// `include.path`, so the user's identity and everything else they set still
-/// applies; git ignores the include when the file isn't there.
-fn install_git_config(workspace: &Path, home: &Path) -> Result<PathBuf> {
+/// applies; git ignores the include when the file isn't there. With `sign`,
+/// every commit and tag is signed with the workspace's key — see
+/// [`signing::git_config`].
+fn install_git_config(workspace: &Path, home: &Path, sign: bool) -> Result<PathBuf> {
     let path = workspace.join("gitconfig");
     // The home directory is passed in, resolved by `config::home()`, rather
     // than read straight out of the environment here: that dropped the
@@ -671,8 +682,30 @@ fn install_git_config(workspace: &Path, home: &Path) -> Result<PathBuf> {
         "[credential]\n\thelper =\n\thelper = store --file={}\n",
         workspace::git_credentials(workspace).display()
     ));
+    if sign {
+        config.push_str(&signing::git_config(&signing::key_path(workspace)));
+    }
     std::fs::write(&path, config).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
+}
+
+/// Rewrite the runner's git config to sign commits or not, as the settings
+/// say. Signing on, the key is made if the workspace has none yet and one
+/// commit is signed in a scratch repository first: a missing `ssh-keygen` or
+/// an unusable key then holds turns with the reason on the page, rather than
+/// failing every commit in every turn with `gpg failed to sign the data`.
+fn apply_signing(workspace: &Path, home: &Path, sign: bool) -> Result<()> {
+    if sign {
+        signing::ensure_key(workspace)?;
+    }
+    let gitconfig = install_git_config(workspace, home, sign)?;
+    if sign && let Err(err) = signing::probe(&gitconfig) {
+        // Back to unsigned, so nothing reads a config that can't commit;
+        // turns are held either way until this is fixed.
+        install_git_config(workspace, home, false)?;
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Let git and tea authenticate to the configured forge; re-run whenever
@@ -907,7 +940,7 @@ mod tests {
     fn the_git_config_chains_the_users_own() {
         let workspace = tempfile::tempdir().unwrap();
 
-        let path = install_git_config(workspace.path(), Path::new("/home/bot")).unwrap();
+        let path = install_git_config(workspace.path(), Path::new("/home/bot"), false).unwrap();
         assert_eq!(path, workspace.path().join("gitconfig"));
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("path = /home/bot/.gitconfig"), "{written}");
@@ -917,6 +950,51 @@ mod tests {
                 workspace::git_credentials(workspace.path()).display()
             )),
             "{written}"
+        );
+    }
+
+    /// Signing is written only when the setting asks for it, and after the
+    /// include: git takes the last value it reads, so a user config that
+    /// turns signing off, or points it at another key or program, must not
+    /// get the final word.
+    #[test]
+    fn the_git_config_signs_only_when_asked_and_over_the_users_own() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[commit]\n\tgpgsign = false\n[gpg \"ssh\"]\n\tprogram = /bin/false\n",
+        )
+        .unwrap();
+        let get = |config: &Path, key: &str| {
+            let out = child::output(
+                Command::new("git")
+                    .args(["config", "--get", key])
+                    .env("GIT_CONFIG_GLOBAL", config)
+                    .env("GIT_CONFIG_NOSYSTEM", "1"),
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap().trim().to_owned()
+        };
+
+        let unsigned = install_git_config(workspace.path(), home.path(), false).unwrap();
+        let written = std::fs::read_to_string(&unsigned).unwrap();
+        assert!(!written.contains("gpgsign"), "{written}");
+        assert_eq!(get(&unsigned, "commit.gpgsign"), "false");
+
+        let signed = install_git_config(workspace.path(), home.path(), true).unwrap();
+        let written = std::fs::read_to_string(&signed).unwrap();
+        assert!(
+            written.find("[include]") < written.find("gpgsign"),
+            "{written}"
+        );
+        assert_eq!(get(&signed, "commit.gpgsign"), "true");
+        assert_eq!(get(&signed, "tag.gpgsign"), "true");
+        assert_eq!(get(&signed, "gpg.format"), "ssh");
+        assert_eq!(get(&signed, "gpg.ssh.program"), "ssh-keygen");
+        assert_eq!(
+            get(&signed, "user.signingkey"),
+            signing::key_path(workspace.path()).display().to_string()
         );
     }
 
@@ -950,7 +1028,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = install_git_config(workspace.path(), home.path()).unwrap();
+        let config = install_git_config(workspace.path(), home.path(), false).unwrap();
         std::fs::write(
             workspace::git_credentials(workspace.path()),
             credential_line(&forge("bot", "s3cret")),

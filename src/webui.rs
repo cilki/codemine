@@ -49,9 +49,8 @@ struct AppState {
     pending: SharedPending,
     /// What turns delivered, for the turn rows' links and the summary.
     deliveries: Arc<Deliveries>,
-    /// The workspace root, which is all the page wants of it: the disk
-    /// figures in the host details describe the filesystem it sits on.
-    #[cfg_attr(not(feature = "hostinfo"), allow(dead_code))]
+    /// The workspace root: the disk figures in the host details describe the
+    /// filesystem it sits on, and the commit signing key lives under it.
     workspace: PathBuf,
 }
 
@@ -477,7 +476,23 @@ async fn api_options(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// The settings with tokens redacted to a `token_set` flag; tokens are
 /// write-only and never leave the server.
 async fn api_settings(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(state.settings.snapshot().0.redacted())
+    Json(settings_view(&state.settings.snapshot().0, &state.workspace))
+}
+
+/// The settings as the page gets them: secrets redacted, and while signing
+/// is on, the public key to register on the forge under `signing_key` — or
+/// why there is none. Asked for here rather than left to the main loop, which
+/// may be hours into a turn, so the key shows the moment signing is turned
+/// on; the generation is shared, so both end up with the same key.
+fn settings_view(settings: &Settings, workspace: &std::path::Path) -> serde_json::Value {
+    let mut value = settings.redacted();
+    if settings.sign_commits {
+        value["signing_key"] = match crate::signing::ensure_key(workspace) {
+            Ok(public) => json!({ "public": public }),
+            Err(err) => json!({ "error": format!("{err:#}") }),
+        };
+    }
+    value
 }
 
 /// Replace the settings. An empty or absent secret (forge token, proxy key)
@@ -524,7 +539,7 @@ async fn api_put_settings(
             Status::update(&state.status, |s| {
                 s.allowance.set_limit(settings.rate_limit)
             });
-            Json(settings.redacted()).into_response()
+            Json(settings_view(&settings, &state.workspace)).into_response()
         }
         Err(err) => error(StatusCode::UNPROCESSABLE_ENTITY, format!("{err:#}")),
     }
