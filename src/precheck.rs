@@ -256,32 +256,33 @@ pub fn opened_since(
         bail!("the {} login is unresolved", forge.kind.name());
     }
     let (login, after) = (&forge.login, format_rfc3339(since));
-    Ok(match forge.kind {
-        ForgeKind::Gitea => {
-            let path = format!(
+    // Gitea's and GitHub's issue listing holds their PRs too, each marked as
+    // one; GitLab keeps one kind per listing.
+    let listings: &[_] = match forge.kind {
+        ForgeKind::Gitlab => &[
+            ("merge_requests", Some(Kind::Pr)),
+            ("issues", Some(Kind::Issue)),
+        ],
+        _ => &[("issues", None)],
+    };
+    let mut opened = Vec::new();
+    for &(listing, kind) in listings {
+        let rows = pulls(forge_json(
+            forge,
+            &format!(
                 "repos/{repo}/issues?state=all&created_by={login}&since={after}&limit={PR_LIMIT}"
-            );
-            opened_in(&pulls(gitea_json(forge, &path)?)?, login, since, None)
-        }
-        ForgeKind::Github => {
-            let path = format!(
+            ),
+            &format!(
                 "repos/{repo}/issues?state=all&creator={login}&since={after}&per_page={PR_LIMIT}"
-            );
-            opened_in(&pulls(api_json(forge, "gh", &path)?)?, login, since, None)
-        }
-        ForgeKind::Gitlab => {
-            let mut opened = Vec::new();
-            for (listing, kind) in [("merge_requests", Kind::Pr), ("issues", Kind::Issue)] {
-                let path = format!(
-                    "projects/{}/{listing}?state=all&author_username={login}&created_after={after}&per_page={PR_LIMIT}",
-                    project(repo)
-                );
-                let listed = pulls(api_json(forge, "glab", &path)?)?;
-                opened.extend(opened_in(&listed, login, since, Some(kind)));
-            }
-            opened
-        }
-    })
+            ),
+            &format!(
+                "projects/{}/{listing}?state=all&author_username={login}&created_after={after}&per_page={PR_LIMIT}",
+                project(repo)
+            ),
+        )?)?;
+        opened.extend(opened_in(&rows, login, since, kind));
+    }
+    Ok(opened)
 }
 
 /// What became of one PR or issue the bot opened. Gitea's and GitHub's

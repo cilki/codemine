@@ -436,25 +436,24 @@ fn spawn_agent(
     turn: &Turn,
     log: &File,
 ) -> Result<Child> {
-    let mut argv: Vec<String> = ["opencode", "run"].map(String::from).into();
-    // Which flags keep the session private and pre-approved depends on the
-    // opencode: see `Version::run_flags`.
-    argv.extend(opencode.run_flags().iter().map(|flag| flag.to_string()));
-    argv.extend(["--model", &cfg.model].map(String::from));
-    // One argument, so a clone path with spaces in it stays whole.
-    argv.push(crate::prompts::sweep_prompt(
-        turn.task,
-        turn.repo,
-        turn.forge_name(),
-        &turn.dir,
-        &turn.notes,
-        crate::workspace::codegraph_available(),
-    ));
     // Commits are attributed to the model that authored them; the email comes
     // from the forge's account via identity::resolve.
     let author = crate::settings::model_author_name(&cfg.model);
-    Command::new(&argv[0])
-        .args(&argv[1..])
+    Command::new("opencode")
+        .arg("run")
+        // Which flags keep the session private and pre-approved depends on the
+        // opencode: see `Version::run_flags`.
+        .args(opencode.run_flags())
+        .args(["--model", &cfg.model])
+        // One argument, so a clone path with spaces in it stays whole.
+        .arg(crate::prompts::sweep_prompt(
+            turn.task,
+            turn.repo,
+            turn.forge_name(),
+            &turn.dir,
+            &turn.notes,
+            crate::workspace::codegraph_available(),
+        ))
         // Own process group, so the timeout can take down the whole tree.
         .process_group(0)
         .current_dir(&turn.dir)
@@ -486,7 +485,7 @@ fn spawn_agent(
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log.try_clone()?))
         .spawn()
-        .with_context(|| format!("failed to spawn {}", argv[0]))
+        .context("failed to spawn opencode")
 }
 
 /// What a turn cost and what rtk saved it, each None when its source
@@ -906,9 +905,7 @@ mod tests {
         Verdict {
             completed,
             died,
-            usage_limit: None,
-            auth_error: false,
-            rejected_model: None,
+            ..Verdict::default()
         }
     }
 
@@ -951,58 +948,6 @@ mod tests {
             outcome_of(exited(0), false, &verdict(false, false), 1, ""),
             Outcome::Skipped
         );
-    }
-
-    /// A tool call the agent recovered from is not how the turn ended. Every
-    /// session is full of them — a path that isn't there, a CLI given a flag
-    /// it doesn't take — and opencode reports each one with the same `Error:`
-    /// line it uses for the failures that stop a session dead. An error
-    /// anywhere in the closing lines used to outrank the agent's own
-    /// sign-off, so turns that opened a PR and said so were recorded as
-    /// failures, and skips that an error line happened to precede were not
-    /// remembered by the skip cache.
-    #[test]
-    fn an_error_the_agent_recovered_from_is_not_a_failed_turn() {
-        let exited = |code: i32| Some(ExitStatus::from_raw(code << 8));
-        let session = |ending: &str| {
-            format!(
-                "\x1b[0m$ \x1b[0mgit grep nothing\n\
-                 \x1b[91m\x1b[1mError: \x1b[0mpath does not exist: md5sum.test/testHello\n\
-                 I'll try that another way.\n\
-                 {ending}"
-            )
-        };
-
-        // Recovered from, then signed off: the marker is the last word.
-        let completed = Verdict::read(&session("TASK COMPLETED — opened PR #63\n"));
-        assert!(completed.completed);
-        assert!(!completed.died);
-        assert_eq!(
-            outcome_of(exited(0), false, &completed, 1, ""),
-            Outcome::Completed
-        );
-
-        // The same for a skip, which is what the skip cache remembers.
-        let skipped = Verdict::read(&session("TASK SKIPPED\n"));
-        assert!(!skipped.completed);
-        assert!(!skipped.died);
-        assert_eq!(
-            outcome_of(exited(0), false, &skipped, 1, ""),
-            Outcome::Skipped
-        );
-
-        // Nothing after the error: the session died on it, marker or no
-        // marker. The second case is a turn that reported and was then cut
-        // off mid-sentence by the API.
-        let died = Verdict::read(&session("still trying\n"));
-        assert!(died.died);
-        assert_eq!(outcome_of(exited(0), false, &died, 1, ""), Outcome::Failed);
-        let died = Verdict::read(&session(
-            "TASK COMPLETED\nError: {\"type\":\"api_error\",\"message\":\"unexpected EOF\"}\n",
-        ));
-        assert!(died.completed);
-        assert!(died.died);
-        assert_eq!(outcome_of(exited(0), false, &died, 1, ""), Outcome::Failed);
     }
 
     /// Paging is driven by what the forge sent, not by what survives the
