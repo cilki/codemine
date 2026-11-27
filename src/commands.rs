@@ -75,8 +75,8 @@ pub fn take(
             continue;
         };
         match command(forge, repo, entry) {
-            Ok(Found::New(request)) => {
-                react(forge, repo, entry);
+            Ok(Found::New(request, reactions)) => {
+                react(forge, repo, &reactions);
                 mark_read(forge, repo, &id);
                 pending.request(request);
                 handled.insert(id);
@@ -102,7 +102,8 @@ enum Found {
     Nothing,
     /// A command taken before a restart, whose thread only needs clearing.
     Taken,
-    New(Request),
+    /// A fresh command, with the API path its acknowledgment is posted to.
+    New(Request, Option<String>),
 }
 
 /// What one feed entry's newest comment asks for.
@@ -125,7 +126,7 @@ fn command(forge: &Forge, repo: &str, entry: &Value) -> Result<Found> {
         );
         return Ok(Found::Nothing);
     }
-    if acknowledged(forge, repo, &comment) {
+    if acknowledged(forge, &comment) {
         info!(
             "@{} {task} on {repo} from {} was taken already",
             forge.login, comment.author
@@ -136,7 +137,7 @@ fn command(forge: &Forge, repo: &str, entry: &Value) -> Result<Found> {
         "@{} {task} on {repo} from {}; queueing it as run now",
         forge.login, comment.author
     );
-    Ok(Found::New(Request {
+    let request = Request {
         kind: forge.kind,
         repo: repo.to_owned(),
         task,
@@ -145,7 +146,8 @@ fn command(forge: &Forge, repo: &str, entry: &Value) -> Result<Found> {
             url: comment.url,
             text,
         }),
-    }))
+    };
+    Ok(Found::New(request, comment.reactions))
 }
 
 /// The task a comment asks for and the rest of what it says, if it is a
@@ -206,8 +208,9 @@ fn mention<'a>(line: &'a str, login: &str) -> Option<&'a str> {
 
 /// The comment a feed entry is about, as far as a command needs it.
 struct Comment {
-    /// The comment's own id: what a reaction is posted against.
-    id: u64,
+    /// The API path of the comment's reactions (GitLab: award emoji); None
+    /// for a GitLab note on something other than an issue or merge request.
+    reactions: Option<String>,
     author: String,
     /// GitLab's author id, which its membership endpoint is keyed on.
     author_id: Option<u64>,
@@ -227,11 +230,11 @@ fn comment(forge: &Forge, repo: &str, entry: &Value) -> Result<Option<Comment>> 
             return Ok(None);
         }
         let url = entry["target_url"].as_str().unwrap_or_default();
-        let (Some(author), Some(id)) = (entry["author"]["username"].as_str(), note_id(url)) else {
+        let (Some(author), Some(_)) = (entry["author"]["username"].as_str(), note_id(url)) else {
             return Ok(None);
         };
         return Ok(Some(Comment {
-            id,
+            reactions: gitlab_note_path(repo, entry).map(|path| format!("{path}/award_emoji")),
             author: author.to_owned(),
             author_id: entry["author"]["id"].as_u64(),
             body: entry["body"].as_str().unwrap_or_default().to_owned(),
@@ -248,7 +251,7 @@ fn comment(forge: &Forge, repo: &str, entry: &Value) -> Result<Option<Comment>> 
     let path = format!("repos/{repo}/issues/comments/{id}");
     let comment = forge_json(forge, &path, &path, "")?;
     Ok(Some(Comment {
-        id,
+        reactions: Some(format!("{path}/reactions")),
         author: comment["user"]["login"]
             .as_str()
             .context("the comment names no author")?
@@ -304,12 +307,14 @@ fn writes(answer: &Value) -> bool {
 /// taken before a restart is told apart. GitLab needs no such check: a todo
 /// marked done leaves its pending list for good. A reaction listing that
 /// can't be read counts as no reaction.
-fn acknowledged(forge: &Forge, repo: &str, comment: &Comment) -> bool {
+fn acknowledged(forge: &Forge, comment: &Comment) -> bool {
     if forge.kind == ForgeKind::Gitlab {
         return false;
     }
-    let path = format!("repos/{repo}/issues/comments/{}/reactions", comment.id);
-    forge_json(forge, &path, &path, "").is_ok_and(|reactions| reacted(&reactions, &forge.login))
+    let Some(path) = comment.reactions.as_deref() else {
+        return false;
+    };
+    forge_json(forge, path, path, "").is_ok_and(|reactions| reacted(&reactions, &forge.login))
 }
 
 /// Whether `login` is among the reactions with the acknowledgment.
@@ -326,26 +331,16 @@ fn reacted(reactions: &Value, login: &str) -> bool {
 
 /// React to the command, so its author sees it was taken. Best-effort, like
 /// [`mark_read`]: a failure is logged and the command still runs.
-fn react(forge: &Forge, repo: &str, entry: &Value) {
-    let reaction = match forge.kind {
-        ForgeKind::Gitlab => {
-            gitlab_note_path(repo, entry).map(|path| format!("{path}/award_emoji"))
-        }
-        _ => comment_id(
-            entry["subject"]["latest_comment_url"]
-                .as_str()
-                .unwrap_or_default(),
-        )
-        .map(|id| format!("repos/{repo}/issues/comments/{id}/reactions")),
+fn react(forge: &Forge, repo: &str, reactions: &Option<String>) {
+    let Some(path) = reactions else {
+        return;
     };
-    if let Some(path) = reaction {
-        let field = match forge.kind {
-            ForgeKind::Gitlab => ("name", ACK),
-            _ => ("content", ACK),
-        };
-        if let Err(err) = forge_call(forge, Method::POST, &path, &path, &path, &[field]) {
-            warn!("failed to react to the command on {repo}: {err:#}");
-        }
+    let field = match forge.kind {
+        ForgeKind::Gitlab => ("name", ACK),
+        _ => ("content", ACK),
+    };
+    if let Err(err) = forge_call(forge, Method::POST, path, path, path, &[field]) {
+        warn!("failed to react to the command on {repo}: {err:#}");
     }
 }
 

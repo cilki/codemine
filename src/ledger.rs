@@ -50,20 +50,9 @@ impl Ledger {
     /// and dropped rather than failing startup: it is only ever a hint to the
     /// draw.
     pub fn load(path: PathBuf) -> Ledger {
-        let entries = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
-                warn!("ignoring {}: {err}", path.display());
-                BTreeMap::new()
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(err) => {
-                warn!("failed to read {}: {err}", path.display());
-                BTreeMap::new()
-            }
-        };
         Ledger {
+            entries: Mutex::new(crate::workspace::read_json_or_default(&path)),
             path,
-            entries: Mutex::new(entries),
         }
     }
 
