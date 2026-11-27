@@ -85,13 +85,20 @@ fn client() -> Result<&'static Client> {
             // here only means something else installed one first, which is
             // just as good.
             let _ = rustls::crypto::ring::default_provider().install_default();
-            Client::builder()
+            let builder = Client::builder()
                 // No redirect following, which is also curl's default and
                 // what the previous implementation therefore did. Both
                 // callers address an API they configured; a 3xx from one is
                 // a misconfiguration to report, not a hop to take with the
                 // secret header still attached.
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(reqwest::redirect::Policy::none());
+            // The platform verifier refuses to build on a host with no CA
+            // bundle, even for a client that never speaks TLS. Tests only
+            // talk plain HTTP to a loopback listener, so they need no roots
+            // and shouldn't depend on whether the host has any.
+            #[cfg(test)]
+            let builder = builder.tls_certs_only([]);
+            builder
                 .build()
                 // reqwest's own message is only "builder error"; the reason
                 // (no CA certificates, a malformed proxy variable) is in the
