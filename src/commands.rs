@@ -23,7 +23,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::config::{Forge, ForgeKind};
-use crate::events::{Focus, Pending, Request, repo_of, stamp};
+use crate::events::{Focus, Pending, Request, fresh, repo_of, stamp};
 use crate::precheck::{forge_call, forge_json, project};
 
 /// The reaction a taken command is acknowledged with; every forge spells it
@@ -47,11 +47,7 @@ pub fn take(
         .iter()
         .filter_map(|entry| Some((thread_id(entry)?, stamp(forge.kind, entry).to_owned())))
         .collect();
-    let fresh: Vec<String> = current
-        .iter()
-        .filter(|(id, stamp)| seen.get(*id).is_none_or(|old| old < *stamp))
-        .map(|(id, _)| id.clone())
-        .collect();
+    let fresh = fresh(seen, &current);
     if fresh.is_empty() {
         *seen = current;
         return;

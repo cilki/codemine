@@ -203,13 +203,11 @@ fn watch(store: SharedSettings, pending: SharedPending) -> ! {
     }
 }
 
-/// The feed entries that are news since the last poll: repositories not seen
-/// before, and seen ones whose newest stamp moved forward. A stamp moving
-/// backward is a notification being read or cleared, not news.
-fn fresh(
-    seen: &BTreeMap<(ForgeKind, String), String>,
-    current: &BTreeMap<(ForgeKind, String), String>,
-) -> Vec<(ForgeKind, String)> {
+/// The feed entries that are news since the last poll: repositories (or, for
+/// `commands`, threads) not seen before, and seen ones whose newest stamp
+/// moved forward. A stamp moving backward is a notification being read or
+/// cleared, not news.
+pub fn fresh<K: Ord + Clone>(seen: &BTreeMap<K, String>, current: &BTreeMap<K, String>) -> Vec<K> {
     current
         .iter()
         .filter(|(key, stamp)| seen.get(*key).is_none_or(|old| old < *stamp))

@@ -51,6 +51,11 @@ impl TokenUsage {
         self.cache_read += other.cache_read;
         self.cache_write += other.cache_write;
     }
+
+    /// Every token of every kind.
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.reasoning + self.cache_read + self.cache_write
+    }
 }
 
 /// What rtk trimmed off the command output the agent read, as rtk recorded

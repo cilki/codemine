@@ -15,13 +15,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use crate::config::ForgeKind;
 use crate::status::Outcome;
+use crate::workspace::JsonStore;
 
 /// How idle a pair can count as, in hours. A pair that has never had a turn,
 /// or hasn't had one in a week, is as stale as it gets; beyond that the
@@ -41,8 +40,7 @@ struct Entry {
 
 /// The per-pair history, keyed by forge, repository, and task.
 pub struct Ledger {
-    path: PathBuf,
-    entries: Mutex<BTreeMap<String, Entry>>,
+    entries: JsonStore<BTreeMap<String, Entry>>,
 }
 
 impl Ledger {
@@ -51,8 +49,7 @@ impl Ledger {
     /// draw.
     pub fn load(path: PathBuf) -> Ledger {
         Ledger {
-            entries: Mutex::new(crate::workspace::read_json_or_default(&path)),
-            path,
+            entries: JsonStore::load(path),
         }
     }
 
@@ -61,7 +58,7 @@ impl Ledger {
     /// pair's yield; a turn that failed, timed out, or was cancelled never
     /// got to answer, so it moves the pair's clock and nothing else.
     pub fn record(&self, task: &str, forge: ForgeKind, repo: &str, drawn: u64, outcome: Outcome) {
-        let mut entries = self.lock();
+        let mut entries = self.entries.lock();
         let entry = entries
             .entry(crate::cache::key(task, forge, repo))
             .or_default();
@@ -71,20 +68,15 @@ impl Ledger {
             Outcome::Skipped => entry.skipped += 1,
             Outcome::Failed | Outcome::Timeout | Outcome::Canceled => {}
         }
-        if let Err(err) = crate::workspace::write_json(&self.path, &*entries) {
-            warn!("failed to save the draw ledger: {err:#}");
-        }
+        self.entries.save(&entries);
     }
 
     /// How much the draw should favour the pair at `now`, relative to the
     /// others on the table. Positive, and larger for a pair that has waited
     /// longer and paid off more often.
     pub fn weight(&self, task: &str, forge: ForgeKind, repo: &str, now: u64) -> f64 {
-        weigh(self.lock().get(&crate::cache::key(task, forge, repo)), now)
-    }
-
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Entry>> {
-        crate::sync::lock(&self.entries)
+        let key = crate::cache::key(task, forge, repo);
+        weigh(self.entries.lock().get(&key), now)
     }
 }
 
@@ -196,7 +188,7 @@ mod tests {
         for outcome in [Outcome::Failed, Outcome::Timeout, Outcome::Canceled] {
             ledger.record("docs", ForgeKind::Github, "me/repo", drawn, outcome);
         }
-        let entry = ledger.lock().get("github:me/repo:docs").cloned().unwrap();
+        let entry = ledger.entries.lock()["github:me/repo:docs"].clone();
         assert_eq!(
             entry,
             Entry {
@@ -244,7 +236,7 @@ mod tests {
         ledger.record("docs", ForgeKind::Github, "me/repo", NOW, Outcome::Skipped);
         drop(ledger);
         let reloaded = Ledger::load(path);
-        let entry = reloaded.lock().get("github:me/repo:docs").cloned();
+        let entry = reloaded.entries.lock().get("github:me/repo:docs").cloned();
         assert_eq!(
             entry,
             Some(Entry {
@@ -261,6 +253,6 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("ledger.json");
         std::fs::write(&path, "not json").unwrap();
-        assert!(Ledger::load(path).lock().is_empty());
+        assert!(Ledger::load(path).entries.lock().is_empty());
     }
 }

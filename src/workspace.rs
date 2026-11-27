@@ -10,7 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -175,19 +175,43 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Read a store the runner can rebuild from scratch: one that is missing,
-/// unreadable or malformed costs only what it remembered, so it is logged
-/// and read as the default rather than failing startup.
-pub fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
-            warn!("ignoring {}: {err}", path.display());
-            T::default()
-        }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => T::default(),
-        Err(err) => {
-            warn!("failed to read {}: {err}", path.display());
-            T::default()
+/// A JSON store the runner can rebuild from scratch (the skip cache, the draw
+/// ledger, the deliveries), held behind a lock and written back whole. Losing
+/// one costs only what it remembered, so a file that is missing, unreadable
+/// or malformed is logged and read as the default rather than failing
+/// startup, and a failed write is logged rather than propagated.
+pub struct JsonStore<T> {
+    path: PathBuf,
+    value: Mutex<T>,
+}
+
+impl<T: serde::de::DeserializeOwned + serde::Serialize + Default> JsonStore<T> {
+    pub fn load(path: PathBuf) -> JsonStore<T> {
+        let value = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                warn!("ignoring {}: {err}", path.display());
+                T::default()
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => T::default(),
+            Err(err) => {
+                warn!("failed to read {}: {err}", path.display());
+                T::default()
+            }
+        };
+        JsonStore {
+            path,
+            value: Mutex::new(value),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        crate::sync::lock(&self.value)
+    }
+
+    /// Write back `value`, the guard [`lock`](Self::lock) handed out.
+    pub fn save(&self, value: &T) {
+        if let Err(err) = write_json(&self.path, value) {
+            warn!("failed to save {}: {err:#}", self.path.display());
         }
     }
 }

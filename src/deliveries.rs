@@ -13,7 +13,6 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +20,7 @@ use tracing::{info, warn};
 
 use crate::config::{Forge, ForgeKind};
 use crate::status::TokenUsage;
+use crate::workspace::JsonStore;
 
 /// How often a delivery that is still open is asked about again. A PR is
 /// reviewed on the scale of a day, so an hour is quick enough for the page
@@ -147,8 +147,7 @@ pub struct TaskSummary {
 /// The deliveries and the per-task tallies, shared between the main loop,
 /// which records and settles them, and the web UI, which shows them.
 pub struct Deliveries {
-    path: PathBuf,
-    ledger: Mutex<Ledger>,
+    ledger: JsonStore<Ledger>,
     /// Bumped whenever what the page shows moves, so the event stream can
     /// tell without serializing the lot to compare.
     revision: AtomicU64,
@@ -159,8 +158,7 @@ impl Deliveries {
     /// logged and started afresh rather than failing startup.
     pub fn load(path: PathBuf) -> Deliveries {
         Deliveries {
-            ledger: Mutex::new(crate::workspace::read_json_or_default(&path)),
-            path,
+            ledger: JsonStore::load(path),
             revision: AtomicU64::new(0),
         }
     }
@@ -182,8 +180,8 @@ impl Deliveries {
         tokens: Option<&TokenUsage>,
         opened: &[Opened],
     ) -> Vec<Opened> {
-        let tokens = tokens.map_or(0, total);
-        let mut ledger = crate::sync::lock(&self.ledger);
+        let tokens = tokens.map_or(0, TokenUsage::total);
+        let mut ledger = self.ledger.lock();
         let tally = ledger.tasks.entry(task.to_owned()).or_default();
         tally.turns += 1;
         tally.tokens += tokens;
@@ -234,7 +232,9 @@ impl Deliveries {
         mut ask: impl FnMut(&str, Kind, u64) -> anyhow::Result<Answer>,
         mut delete: impl FnMut(&str, &Head) -> anyhow::Result<Option<String>>,
     ) {
-        let due: Vec<(String, Kind, u64)> = crate::sync::lock(&self.ledger)
+        let due: Vec<(String, Kind, u64)> = self
+            .ledger
+            .lock()
             .deliveries
             .iter()
             .filter(|d| d.forge == forge && d.state == State::Open)
@@ -269,7 +269,7 @@ impl Deliveries {
                 (key, answer)
             })
             .collect();
-        let mut ledger = crate::sync::lock(&self.ledger);
+        let mut ledger = self.ledger.lock();
         for (key, answer) in answers {
             let Some(delivery) = ledger.deliveries.iter_mut().find(|d| d.key() == key) else {
                 continue;
@@ -290,7 +290,7 @@ impl Deliveries {
     /// What the page shows: each delivery's state by its key, for the turn
     /// rows, and one line per task.
     pub fn view(&self) -> serde_json::Value {
-        let ledger = crate::sync::lock(&self.ledger);
+        let ledger = self.ledger.lock();
         let states: BTreeMap<String, State> = ledger
             .deliveries
             .iter()
@@ -304,14 +304,8 @@ impl Deliveries {
     /// either way, since what the page shows did.
     fn save(&self, ledger: &Ledger) {
         self.revision.fetch_add(1, Ordering::Relaxed);
-        if let Err(err) = crate::workspace::write_json(&self.path, ledger) {
-            warn!("failed to save the deliveries: {err:#}");
-        }
+        self.ledger.save(ledger);
     }
-}
-
-fn total(t: &TokenUsage) -> u64 {
-    t.input + t.output + t.reasoning + t.cache_read + t.cache_write
 }
 
 fn summary(ledger: &Ledger) -> Vec<TaskSummary> {

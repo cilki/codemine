@@ -40,7 +40,7 @@ impl Receipt<'_> {
         lines.push(match self.tokens {
             Some(t) => format!(
                 "- tokens: {} (input {} · output {} · reasoning {} · cache read {} · cache write {})",
-                thousands(t.input + t.output + t.reasoning + t.cache_read + t.cache_write),
+                thousands(t.total()),
                 thousands(t.input),
                 thousands(t.output),
                 thousands(t.reasoning),

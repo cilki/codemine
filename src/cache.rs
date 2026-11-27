@@ -23,7 +23,6 @@ use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -32,6 +31,7 @@ use tracing::{info, warn};
 
 use crate::config::{Forge, ForgeKind};
 use crate::precheck::{conflicting_prs, review_requests};
+use crate::workspace::JsonStore;
 
 /// What a skipped turn on this task is remembered against, or `None` when the
 /// skip isn't worth remembering at all.
@@ -108,8 +108,7 @@ struct Mark {
 
 /// The remembered skips, keyed by forge, repository, and task.
 pub struct Cache {
-    path: PathBuf,
-    marks: Mutex<BTreeMap<String, Mark>>,
+    marks: JsonStore<BTreeMap<String, Mark>>,
 }
 
 impl Cache {
@@ -118,8 +117,7 @@ impl Cache {
     /// is logged and dropped rather than failing startup.
     pub fn load(path: PathBuf) -> Cache {
         Cache {
-            marks: Mutex::new(crate::workspace::read_json_or_default(&path)),
-            path,
+            marks: JsonStore::load(path),
         }
     }
 
@@ -130,37 +128,25 @@ impl Cache {
             state: state.to_owned(),
             prompt: digest(task),
         };
-        let mut marks = self.lock();
+        let mut marks = self.marks.lock();
         if marks.insert(key(task, forge, repo), mark.clone()) == Some(mark) {
             return;
         }
-        self.save(&marks);
+        self.marks.save(&marks);
     }
 
     /// Drop whatever was remembered for the task on this repository: the turn
     /// either changed something or never got to answer, so the old mark no
     /// longer describes it.
     pub fn forget(&self, task: &str, forge: ForgeKind, repo: &str) {
-        let mut marks = self.lock();
+        let mut marks = self.marks.lock();
         if marks.remove(&key(task, forge, repo)).is_some() {
-            self.save(&marks);
+            self.marks.save(&marks);
         }
     }
 
     fn marked(&self, key: &str) -> Option<Mark> {
-        self.lock().get(key).cloned()
-    }
-
-    /// Write the memory back out. A failure costs a redundant turn after the
-    /// next restart and nothing else, so it is logged rather than propagated.
-    fn save(&self, marks: &BTreeMap<String, Mark>) {
-        if let Err(err) = crate::workspace::write_json(&self.path, marks) {
-            warn!("failed to save the skip cache: {err:#}");
-        }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Mark>> {
-        crate::sync::lock(&self.marks)
+        self.marks.lock().get(key).cloned()
     }
 }
 
@@ -818,7 +804,7 @@ mod tests {
         let cache = cache(&root);
         cache.remember("docs", ForgeKind::Github, "me/repo", "abc");
         let key = key("docs", ForgeKind::Github, "me/repo");
-        cache.lock().get_mut(&key).unwrap().prompt = "stale".into();
+        cache.marks.lock().get_mut(&key).unwrap().prompt = "stale".into();
         assert!(!probe(&cache, "abc").remembered("docs", "me/repo"));
     }
 
@@ -854,7 +840,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("skips.json");
         std::fs::write(&path, b"{ this is not json").unwrap();
-        assert!(Cache::load(path).lock().is_empty());
+        assert!(Cache::load(path).marks.lock().is_empty());
     }
 
     /// The digest is stable across calls, so a mark can't invalidate itself,
