@@ -48,12 +48,19 @@ impl Verdict {
         // auth failure, and the refused model are whatever went wrong
         // mid-turn and can sit anywhere in the tail.
         let closing = last_lines(&tail, CLOSING_LINES);
+        let completed = reported_completed(closing);
         Verdict {
-            completed: reported_completed(closing),
+            completed,
             died: died_on_error(closing),
             usage_limit: usage_limit_epoch(&tail),
             auth_error: auth_error(&tail),
-            rejected_model: rejected_model(&tail),
+            // A refused model never gets as far as a session, let alone one
+            // the agent signed off as completed.
+            rejected_model: if completed {
+                None
+            } else {
+                rejected_model(&tail)
+            },
         }
     }
 }
@@ -196,14 +203,27 @@ const MODEL_REFUSAL: &str = "Model not found:";
 /// refusals do: the phrase is plain enough English that a repository under a
 /// turn could print it for its own reasons, and holding every turn on a
 /// settings blocker nobody can see a cause for is worse than one wasted turn.
+///
+/// Nor does it count once the session has started: the refusal comes before
+/// opencode's session header, and a refusal printed after it is a tool's
+/// output — an agent running another opencode with a made-up model to see it
+/// refused prints exactly opencode's own line.
 fn rejected_model(tail: &str) -> Option<String> {
-    tail.lines().find_map(|line| {
-        if !is_error_report(line) {
-            return None;
-        }
-        let at = line.find(MODEL_REFUSAL)?;
-        Some(line[at..].trim().to_owned())
-    })
+    tail.lines()
+        .take_while(|line| !is_session_header(line))
+        .find_map(|line| {
+            if !is_error_report(line) {
+                return None;
+            }
+            let at = line.find(MODEL_REFUSAL)?;
+            Some(line[at..].trim().to_owned())
+        })
+}
+
+/// Whether one line is the header `opencode run` opens a session with:
+/// `> <agent> · <model>`.
+fn is_session_header(line: &str) -> bool {
+    line.starts_with("> ") && line.contains(" · ")
 }
 
 /// The epoch at which an exhausted usage window reopens, parsed from a
@@ -506,6 +526,33 @@ mod tests {
             rejected_model("  warning: Model not found: anthropic/x"),
             None
         );
+    }
+
+    /// Shaped after a real turn whose agent ran opencode itself with a
+    /// placeholder model to watch it be refused: the nested refusal is
+    /// opencode's own line, word for word, but printed inside the session —
+    /// and read as the runner's, it held every turn behind a model nobody had
+    /// configured.
+    #[test]
+    fn a_refusal_inside_the_session_is_a_tools_output() {
+        let nested = "Database migration complete.\n\
+             \x1b[0m\n\
+             > build · claude-opus-5-5\n\
+             \x1b[0m\n\
+             \x1b[0m$ \x1b[0mopencode run --model nonexistent/model hi\n\
+             \x1b[91m\x1b[1mError: \x1b[0mModel not found: nonexistent/model.\n\
+             \x1b[91m\x1b[1mError: \x1b[0m{\n  \"name\": \"UnknownError\",\n}\n";
+        assert_eq!(Verdict::read(nested).rejected_model, None);
+
+        let completed = format!("{nested}\nTASK COMPLETED — answered the review\n");
+        assert_eq!(Verdict::read(&completed).rejected_model, None);
+
+        // Without the header the same refusal is the runner's own, unless the
+        // agent got far enough to sign the turn off.
+        let headless = nested.replace("> build · claude-opus-5-5\n", "");
+        assert!(Verdict::read(&headless).rejected_model.is_some());
+        let signed_off = format!("{headless}\nTASK COMPLETED — answered the review\n");
+        assert_eq!(Verdict::read(&signed_off).rejected_model, None);
     }
 
     #[test]
